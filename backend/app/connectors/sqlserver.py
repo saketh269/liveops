@@ -11,28 +11,39 @@ Safety:
   when the login can write (sysadmin, INSERT/UPDATE/DELETE on the database).
 - Dataset names are only accepted if ``discover()`` returned them; the schema
   and table come from that discovery result and are bracket-quoted with the
-  same rules as ``QUOTENAME`` (``]`` doubled). Values are always parameters.
-- Encryption defaults to ``required`` (TLS for the whole session). FreeTDS
-  can't verify the server certificate per connection, so there is no
-  ``verify`` option here (noted on LIVEOPS-5).
+  same rules as ``QUOTENAME`` (``]`` doubled). Values are bound parameters,
+  except that queries containing a table identifier take no parameters at all
+  (pymssql substitutes ``%s`` anywhere in the text, so a table named ``a%sb``
+  would break) and inline only Python ints.
+- Encryption defaults to ``required``: TLS for the whole session, but the
+  server certificate is NOT verified (FreeTDS can't take a CA per connection,
+  so there is no ``verify`` option; LIVEOPS-29).
 
 CDC mode reads ``CHANGETABLE(CHANGES ...)`` from a version cursor. The first
 batch is the full current state (version read *before* the snapshot, so no
 change is lost; re-seen rows are deduplicated). When the cursor falls behind
 ``CHANGE_TRACKING_MIN_VALID_VERSION`` (retention cleanup) or the database
 version goes backwards (restore), the connector resyncs: it re-reads the table
-and emits only the differences.
+and emits only the differences (UPSERTs and explicit DELETEs). A resync does not
+emit a second ``SNAPSHOT_END``: ADR 0004 allows exactly one per ``stream()``
+call, and the runner only collects ids before the first marker.
+
+Rows whose key column is NULL are skipped and counted in ``skipped_records``
+(ADR 0004).
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import time
 from collections.abc import AsyncIterator, Callable
 from typing import Any, TypeVar
 
 from app.connectors.base import (
+    MAX_SNAPSHOT_ROWS,
+    MIN_POLL_INTERVAL_S,
     Category,
     Change,
     ChangeOp,
@@ -45,6 +56,7 @@ from app.connectors.base import (
     Record,
     TestReport,
     TestStep,
+    check_row_cap,
     diff_snapshots,
     normalize_record,
     normalize_value,
@@ -52,7 +64,7 @@ from app.connectors.base import (
 )
 from app.connectors.registry import register
 
-MAX_ROWS = 50_000  # cap per snapshot and per change batch
+MAX_ROWS = MAX_SNAPSHOT_ROWS  # cap per snapshot and per change batch
 CONNECT_TIMEOUT_S = 10
 QUERY_TIMEOUT_S = 15
 ENCRYPTION = {"required": "require", "off": "off"}
@@ -69,6 +81,21 @@ def _driver() -> Any:
             hint="Install it with: pip install pymssql, then restart Live Ops.",
         ) from e
     return pymssql
+
+
+async def _in_thread[R](fn: Callable[..., R], *args: Any) -> R:
+    """Run blocking ``fn`` in a worker thread. If the caller is cancelled, still
+    wait for the thread to finish before re-raising, so whoever holds the
+    connection lock keeps it until the driver is really done with the
+    connection (``close()`` must never close it under a running call)."""
+    fut = asyncio.ensure_future(asyncio.to_thread(fn, *args))
+    try:
+        return await asyncio.shield(fut)
+    except asyncio.CancelledError:
+        while not fut.done():
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.wait({fut})
+        raise
 
 
 def quote_ident(name: str) -> str:
@@ -92,7 +119,9 @@ class SqlServerConnector(PollingConnector):
         modes=[Mode.POLL, Mode.CDC],
         description=(
             "Reads tables and views from SQL Server 2016+ / Azure SQL with a read-only login. "
-            "CDC mode uses Change Tracking."
+            "CDC mode uses Change Tracking. Encryption 'required' encrypts the session with TLS but does NOT "
+            "verify the server certificate (the driver can't), so it protects against eavesdropping, not against "
+            "an attacker who can redirect traffic."
         ),
         maturity="needs_real_test",
         settings_schema={
@@ -109,8 +138,8 @@ class SqlServerConnector(PollingConnector):
                     "enum": ["required", "off"],
                     "default": "required",
                     "description": (
-                        "'required' encrypts the whole session with TLS. The driver does not check the "
-                        "server certificate. Use 'off' only for local testing."
+                        "'required' encrypts the whole session with TLS but does NOT verify the server "
+                        "certificate (not supported by the driver). Use 'off' only for local testing."
                     ),
                 },
                 "mode": {
@@ -181,13 +210,13 @@ class SqlServerConnector(PollingConnector):
         async with self._lock:
             conn = await self._ensure()
             try:
-                return await asyncio.to_thread(fn, conn)
+                return await _in_thread(fn, conn)
             except ConnectorError:
                 raise
             except Exception as e:  # noqa: BLE001 - driver errors become ConnectorError
                 if _is_disconnect(e):
                     self._conn = None
-                    await asyncio.to_thread(_close_quietly, conn)
+                    await _in_thread(_close_quietly, conn)
                 raise ConnectorError(
                     f"SQL Server query failed: {self._error_text(e)}",
                     hint="Check the server is up and the login still has SELECT on the table.",
@@ -196,14 +225,19 @@ class SqlServerConnector(PollingConnector):
     async def _ensure(self) -> Any:
         """Open the connection if needed. Driver errors pass through unchanged."""
         if self._conn is None:
-            self._conn = await asyncio.to_thread(self._open)
+            await _in_thread(self._open_into_self)
         return self._conn
 
+    def _open_into_self(self) -> None:
+        # Stored from the worker thread, so a cancelled caller can't leak the connection.
+        self._conn = self._open()
+
     async def close(self) -> None:
+        # Holding the lock means any in-flight call has finished with the connection.
         async with self._lock:
             conn, self._conn = self._conn, None
-        if conn is not None:
-            await asyncio.to_thread(_close_quietly, conn)
+            if conn is not None:
+                await _in_thread(_close_quietly, conn)
 
     def _mode(self, options: dict[str, Any] | None) -> str:
         return str((options or {}).get("mode") or self.settings.get("mode") or "poll")
@@ -279,7 +313,7 @@ class SqlServerConnector(PollingConnector):
             TestStep(
                 name="Encryption",
                 ok=enc or want == "off",
-                detail="encrypted (TLS)" if enc else "not encrypted",
+                detail="encrypted (TLS); server certificate NOT verified" if enc else "not encrypted",
                 hint=""
                 if enc or want == "off"
                 else "The server didn't encrypt the session. Install a TLS certificate on SQL Server "
@@ -411,15 +445,16 @@ class SqlServerConnector(PollingConnector):
         return list(out.values())
 
     async def snapshot(self, dataset: str) -> list[Record]:
+        """The whole table, or ConnectorError if it has more than MAX_ROWS rows (never truncated)."""
         schema, table = await self._resolve(dataset)
-        query = f"SELECT TOP (%s) * FROM {quote_ident(schema)}.{quote_ident(table)}"  # noqa: S608 - quoted identifiers
+        rows = await self._run(_select_top(schema, table, MAX_ROWS + 1))
+        check_row_cap(len(rows), dataset, MAX_ROWS)
+        return [normalize_record(r) for r in rows]
 
-        def read(c: Any) -> list[dict[str, Any]]:
-            cur = c.cursor()
-            cur.execute(query, (MAX_ROWS,))
-            return _fetch_dicts(cur)
-
-        return [normalize_record(r) for r in await self._run(read)]
+    async def preview(self, dataset: str, limit: int = 20) -> list[Record]:
+        schema, table = await self._resolve(dataset)
+        rows = await self._run(_select_top(schema, table, max(0, min(int(limit), MAX_ROWS))))
+        return [normalize_record(r) for r in rows]
 
     async def stream(
         self, dataset: str, key_fields: list[str], options: dict[str, Any] | None = None
@@ -432,7 +467,7 @@ class SqlServerConnector(PollingConnector):
         await tracker.start()
         for ch in tracker.initial():
             yield ch
-        interval = float((options or {}).get("poll_interval_s", 1.0))
+        interval = max(MIN_POLL_INTERVAL_S, float((options or {}).get("poll_interval_s", 1.0)))
         while True:
             await asyncio.sleep(interval)
             for ch in await tracker.poll():
@@ -466,6 +501,7 @@ class ChangeTracker:
         self.version: int | None = None
         self.known: dict[str, Record] = {}
         self.pk_to_key: dict[str, str] = {}
+        self.keyless: set[str] = set()  # primary keys of rows whose mapping key is NULL right now
         self._pending: list[Change] = []
         self.schema = ""
         self.table = ""
@@ -495,13 +531,14 @@ class ChangeTracker:
     def qualified(self) -> str:
         return f"{quote_ident(self.schema)}.{quote_ident(self.table)}"
 
-    def changes_sql(self) -> str:
+    def changes_sql(self, since: int) -> str:
+        # No driver parameters (identifiers may contain '%'); only Python ints are inlined.
         q = self.qualified
         pk_cols = ", ".join(f"ct.{quote_ident(p)}" for p in self.pk)
         join = " AND ".join(f"t.{quote_ident(p)} = ct.{quote_ident(p)}" for p in self.pk)
         return (
-            f"SELECT TOP (%s) ct.SYS_CHANGE_VERSION, {pk_cols}, t.* "  # noqa: S608 - quoted identifiers
-            f"FROM CHANGETABLE(CHANGES {q}, %s) AS ct "
+            f"SELECT TOP ({int(MAX_ROWS) + 1}) ct.SYS_CHANGE_VERSION, {pk_cols}, t.* "  # noqa: S608 - quoted
+            f"FROM CHANGETABLE(CHANGES {q}, {int(since)}) AS ct "
             f"LEFT OUTER JOIN {q} AS t ON {join} "
             "ORDER BY ct.SYS_CHANGE_VERSION"
         )
@@ -510,19 +547,23 @@ class ChangeTracker:
         return "|".join(str(normalize_value(v)) for v in values)
 
     async def _resync(self) -> list[Change]:
-        """Read version + full table; emit the difference to what we knew."""
-        q = self.qualified
+        """Read version + full table; emit the difference to what we knew.
+
+        The first call returns the initial state followed by the SNAPSHOT_END
+        marker; later calls (resyncs) return only UPSERT/DELETE differences.
+        """
         pk = self.pk
+        select_all = _select_top(self.schema, self.table, MAX_ROWS + 1)
 
         def read(c: Any) -> tuple[int | None, list[dict[str, Any]]]:
             cur = c.cursor()
             cur.execute("SELECT CHANGE_TRACKING_CURRENT_VERSION()")
             row = cur.fetchone()
             version = row[0] if row else None
-            cur.execute(f"SELECT TOP (%s) * FROM {q}", (MAX_ROWS,))  # noqa: S608 - quoted identifiers
-            return version, _fetch_dicts(cur)
+            return version, select_all(c)
 
         version, rows = await self.c._run(read)
+        check_row_cap(len(rows), self.dataset, MAX_ROWS)
         if version is None:
             raise ConnectorError(
                 "Change tracking is off for this database",
@@ -532,20 +573,27 @@ class ChangeTracker:
             )
         current: dict[str, Record] = {}
         pk_to_key: dict[str, str] = {}
+        keyless: set[str] = set()
         for raw in rows:
             rec = normalize_record(raw)
-            key = record_key(rec, self.key_fields)
+            pk_key = self._pk_key([raw[p] for p in pk])
+            try:
+                key = record_key(rec, self.key_fields)
+            except KeyError:
+                keyless.add(pk_key)  # no value in the key column: skip and count (ADR 0004)
+                continue
             current[key] = rec
-            pk_to_key[self._pk_key([raw[p] for p in pk])] = key
+            pk_to_key[pk_key] = key
         changes = diff_snapshots(self.dataset, self.known if self.version is not None else None, current)
-        self.known, self.pk_to_key, self.version = current, pk_to_key, int(version)
+        self.known, self.pk_to_key, self.keyless, self.version = current, pk_to_key, keyless, int(version)
+        self.c.skipped_records = len(keyless)
         return changes
 
     async def poll(self) -> list[Change]:
         assert self.version is not None
         since = self.version
         obj = self.qualified
-        sql = self.changes_sql()
+        sql = self.changes_sql(since)
         npk = len(self.pk)
 
         def read(c: Any) -> tuple[Any, Any, list[str], list[tuple[Any, ...]]]:
@@ -558,7 +606,7 @@ class ChangeTracker:
             cur_v, min_v = row[0], row[1]
             if cur_v is None or min_v is None or since < min_v or cur_v < since:
                 return cur_v, min_v, [], []
-            cur.execute(sql, (MAX_ROWS + 1, since))
+            cur.execute(sql)
             names = [d[0] for d in cur.description or []]
             return cur_v, min_v, names, list(cur.fetchall())
 
@@ -583,12 +631,22 @@ class ChangeTracker:
             values = row[1 + npk :]
             exists = values[pk_idx[0]] is not None
             if not exists:
+                self.keyless.discard(pk_key)
                 old = self.pk_to_key.pop(pk_key, None)
                 if old is not None and self.known.pop(old, None) is not None:
                     out.append(Change(op=ChangeOp.DELETE, dataset=self.dataset, key=old, record={}))
                 continue
             rec = normalize_record(dict(zip(row_cols, values, strict=False)))
-            key = record_key(rec, self.key_fields)
+            try:
+                key = record_key(rec, self.key_fields)
+            except KeyError:
+                # Key column became NULL: the row can no longer be placed on the map.
+                self.keyless.add(pk_key)
+                old = self.pk_to_key.pop(pk_key, None)
+                if old is not None and self.known.pop(old, None) is not None:
+                    out.append(Change(op=ChangeOp.DELETE, dataset=self.dataset, key=old, record={}))
+                continue
+            self.keyless.discard(pk_key)
             old = self.pk_to_key.get(pk_key)
             if old is not None and old != key and self.known.pop(old, None) is not None:
                 out.append(Change(op=ChangeOp.DELETE, dataset=self.dataset, key=old, record={}))
@@ -597,7 +655,20 @@ class ChangeTracker:
                 self.known[key] = rec
                 out.append(Change(op=ChangeOp.UPSERT, dataset=self.dataset, key=key, record=rec))
         self.version = int(cur_v)
+        self.c.skipped_records = len(self.keyless)
         return out
+
+
+def _select_top(schema: str, table: str, n: int) -> Callable[[Any], list[dict[str, Any]]]:
+    """``SELECT TOP (n) *`` reader. No driver parameters: identifiers may contain ``%``."""
+    query = f"SELECT TOP ({int(n)}) * FROM {quote_ident(schema)}.{quote_ident(table)}"  # noqa: S608 - quoted
+
+    def read(c: Any) -> list[dict[str, Any]]:
+        cur = c.cursor()
+        cur.execute(query)
+        return _fetch_dicts(cur)
+
+    return read
 
 
 def _close_quietly(conn: Any) -> None:

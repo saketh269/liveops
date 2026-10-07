@@ -107,7 +107,7 @@ async def test_snapshot_is_read_only_quoted_and_bounded() -> None:
         'SELECT * FROM "APP"."Mixed Case" FETCH FIRST :n ROWS ONLY',
         "ROLLBACK",
     ]
-    assert tail[2][1] == {"n": MAX_ROWS} and tail[2][2] == {"fetch_lobs": False}
+    assert tail[2][1] == {"n": MAX_ROWS + 1} and tail[2][2] == {"fetch_lobs": False}
 
 
 async def test_discovered_name_with_quote_is_never_executed() -> None:
@@ -222,3 +222,108 @@ def test_open_sets_call_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     conn = c._open()
     assert conn.call_timeout == oracle.CALL_TIMEOUT_MS
     assert seen["service_name"] == "S" and seen["protocol"] == "tcps"
+
+
+async def test_snapshot_over_cap_raises_instead_of_truncating(monkeypatch: pytest.MonkeyPatch) -> None:
+    """LIVEOPS-34: fetch cap+1 and refuse, never return a partial table."""
+    from app.connectors import oracle
+
+    monkeypatch.setattr(oracle, "MAX_ROWS", 1)
+    c, fake = make(FakeOracle())  # two rows
+    with pytest.raises(ConnectorError) as e:
+        await c.snapshot("APP.ASSETS")
+    assert "more than 1 rows" in str(e.value) and e.value.hint
+    assert fake.executed[-2][1] == {"n": 2}
+    assert len(await c.preview("APP.ASSETS", limit=1)) == 1  # preview is bounded by limit and never raises
+
+
+async def test_poll_stream_skips_rows_without_key_and_sends_marker() -> None:
+    from app.connectors.base import ChangeOp
+
+    db = FakeOracle()
+    db.rows.append((None, "free", "ER"))
+    c, _ = make(db)
+    gen = c.stream("APP.ASSETS", ["id"], {"poll_interval_s": 0.5})
+    first = [await gen.__anext__() for _ in range(3)]
+    assert [(ch.op, ch.key) for ch in first] == [
+        (ChangeOp.UPSERT, "A1"),
+        (ChangeOp.UPSERT, "A2"),
+        (ChangeOp.SNAPSHOT_END, ""),
+    ]
+    assert c.skipped_records == 1
+    await gen.aclose()
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        ("[Errno -2] Name or service not known", "host name"),  # LIVEOPS-47
+        ("DPY-6005: cannot connect to database | [Errno -3] Temporary failure in name resolution", "host name"),
+        ("ORA-12514: Cannot connect to database. Service X is not registered with the listener", "service name"),
+        ("DPY-6005: cannot connect to database | [Errno 111] Connection refused", "host and port"),
+        ("DPY-6005: cannot connect | [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed", "certificate"),
+    ],
+)
+def test_connection_hints(message: str, expected: str) -> None:
+    from app.connectors.oracle import _connection_hint
+
+    assert expected in _connection_hint(message, "verify")
+
+
+async def test_test_unknown_host_gets_host_hint() -> None:
+    c = OracleConnector({"host": "x", "port": 1521, "service_name": "S", "user": "u"}, {"password": PASSWORD})
+
+    def boom() -> Any:
+        raise OSError(-2, "Name or service not known")
+
+    c._open = boom  # type: ignore[method-assign]
+    report = await c.test()
+    assert report.steps[0].name == "Reach the server"
+    assert "host name" in report.steps[0].hint
+
+
+async def test_encryption_step_says_whether_server_was_verified() -> None:
+    c, _ = make(FakeOracle())
+    enc = next(s for s in (await c.test()).steps if s.name == "Encryption")
+    assert enc.ok and "NOT verified" in enc.detail
+    c2, _ = make(FakeOracle(), encryption="verify")
+    enc2 = next(s for s in (await c2.test()).steps if s.name == "Encryption")
+    assert enc2.ok and "verified" in enc2.detail and "NOT" not in enc2.detail
+    assert "NOT verify" in OracleConnector.spec.description
+
+
+async def test_close_waits_for_a_cancelled_in_flight_query() -> None:
+    import asyncio
+    import threading
+
+    entered, release = threading.Event(), threading.Event()
+    order: list[str] = []
+    db = FakeOracle()
+
+    def responder(sql: str, params: Any) -> Result:
+        if "FETCH FIRST" in sql:
+            entered.set()
+            release.wait(5)
+            order.append("query finished")
+        return db(sql, params)
+
+    c, fake = make(responder)
+    await c.discover()
+    real_close = fake.close
+
+    def close() -> None:
+        order.append("close")
+        real_close()
+
+    fake.close = close  # type: ignore[method-assign]
+    task = asyncio.create_task(c.snapshot("APP.ASSETS"))
+    await asyncio.to_thread(entered.wait, 5)
+    task.cancel()
+    closing = asyncio.create_task(c.close())
+    await asyncio.sleep(0.05)
+    assert not closing.done(), "close() must wait while the worker thread still uses the connection"
+    release.set()
+    await closing
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert order == ["query finished", "close"]
