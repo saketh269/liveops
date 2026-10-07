@@ -100,3 +100,13 @@ table.data td.num { text-align: right; font-family: var(--f-mono); }
 .app-health { display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center; }
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden;
   clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+/* Key/value editor (object settings such as query parameters) */
+.kv { display: grid; gap: 6px; }
+.kv-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto; gap: 6px; align-items: center; }
+.kv-row input { font: inherit; color: var(--fg); background: var(--panel-2); border: 1px solid var(--line);
+  border-radius: 6px; padding: 7px 10px; min-width: 0; }
+.kv-row input[aria-invalid="true"] { border-color: var(--bad); }
+.field textarea.mono { font-family: var(--f-mono); font-size: 0.8rem; }
+.kv-row select { font: inherit; color: var(--fg); background: var(--panel-2); border: 1px solid var(--line);
+  border-radius: 6px; padding: 7px 10px; min-width: 0; }
+.field .kv-label { font-weight: 500; font-size: 0.85rem; }

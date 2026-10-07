@@ -12,6 +12,11 @@ export type JSONSchema = {
   format?: string;
   items?: JSONSchema;
   examples?: unknown[];
+  additionalProperties?: boolean | JSONSchema;
+  minimum?: number;
+  maximum?: number;
+  minLength?: number;
+  maxLength?: number;
 };
 
 export type ConnectorSpec = {

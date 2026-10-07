@@ -102,10 +102,10 @@ test("client-side checks and API 422 problems are shown inline", async () => {
   await screen.findByRole("region", { name: "Preview of records" });
 
   fireEvent.change(screen.getByLabelText(/^ID column/), { target: { value: "" } });
-  fireEvent.change(screen.getByLabelText(/Check for changes every/), { target: { value: "0" } });
+  fireEvent.change(screen.getByLabelText(/Check for changes every/), { target: { value: "0.2" } });
   fireEvent.click(screen.getByRole("button", { name: "Save and start" }));
   expect(screen.getByText(/Choose the column that identifies each asset/)).toBeTruthy();
-  expect(screen.getByText("Enter a number of seconds between 1 and 3600.")).toBeTruthy();
+  expect(screen.getByText("Enter a number of seconds between 0.5 and 3600.")).toBeTruthy();
 
   fireEvent.change(screen.getByLabelText(/^ID column/), { target: { value: "bed_id" } });
   fireEvent.change(screen.getByLabelText(/Check for changes every/), { target: { value: "3" } });
@@ -158,4 +158,43 @@ test("editing keeps site and source fixed and sends an update", async () => {
   fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
   await waitFor(() => expect(api.find("PUT", "/api/mappings/m1")).toHaveLength(1));
   expect(api.find("PUT", "/api/mappings/m1")[0].body).toMatchObject({ dataset: "public.beds", options: { poll_interval_s: 3 } });
+});
+
+test("edit then save keeps every config field, including ones this screen has no dedicated control for (LIVEOPS-32)", async () => {
+  const config = {
+    id_field: "bed_id",
+    match_key: "bed_id",
+    fields: { zone: "unit", state: "status", label: "bed_label", x: "pos_x", cleaning: "clean_status" },
+    state_map: { occupied: "in_use", blocked: "alert" }, // "blocked" isn't in the preview
+    attributes: ["patient_count", "old_column"],
+    kind: "bed",
+  };
+  const existing = { ...MAPPING, config, options: { poll_interval_s: 0.5, extra_option: true } };
+  const api = routes({ "GET /api/mappings": [existing], "PUT /api/mappings/m1": existing });
+  renderAt("/mapping/m1/edit");
+  await screen.findByRole("region", { name: "Preview of records" });
+  // Extra fields are visible and editable
+  expect((screen.getByLabelText("Field name 1") as HTMLInputElement).value).toBe("x");
+  expect((screen.getByLabelText("Column for field 2") as HTMLSelectElement).value).toBe("clean_status");
+  expect(screen.getByLabelText("Show “blocked” as")).toBeTruthy();
+  expect((screen.getByLabelText("old_column") as HTMLInputElement).checked).toBe(true);
+
+  fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+  await waitFor(() => expect(api.find("PUT", "/api/mappings/m1")).toHaveLength(1));
+  expect(api.find("PUT", "/api/mappings/m1")[0].body).toEqual({
+    dataset: "public.beds", config, options: { poll_interval_s: 0.5, extra_option: true },
+  });
+});
+
+test("an unreachable source on save shows the server's hint (502)", async () => {
+  routes({
+    "POST /api/mappings": new Reply(502, { detail: { message: "Couldn't read the source: connection refused", hint: "Run Test connection on the source to see which step fails." } }),
+  });
+  renderAt("/mapping/new?site=site1&source=src1");
+  fireEvent.change(await screen.findByLabelText("Table or dataset"), { target: { value: "public.beds" } });
+  await screen.findByRole("region", { name: "Preview of records" });
+  fireEvent.click(screen.getByRole("button", { name: "Save and start" }));
+  const box = (await screen.findByText("Couldn't save the mapping")).closest("[role=alert]") as HTMLElement;
+  expect(box.textContent).toContain("connection refused");
+  expect(box.textContent).toContain("Run Test connection on the source to see which step fails.");
 });

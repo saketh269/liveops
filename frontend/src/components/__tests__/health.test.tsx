@@ -39,7 +39,7 @@ test("shows app version and per-mapping health, and polls every 5 seconds", asyn
   expect(within(beds).getByText("Running")).toBeTruthy();
   expect(within(beds).getByText("42")).toBeTruthy(); // events/min
   expect(within(beds).getByText("1.2 s")).toBeTruthy(); // lag p95
-  expect(within(beds).getByText("3")).toBeTruthy(); // skipped
+  expect(within(beds).getByText("Rows skipped (no ID)").nextElementSibling?.textContent).toBe("3");
   expect(beds.textContent).toContain("Last event 30 s ago");
   expect(beds.textContent).toContain("Hospital EHR");
   expect(beds.textContent).toContain("St Mary's");

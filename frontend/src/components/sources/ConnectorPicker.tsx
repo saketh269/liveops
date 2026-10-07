@@ -10,7 +10,22 @@ const CATEGORY_LABELS: Record<ConnectorSpec["category"], string> = {
 };
 const CATEGORY_ORDER = Object.keys(CATEGORY_LABELS) as ConnectorSpec["category"][];
 
-const MODE_LABELS: Record<string, string> = { poll: "Polls for changes", cdc: "Reads the change log", push: "Receives pushed events" };
+/** How fresh the map will be, in the user's words. Live (cdc/push) wins over polling. */
+export function ModeBadge({ modes }: { modes: ConnectorSpec["modes"] }) {
+  if (modes.includes("cdc")) {
+    return <span className="pill info" title="Reads the database's change log: changes appear within a second or two">Live changes</span>;
+  }
+  if (modes.includes("push")) {
+    return <span className="pill info" title="Your system sends changes to Live Ops as they happen">Pushed live</span>;
+  }
+  return <span className="pill" title="Live Ops checks for changes every few seconds">Checks every few seconds</span>;
+}
+
+const MODE_LABELS: Record<string, string> = {
+  poll: "Checks for changes every few seconds",
+  cdc: "Streams each change as it is committed",
+  push: "Receives changes as your system sends them",
+};
 
 export function MaturityBadge({ maturity }: { maturity: ConnectorSpec["maturity"] }) {
   if (maturity === "stable") return null;
@@ -36,10 +51,13 @@ export function ConnectorPicker({ connectors, onPick }: { connectors: ConnectorS
               <button type="button" key={c.type} className="picker-option" onClick={() => onPick(c)}>
                 <span className="card-head">
                   <span className="name">{c.display_name}</span>
-                  <MaturityBadge maturity={c.maturity} />
+                  <span className="badges">
+                    <ModeBadge modes={c.modes} />
+                    <MaturityBadge maturity={c.maturity} />
+                  </span>
                 </span>
                 {c.description && <span className="desc">{c.description}</span>}
-                <span className="meta">{c.modes.map((m) => MODE_LABELS[m] ?? m).join(" · ")}</span>
+                <span className="meta">{c.modes.map((m) => MODE_LABELS[m] ?? m).join("; or ")}</span>
               </button>
             ))}
           </div>
