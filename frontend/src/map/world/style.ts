@@ -27,6 +27,10 @@ export type ScenePalette = {
   /** Text printed on the floor: room names, and area names. */
   roomLabel: string;
   areaLabel: string;
+  /** Bay zones (ambulance and vehicle bays): pad fill, painted edge line and the low kerb around it. */
+  bayPad: string;
+  bayLine: string;
+  kerb: string;
   wall: string;
   wallTop: string;
   /** Top of the outer (building) walls. */
@@ -64,6 +68,9 @@ const LIGHT: ScenePalette = {
   zoneFill: "rgba(111,134,168,0.10)",
   roomLabel: "rgba(20,34,49,0.62)",
   areaLabel: "rgba(11,122,131,0.70)",
+  bayPad: "#dfe5ea",
+  bayLine: "rgba(255,255,255,0.95)",
+  kerb: "#f7f9fb",
   wall: "#fbfcfd",
   wallTop: "#9fb4c8",
   outerWallTop: "#0b7a83",
@@ -96,14 +103,17 @@ const DARK: ScenePalette = {
   ground: "#1b2b25",
   road: "#2b3640",
   roadLine: "#4b5a66",
-  slab: "#2a3b44",
-  floor: "#24343c",
+  slab: "#33464f",
+  floor: "#2b3d46",
   floorLine: "rgba(227,236,239,0.05)",
   corridor: "#1f4148",
   corridorLine: "rgba(63,182,193,0.45)",
   zoneFill: "rgba(122,166,240,0.08)",
   roomLabel: "rgba(227,236,239,0.70)",
   areaLabel: "rgba(63,182,193,0.85)",
+  bayPad: "#384b55",
+  bayLine: "rgba(227,236,239,0.45)",
+  kerb: "#4a5f6b",
   wall: "#4a5f6b",
   wallTop: "#7d97ab",
   outerWallTop: "#3fb6c1",
@@ -155,6 +165,8 @@ export const WORLD = {
   wallHeight: 1.55,
   wallThickness: 0.2,
   outerWallHeight: 1.7,
+  kerbHeight: 0.12,
+  kerbThickness: 0.16,
   doorWidth: 1.4,
   slabThickness: 0.35,
   slabMargin: 0.6,

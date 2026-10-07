@@ -54,10 +54,17 @@ export function fitSun(l: Lights, width: number, depth: number) {
   l.sun.shadow.needsUpdate = true;
 }
 
-export function configureRenderer(r: THREE.WebGLRenderer, p: ScenePalette) {
+/**
+ * Renderer settings. On software renderers (SwiftShader/llvmpipe) every shadow texel
+ * and filter tap costs CPU: plain PCF instead of soft PCF, and the shadow map is only
+ * redrawn when the static world changes (figures cast no shadows there), not every frame.
+ */
+export function configureRenderer(r: THREE.WebGLRenderer, p: ScenePalette, software = false) {
   r.outputColorSpace = THREE.SRGBColorSpace;
   r.toneMapping = THREE.ACESFilmicToneMapping;
   r.toneMappingExposure = p.exposure;
-  r.shadowMap.enabled = true;
+  r.shadowMap.enabled = !software;
   r.shadowMap.type = THREE.PCFSoftShadowMap;
+  r.shadowMap.autoUpdate = !software;
+  r.shadowMap.needsUpdate = true;
 }

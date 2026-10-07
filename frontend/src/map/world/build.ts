@@ -131,7 +131,20 @@ export class RoomTiles {
   }
 }
 
-export type BuiltWorld = { group: THREE.Group; tiles: RoomTiles; wallCount: number };
+type MatParams = { color?: THREE.ColorRepresentation; roughness?: number; vertexColors?: boolean; flatShading?: boolean };
+type MakeMat = (o?: MatParams) => THREE.MeshStandardMaterial | THREE.MeshLambertMaterial;
+
+/**
+ * Material factory for the static world: PBR on a GPU; Lambert on software renderers,
+ * where the standard shader's per-pixel cost halves the frame rate of a full-screen floor.
+ */
+export function worldMaterial(p: ScenePalette, software: boolean): MakeMat {
+  return ({ roughness, ...o } = {}) =>
+    software ? new THREE.MeshLambertMaterial(o) : new THREE.MeshStandardMaterial({ roughness: roughness ?? p.roughness, metalness: 0.02, ...o });
+}
+
+/** `background`: clear color that matches the world's surroundings (grass around the ground floor, sky above). */
+export type BuiltWorld = { group: THREE.Group; tiles: RoomTiles; wallCount: number; background: string };
 
 /** Build the static world of a floor centred on the origin. */
 export function buildWorld(input: WorldInput): BuiltWorld {
@@ -140,10 +153,10 @@ export function buildWorld(input: WorldInput): BuiltWorld {
   group.name = "world";
   const toWorld = (x: number, y: number) => new THREE.Vector3(x - width / 2, 0, y - depth / 2);
   const valid = zones.filter((z) => Array.isArray(z.polygon) && z.polygon.length >= 3);
-  const mat = (o: THREE.MeshStandardMaterialParameters = {}) => new THREE.MeshStandardMaterial({ roughness: p.roughness, metalness: 0.02, ...o });
+  const mat = worldMaterial(p, input.software);
 
   // Site ground (first floor only) and decoration.
-  if (input.ground) group.add(...buildSite(width, depth, entrances, p, mat));
+  if (input.ground) group.add(...buildSite(width, depth, entrances, p, mat, input.software));
 
   // Slab with rounded edges, its top just under the floor.
   const m = WORLD.slabMargin;
@@ -155,7 +168,7 @@ export function buildWorld(input: WorldInput): BuiltWorld {
 
   // Painted floor.
   const canvas = paintFloor(width, depth, valid, p, input.fonts, input.software ? 1536 : 2048);
-  const floorMat = mat({ color: canvas ? 0xffffff : p.floor, roughness: 0.9 });
+  const floorMat = mat({ color: canvas ? 0xffffff : p.floor, roughness: 0.9 }) as THREE.MeshStandardMaterial | THREE.MeshLambertMaterial;
   if (canvas) {
     const tex = new THREE.CanvasTexture(canvas);
     tex.colorSpace = THREE.SRGBColorSpace;
@@ -181,6 +194,7 @@ export function buildWorld(input: WorldInput): BuiltWorld {
   for (const z of valid) {
     if (isNurseStation(z)) nurseDesk(bake, z, p, toWorld);
     else if (z.kind === "waiting") chairs(bake, z, p, toWorld);
+    else if (z.kind === "bay") for (const e of bayKerbs(z)) wallPiece(bake, e, WORLD.kerbHeight, p.kerb, p.kerb, toWorld, WORLD.kerbThickness);
   }
   const geo = bake.build();
   if (geo) {
@@ -190,13 +204,12 @@ export function buildWorld(input: WorldInput): BuiltWorld {
     statics.name = "statics";
     group.add(statics);
   }
-  return { group, tiles, wallCount: walls.inner.length + walls.outer.length };
+  return { group, tiles, wallCount: walls.inner.length + walls.outer.length, background: input.ground ? p.ground : p.sky };
 }
 
-function wallPiece(bake: Baker, s: Seg, h: number, side: string, top: string, toWorld: (x: number, y: number) => THREE.Vector3) {
+function wallPiece(bake: Baker, s: Seg, h: number, side: string, top: string, toWorld: (x: number, y: number) => THREE.Vector3, T: number = WORLD.wallThickness) {
   const len = Math.hypot(s.b[0] - s.a[0], s.b[1] - s.a[1]);
   if (len < 0.05) return;
-  const T = WORLD.wallThickness;
   const c = toWorld((s.a[0] + s.b[0]) / 2, (s.a[1] + s.b[1]) / 2);
   const geo = new THREE.BoxGeometry(len + T, h, T); // + T closes the corners
   bake.add(geo, side, m4(c.x, h / 2, c.z, -Math.atan2(s.b[1] - s.a[1], s.b[0] - s.a[0])), top);
@@ -217,6 +230,21 @@ function nurseDesk(bake: Baker, z: Zone, p: ScenePalette, toWorld: (x: number, y
     const local = new THREE.Vector3(off, 0, -0.15).applyAxisAngle(new THREE.Vector3(0, 1, 0), rot);
     bake.add(new THREE.BoxGeometry(0.9, 0.55, 0.06), p.screen, m4(c.x + local.x, 1.33, c.z + local.z, rot, -0.15));
   }
+}
+
+/** Low kerb around a bay pad: every edge, except the edge with the bay's door (left open for vehicles). */
+export function bayKerbs(z: Zone): Seg[] {
+  const poly = z.polygon;
+  if (!Array.isArray(poly) || poly.length < 3) return [];
+  const es: Seg[] = poly.map((a, i) => ({ a, b: poly[(i + 1) % poly.length] }));
+  const door = (z.doors ?? []).find((d) => Array.isArray(d) && Number.isFinite(d[0]) && Number.isFinite(d[1]));
+  if (!door) return es;
+  let open = 0, best = Infinity;
+  es.forEach((e, i) => {
+    const d = Math.hypot((e.a[0] + e.b[0]) / 2 - door[0], (e.a[1] + e.b[1]) / 2 - door[1]);
+    if (d < best) { best = d; open = i; }
+  });
+  return es.filter((_, i) => i !== open);
 }
 
 /** Seats laid out in rows inside a waiting area (kept clear of its doors). */
@@ -243,15 +271,19 @@ function chairs(bake: Baker, z: Zone, p: ScenePalette, toWorld: (x: number, y: n
 }
 
 /** Grass, a road below the building, paths to the entrances, and trees. */
-function buildSite(width: number, depth: number, entrances: readonly Entrance[], p: ScenePalette, mat: (o?: THREE.MeshStandardMaterialParameters) => THREE.MeshStandardMaterial): THREE.Object3D[] {
+function buildSite(width: number, depth: number, entrances: readonly Entrance[], p: ScenePalette, mat: MakeMat, software: boolean): THREE.Object3D[] {
   const out: THREE.Object3D[] = [];
   const size = Math.max(width, depth) * 4 + 200;
-  const ground = new THREE.Mesh(new THREE.PlaneGeometry(size, size), mat({ color: p.ground, roughness: 1 }));
-  ground.rotation.x = -Math.PI / 2;
-  ground.position.y = -WORLD.slabThickness - 0.01;
-  ground.receiveShadow = true;
-  ground.name = "ground";
-  out.push(ground);
+  // The grass is a full-screen plane: on a software renderer the clear color (same
+  // grass color, see BuiltWorld.background) shows instead, at no per-pixel cost.
+  if (!software) {
+    const ground = new THREE.Mesh(new THREE.PlaneGeometry(size, size), mat({ color: p.ground, roughness: 1 }));
+    ground.rotation.x = -Math.PI / 2;
+    ground.position.y = -WORLD.slabThickness - 0.01;
+    ground.receiveShadow = true;
+    ground.name = "ground";
+    out.push(ground);
+  }
 
   const roadZ = depth / 2 + 10;
   const bake = new Baker();

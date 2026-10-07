@@ -11,18 +11,35 @@ export function paintScale(width: number, depth: number, maxPx = 2048): number {
 }
 
 /**
- * Where a zone's name is printed: just inside its first door (towards the middle of
- * the zone), or at its centre when it has no door.
+ * Layout direction the default camera looks from (towards +y: the camera sits below
+ * the floor plan, see camera.ts VIEW_DIR). Floor just behind a wall, seen from here,
+ * is hidden by that wall.
  */
-export function labelSpot(zone: Zone): Pt {
+const VIEWER: Pt = [0, 1];
+
+/**
+ * Where a zone's name is printed, next to its first door so it reads like a door
+ * plate: on the side of the door the default camera can see. A door facing the
+ * camera puts the name just outside (on the corridor), a door facing away puts it
+ * just inside (towards the middle of the zone). No door: the zone's centre.
+ * `bounds` (the floor) keeps an outside name on the floor.
+ */
+export function labelSpot(zone: Zone, bounds?: { width: number; depth: number }): Pt {
   const c = polygonCentroid(zone.polygon);
   const d = zone.doors?.find((p) => Array.isArray(p) && Number.isFinite(p[0]) && Number.isFinite(p[1]));
   if (!d) return c;
   const dx = c[0] - d[0], dy = c[1] - d[1];
   const dist = Math.hypot(dx, dy);
   if (dist < 1e-6) return c;
+  const ux = dx / dist, uy = dy / dist; // inwards
+  const facesViewer = -(ux * VIEWER[0] + uy * VIEWER[1]) > 0.5;
+  if (facesViewer) {
+    const out: Pt = [d[0] - ux * 0.75, d[1] - uy * 0.75];
+    const inFloor = !bounds || (out[0] >= 0.3 && out[1] >= 0.3 && out[0] <= bounds.width - 0.3 && out[1] <= bounds.depth - 0.3);
+    if (inFloor) return out;
+  }
   const step = Math.min(1.3, dist * 0.5);
-  return [d[0] + (dx / dist) * step, d[1] + (dy / dist) * step];
+  return [d[0] + ux * step, d[1] + uy * step];
 }
 
 /** A zone is roughly a rectangle (so a centre line along it makes sense). */
@@ -68,7 +85,7 @@ export function paintFloor(width: number, depth: number, zones: readonly Zone[],
   for (const z of valid) {
     if (z.kind === "room") continue;
     path(g, z.polygon, s);
-    g.fillStyle = z.kind === "corridor" ? p.corridor : p.zoneFill;
+    g.fillStyle = z.kind === "corridor" ? p.corridor : z.kind === "bay" ? p.bayPad : p.zoneFill;
     g.fill();
     if (z.color && z.kind !== "corridor") {
       g.globalAlpha = 0.3;
@@ -100,6 +117,20 @@ export function paintFloor(width: number, depth: number, zones: readonly Zone[],
   }
   g.setLineDash([]);
 
+  // Bay markings: a painted line just inside each bay's edge (over the tile grid).
+  g.strokeStyle = p.bayLine;
+  g.lineWidth = Math.max(2, s * 0.14);
+  g.lineJoin = "round";
+  for (const z of valid) {
+    if (z.kind !== "bay") continue;
+    const b = polygonBounds(z.polygon);
+    const inset = Math.min(0.35, b.w / 6, b.h / 6);
+    const c = polygonCentroid(z.polygon);
+    // Shrink towards the centre: exact for rectangles, close enough for other shapes.
+    path(g, z.polygon.map(([x, y]) => [x + Math.sign(c[0] - x) * inset, y + Math.sign(c[1] - y) * inset] as Pt), s);
+    g.stroke();
+  }
+
   // Names printed on the floor.
   g.textAlign = "center";
   g.textBaseline = "middle";
@@ -109,7 +140,7 @@ export function paintFloor(width: number, depth: number, zones: readonly Zone[],
     if (!name) continue;
     const b = polygonBounds(z.polygon);
     if (z.kind === "room") {
-      const [x, y] = labelSpot(z);
+      const [x, y] = labelSpot(z, { width, depth });
       g.fillStyle = p.roomLabel;
       fitText(g, name, x * s, y * s, 0.7 * s, b.w * s * 0.86, 600, fonts.data);
     } else {
