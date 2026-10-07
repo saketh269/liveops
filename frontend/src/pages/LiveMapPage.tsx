@@ -1,7 +1,9 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { ApiError, api } from "../api/client";
-import type { Site } from "../api/types";
+import type { Asset, Site } from "../api/types";
+import FloorSwitcher from "../map/FloorSwitcher";
+import { assetFloorId, assetsOnFloor, countByFloor, floorLayout, floorsOf, planView } from "../map/floors";
 import LayoutEditor from "../map/LayoutEditor";
 import Map2D from "../map/Map2D";
 import MapView3D from "../map/MapView3D";
@@ -46,7 +48,11 @@ function SitePicker() {
             <li key={s.id}>
               <Link className="panel lm-site-card" to={`/map/${encodeURIComponent(s.id)}`}>
                 <strong>{s.name}</strong>
-                <span className="muted lm-small">{s.template} · {(s.layout?.zones ?? []).length} zones</span>
+                <span className="muted lm-small">
+                  {s.template}
+                  {(s.layout?.floors?.length ?? 0) > 1 && <> · {s.layout.floors!.length} floors</>}
+                  {" · "}{(s.layout?.zones ?? []).length} zones
+                </span>
               </Link>
             </li>
           ))}
@@ -96,6 +102,31 @@ function SiteMap({ siteId }: { siteId: string }) {
   const use2d = force2d || glError !== null;
   const shown = (selected && ui.assets.get(selected)) || (hover && ui.assets.get(hover)) || null;
 
+  // Floors (ADR 0006): one floor is shown at a time; ?floor=<id> keeps the choice in the link.
+  const floors = useMemo(() => floorsOf(layout), [layout]);
+  const floor = floors.find((f) => f.id === params.get("floor")) ?? floors[0];
+  const floorId = floor.id;
+  const viewLayout = useMemo(() => floorLayout(layout, floorId), [layout, floorId]);
+  const plan = useMemo(() => planView(siteId, floorsOf(layout).find((f) => f.id === floorId)), [siteId, layout, floorId]);
+  const floorAssets = useMemo(() => assetsOnFloor(layout, ui.assets, floorId), [layout, ui.assets, floorId]);
+  const assetFilter = useCallback((m: ReadonlyMap<string, Asset>) => assetsOnFloor(layout, m, floorId), [layout, floorId]);
+  const floorCounts = useMemo(() => (floors.length > 1 ? countByFloor(layout, ui.assets.values()) : null), [floors, layout, ui.assets]);
+
+  const setFloor = (id: string) => {
+    const next = new URLSearchParams(params);
+    if (id === floors[0].id) next.delete("floor"); else next.set("floor", id);
+    setParams(next, { replace: true });
+  };
+  /** Select an asset; on a multi-floor site the map moves to the asset's floor. */
+  const select = (id: string | null) => {
+    setSelected(id);
+    const a = id ? ui.assets.get(id) : undefined;
+    if (a && floors.length > 1) {
+      const fid = assetFloorId(layout, a);
+      if (fid !== floorId) setFloor(fid);
+    }
+  };
+
   const setEdit = (on: boolean) => {
     const next = new URLSearchParams(params);
     if (on) next.set("edit", "1"); else next.delete("edit");
@@ -143,7 +174,7 @@ function SiteMap({ siteId }: { siteId: string }) {
       </header>
 
       {editing ? (
-        <LayoutEditor site={site} onSaved={setSite} onClose={() => setEdit(false)} />
+        <LayoutEditor site={site} onSaved={setSite} onClose={() => setEdit(false)} initialFloorId={floorId} />
       ) : (
         <div className="lm-grid">
           <div className="lm-main">
@@ -153,25 +184,30 @@ function SiteMap({ siteId }: { siteId: string }) {
                 get suggestions, or <Link to={`/mapping/new?site=${encodeURIComponent(site.id)}`}>map a table by hand</Link>.
               </div>
             )}
-            <SetupHints site={site} assets={ui.assets} ready={ui.snapshotReceived} onSite={setSite} onEditLayout={() => setEdit(true)} />
+            <SetupHints site={site} assets={ui.assets} ready={ui.snapshotReceived} onSite={setSite} onEditLayout={() => setEdit(true)} floorId={floorId} />
+            {floors.length > 1 && <FloorSwitcher floors={floors} current={floorId} counts={floorCounts} onChange={setFloor} />}
             <div className="lm-stage">
               {use2d ? (
                 <Map2D
-                  layout={layout}
-                  assets={ui.assets}
+                  layout={viewLayout}
+                  assets={floorAssets}
+                  plan={plan}
                   selectedId={selected}
-                  onSelect={setSelected}
+                  onSelect={select}
                   onHover={(id) => setHover(id)}
                   reason={force2d ? "selected with ?view=2d." : `${glError} Showing a top view instead.`}
                 />
               ) : (
                 <MapView3D
-                  layout={layout}
+                  layout={viewLayout}
+                  plan={plan}
+                  assetFilter={floors.length > 1 ? assetFilter : undefined}
+                  viewKey={floorId}
                   stateRef={live.stateRef}
                   listen={live.listen}
                   selectedId={selected}
                   onHover={(id) => setHover(id)}
-                  onSelect={setSelected}
+                  onSelect={select}
                   onFail={(r) => setGlError(`The 3D view could not start (${r}).`)}
                   debug={debug}
                 />
@@ -193,7 +229,7 @@ function SiteMap({ siteId }: { siteId: string }) {
                     setFind(e.target.value);
                     const v = e.target.value.trim().toLowerCase();
                     const hit = [...ui.assets.values()].find((a) => a.asset_id.toLowerCase() === v || assetName(a).toLowerCase() === v);
-                    if (hit) setSelected(hit.asset_id);
+                    if (hit) select(hit.asset_id);
                   }}
                 />
               </label>
@@ -213,7 +249,7 @@ function SiteMap({ siteId }: { siteId: string }) {
           <div className="lm-side">
             <KpiPanel layout={layout} assets={ui.assets} />
             <Legend />
-            <EventFeed feed={ui.feed} onSelect={setSelected} sourceNames={sourceNames} />
+            <EventFeed feed={ui.feed} onSelect={select} sourceNames={sourceNames} />
           </div>
         </div>
       )}

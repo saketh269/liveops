@@ -1,5 +1,7 @@
 import { useMemo } from "react";
 import type { Asset, SiteLayout } from "../api/types";
+import { FloorPlanImage } from "./FloorPlanImage";
+import type { PlanView } from "./floors";
 import { floorSize, PlacementCache, polygonCentroid } from "./placement";
 import { stateKey } from "./stateColors";
 
@@ -10,10 +12,12 @@ type Props = {
   onSelect: (id: string | null) => void;
   onHover: (id: string | null, x: number, y: number) => void;
   reason?: string;
+  /** Floor plan image drawn over the zone fills, under assets. */
+  plan?: PlanView | null;
 };
 
 /** Top-down SVG view used when WebGL is unavailable. Same zones, positions and colors as the 3D map. */
-export default function Map2D({ layout, assets, selectedId, onSelect, onHover, reason }: Props) {
+export default function Map2D({ layout, assets, selectedId, onSelect, onHover, reason, plan }: Props) {
   const cache = useMemo(() => new PlacementCache(), []);
   const placement = cache.get(layout, assets.values());
   const { width, depth } = floorSize(layout);
@@ -41,6 +45,7 @@ export default function Map2D({ layout, assets, selectedId, onSelect, onHover, r
             />
           ) : null,
         )}
+        {plan && <FloorPlanImage plan={plan} />}
         {u && (
           <g>
             <rect className="lm-unassigned" x={u.x} y={u.y} width={u.w} height={u.h} />

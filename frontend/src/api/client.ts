@@ -1,6 +1,6 @@
 import type {
   AppHealth, ConnectorSpec, Dataset, Mapping, MappingConfig, MappingHealth, Site, SiteLayout, Source,
-  SourceRecord, StreamMessage, Suggestion, TestReport, UploadResult,
+  PlanUpload, SourceRecord, StreamMessage, Suggestion, TestReport, UploadResult,
 } from "./types";
 
 export class ApiError extends Error {
@@ -72,6 +72,20 @@ export const api = {
   updateSite: (id: string, b: { name?: string; template?: string; layout?: SiteLayout }) =>
     req<Site>("PUT", `/api/sites/${id}`, b),
   deleteSite: (id: string) => req<void>("DELETE", `/api/sites/${id}`),
+  uploadPlan: async (siteId: string, file: File): Promise<PlanUpload> => {
+    const body = new FormData();
+    body.append("file", file, file.name);
+    const res = await fetch(`/api/sites/${encodeURIComponent(siteId)}/plans`, { method: "POST", body });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const d = data?.detail ?? {};
+      const msg = typeof d === "string" ? d : d.message ?? (res.status === 413 ? "The file is too large" : `Upload failed (${res.status})`);
+      throw new ApiError(res.status, msg, d.hint);
+    }
+    return data as PlanUpload;
+  },
+  deletePlan: (siteId: string, assetId: string) =>
+    req<void>("DELETE", `/api/sites/${encodeURIComponent(siteId)}/plans/${encodeURIComponent(assetId)}`),
 
   mappings: (siteId?: string) => req<Mapping[]>("GET", `/api/mappings${siteId ? `?site_id=${siteId}` : ""}`),
   createMapping: (b: { site_id: string; source_id: string; dataset: string; config: MappingConfig; options?: Record<string, unknown>; active?: boolean }) =>

@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
-import type { SiteLayout } from "../api/types";
+import type { Asset, SiteLayout } from "../api/types";
+import type { PlanView } from "./floors";
 import { PlacementCache } from "./placement";
 import type { MapState } from "./reducer";
 import type { MapScene } from "./scene";
@@ -15,6 +16,12 @@ type Props = {
   /** WebGL could not start: the page switches to the 2D view. */
   onFail: (reason: string) => void;
   debug?: boolean;
+  /** Floor plan image drawn on the floor. */
+  plan?: PlanView | null;
+  /** Narrows the live assets to what this view shows (e.g. one floor). Keep it stable (useCallback). */
+  assetFilter?: (assets: ReadonlyMap<string, Asset>) => ReadonlyMap<string, Asset>;
+  /** Changing this re-frames the camera (e.g. the floor id). */
+  viewKey?: string;
 };
 
 declare global {
@@ -24,7 +31,7 @@ declare global {
 }
 
 /** Hosts the Three.js scene. Asset updates bypass React and go straight to the scene. */
-export default function MapView3D({ layout, stateRef, listen, selectedId, onHover, onSelect, onFail, debug }: Props) {
+export default function MapView3D({ layout, stateRef, listen, selectedId, onHover, onSelect, onFail, debug, plan, assetFilter, viewKey }: Props) {
   const hostRef = useRef<HTMLDivElement>(null);
   const labelsRef = useRef<HTMLDivElement>(null);
   const [scene, setScene] = useState<MapScene | null>(null);
@@ -59,9 +66,10 @@ export default function MapView3D({ layout, stateRef, listen, selectedId, onHove
     if (!scene) return;
     const cache = new PlacementCache();
     const push = (st: MapState) => {
-      const placement = cache.get(layout, st.assets.values());
+      const assets = assetFilter ? assetFilter(st.assets) : st.assets;
+      const placement = cache.get(layout, assets.values());
       scene.setLayout(layout, placement.unassigned);
-      scene.setAssets(st.assets, placement);
+      scene.setAssets(assets, placement);
     };
     push(stateRef.current);
     const off = listen(push);
@@ -78,7 +86,16 @@ export default function MapView3D({ layout, stateRef, listen, selectedId, onHove
       off();
       if (debug) delete window.__liveopsMap;
     };
-  }, [scene, layout, listen, stateRef, debug]);
+  }, [scene, layout, listen, stateRef, debug, assetFilter]);
+
+  const framedKey = useRef(viewKey);
+  useEffect(() => {
+    if (!scene || framedKey.current === viewKey) return;
+    framedKey.current = viewKey;
+    scene.resetCamera();
+  }, [scene, viewKey]);
+
+  useEffect(() => { scene?.setPlan(plan ?? null); }, [scene, plan]);
 
   useEffect(() => { scene?.setSelected(selectedId); }, [scene, selectedId]);
 

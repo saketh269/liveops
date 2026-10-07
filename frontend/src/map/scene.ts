@@ -3,6 +3,8 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import type { Asset, SiteLayout } from "../api/types";
+import { FloorPlanLayer } from "./floorPlanLayer";
+import type { PlanView } from "./floors";
 import { floorSize, polygonCentroid, type PlacementResult, type Pt, type Rect } from "./placement";
 import { STATE_KEYS, onThemeChange, readStateColors, readToken, stateKey, type StateKey } from "./stateColors";
 
@@ -60,6 +62,7 @@ export class MapScene {
   private camera = new THREE.PerspectiveCamera(45, 1, 0.1, 5000);
   private controls: OrbitControls;
   private floor = new THREE.Group();
+  private planLayer = new FloorPlanLayer(); // floor plan image (LIVEOPS-97)
   private meshes = new Map<string, KindMesh>();
   private index = new Map<string, { kind: string; i: number }>();
   private assets: ReadonlyMap<string, Asset> = new Map();
@@ -114,6 +117,7 @@ export class MapScene {
     sun.position.set(30, 80, 40);
     this.scene.add(sun);
     this.scene.add(this.floor);
+    this.scene.add(this.planLayer.group);
 
     const boxGeo = new THREE.EdgesGeometry(new THREE.BoxGeometry(1, 1, 1));
     boxGeo.translate(0, 0.5, 0);
@@ -195,6 +199,7 @@ export class MapScene {
     this.labels = [];
 
     const { width, depth } = floorSize(layout);
+    this.planLayer.setFloor(width, depth);
     const plane = new THREE.Mesh(new THREE.PlaneGeometry(width, depth), new THREE.MeshBasicMaterial());
     plane.rotation.x = -Math.PI / 2;
     plane.userData.token = "--panel";
@@ -414,7 +419,13 @@ export class MapScene {
     this.selectionBox.visible = true;
   }
 
+  /** Floor plan image under the zones and assets, or null for none. */
+  setPlan(plan: PlanView | null) {
+    this.planLayer.setPlan(plan);
+  }
+
   refreshTheme() {
+    this.planLayer.refreshTheme();
     const sc = readStateColors();
     for (const k of STATE_KEYS) {
       const c = this.colors.get(k) ?? new THREE.Color();
@@ -549,6 +560,7 @@ export class MapScene {
     for (const l of this.labels) l.el.remove();
     this.labels = [];
     for (const km of this.meshes.values()) km.mesh.dispose();
+    this.planLayer.dispose();
     disposeTree(this.scene);
     this.scene.clear();
     this.meshes.clear();
