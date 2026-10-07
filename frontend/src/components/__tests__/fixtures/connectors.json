@@ -1,0 +1,773 @@
+[
+ {
+  "type": "csv_file",
+  "display_name": "CSV / Excel file",
+  "category": "file",
+  "modes": [
+   "poll"
+  ],
+  "description": "Upload CSV or Excel (.xlsx) files. Upload a new version to update the map.",
+  "settings_schema": {
+   "type": "object",
+   "properties": {
+    "folder": {
+     "type": "string",
+     "title": "Folder on the server",
+     "description": "Set automatically on the first upload. Admins can point it at a folder inside LIVEOPS_DATA_DIR."
+    },
+    "delimiter": {
+     "type": "string",
+     "title": "CSV delimiter",
+     "default": ",",
+     "maxLength": 1
+    },
+    "encoding": {
+     "type": "string",
+     "title": "CSV encoding",
+     "default": "utf-8-sig"
+    },
+    "sheet": {
+     "type": "string",
+     "title": "Excel sheet (default: first sheet)"
+    }
+   }
+  },
+  "secrets_schema": {
+   "type": "object",
+   "properties": {}
+  },
+  "maturity": "beta"
+ },
+ {
+  "type": "sqlserver",
+  "display_name": "Microsoft SQL Server",
+  "category": "database",
+  "modes": [
+   "poll",
+   "cdc"
+  ],
+  "description": "Reads tables and views from SQL Server 2016+ / Azure SQL with a read-only login. CDC mode uses Change Tracking.",
+  "settings_schema": {
+   "type": "object",
+   "required": [
+    "host",
+    "port",
+    "database",
+    "user"
+   ],
+   "properties": {
+    "host": {
+     "type": "string",
+     "title": "Host",
+     "examples": [
+      "sql.example.com"
+     ]
+    },
+    "port": {
+     "type": "integer",
+     "title": "Port",
+     "default": 1433
+    },
+    "database": {
+     "type": "string",
+     "title": "Database"
+    },
+    "user": {
+     "type": "string",
+     "title": "Read-only login"
+    },
+    "encryption": {
+     "type": "string",
+     "title": "Encryption",
+     "enum": [
+      "required",
+      "off"
+     ],
+     "default": "required",
+     "description": "'required' encrypts the whole session with TLS. The driver does not check the server certificate. Use 'off' only for local testing."
+    },
+    "mode": {
+     "type": "string",
+     "title": "How to read changes",
+     "enum": [
+      "poll",
+      "cdc"
+     ],
+     "default": "poll",
+     "description": "'cdc' reads SQL Server Change Tracking (faster, needs it turned on)."
+    },
+    "schemas": {
+     "type": "array",
+     "items": {
+      "type": "string"
+     },
+     "title": "Schemas to list",
+     "default": [
+      "dbo"
+     ]
+    }
+   }
+  },
+  "secrets_schema": {
+   "type": "object",
+   "required": [
+    "password"
+   ],
+   "properties": {
+    "password": {
+     "type": "string",
+     "title": "Password",
+     "format": "password"
+    }
+   }
+  },
+  "maturity": "needs_real_test"
+ },
+ {
+  "type": "mysql",
+  "display_name": "MySQL",
+  "category": "database",
+  "modes": [
+   "cdc",
+   "poll"
+  ],
+  "description": "Reads tables from MySQL 8 with a read-only user. Streams changes live from the binary log when it is enabled (binlog_format=ROW), otherwise polls.",
+  "settings_schema": {
+   "type": "object",
+   "required": [
+    "host",
+    "port",
+    "database",
+    "user"
+   ],
+   "properties": {
+    "host": {
+     "type": "string",
+     "title": "Host",
+     "examples": [
+      "db.example.com"
+     ]
+    },
+    "port": {
+     "type": "integer",
+     "title": "Port",
+     "default": 3306
+    },
+    "database": {
+     "type": "string",
+     "title": "Database (schema)"
+    },
+    "user": {
+     "type": "string",
+     "title": "Read-only user"
+    },
+    "mode": {
+     "type": "string",
+     "title": "How to read changes",
+     "enum": [
+      "auto",
+      "cdc",
+      "poll"
+     ],
+     "default": "auto",
+     "description": "auto: live from the binary log when usable, otherwise poll."
+    },
+    "encryption": {
+     "type": "string",
+     "title": "Encryption",
+     "enum": [
+      "required",
+      "verify",
+      "off"
+     ],
+     "default": "required",
+     "description": "Use 'off' only for local testing. 'verify' also checks the server certificate."
+    },
+    "ssl_ca": {
+     "type": "string",
+     "title": "CA certificate file (for 'verify')",
+     "description": "Path on the Live Ops server. Empty uses the system trust store."
+    },
+    "server_id": {
+     "type": "integer",
+     "title": "Replica server id (CDC)",
+     "description": "Unique among the server's replicas. Empty picks a random one.",
+     "minimum": 1,
+     "maximum": 4294967295
+    }
+   }
+  },
+  "secrets_schema": {
+   "type": "object",
+   "required": [
+    "password"
+   ],
+   "properties": {
+    "password": {
+     "type": "string",
+     "title": "Password",
+     "format": "password"
+    }
+   }
+  },
+  "maturity": "beta"
+ },
+ {
+  "type": "oracle",
+  "display_name": "Oracle Database",
+  "category": "database",
+  "modes": [
+   "poll"
+  ],
+  "description": "Reads tables and views from Oracle 12c+ with a read-only user. No Oracle Client needed.",
+  "settings_schema": {
+   "type": "object",
+   "required": [
+    "host",
+    "port",
+    "service_name",
+    "user"
+   ],
+   "properties": {
+    "host": {
+     "type": "string",
+     "title": "Host",
+     "examples": [
+      "oracle.example.com"
+     ]
+    },
+    "port": {
+     "type": "integer",
+     "title": "Port",
+     "default": 1521,
+     "description": "Usually 1521 for plain TCP and 2484 for TCPS (encrypted)."
+    },
+    "service_name": {
+     "type": "string",
+     "title": "Service name",
+     "examples": [
+      "ORCLPDB1",
+      "FREEPDB1"
+     ]
+    },
+    "user": {
+     "type": "string",
+     "title": "Read-only user"
+    },
+    "encryption": {
+     "type": "string",
+     "title": "Encryption",
+     "enum": [
+      "required",
+      "verify",
+      "off"
+     ],
+     "default": "required",
+     "description": "'required' connects over TCPS (TLS). 'verify' also checks the server certificate and host name. 'off' uses plain TCP: local testing only."
+    },
+    "ca_file": {
+     "type": "string",
+     "title": "CA certificate file (verify only)",
+     "description": "Path on the Live Ops server to a PEM file. Empty uses the system certificates."
+    },
+    "schemas": {
+     "type": "array",
+     "items": {
+      "type": "string"
+     },
+     "title": "Schemas (owners) to list",
+     "description": "Empty lists the user's own schema. Names are case-sensitive, usually UPPER CASE."
+    }
+   }
+  },
+  "secrets_schema": {
+   "type": "object",
+   "required": [
+    "password"
+   ],
+   "properties": {
+    "password": {
+     "type": "string",
+     "title": "Password",
+     "format": "password"
+    }
+   }
+  },
+  "maturity": "needs_real_test"
+ },
+ {
+  "type": "postgres",
+  "display_name": "PostgreSQL",
+  "category": "database",
+  "modes": [
+   "poll"
+  ],
+  "description": "Reads tables and views from PostgreSQL 12+ with a read-only user.",
+  "settings_schema": {
+   "type": "object",
+   "required": [
+    "host",
+    "port",
+    "database",
+    "user"
+   ],
+   "properties": {
+    "host": {
+     "type": "string",
+     "title": "Host",
+     "examples": [
+      "db.example.com"
+     ]
+    },
+    "port": {
+     "type": "integer",
+     "title": "Port",
+     "default": 5432
+    },
+    "database": {
+     "type": "string",
+     "title": "Database"
+    },
+    "user": {
+     "type": "string",
+     "title": "Read-only user"
+    },
+    "encryption": {
+     "type": "string",
+     "title": "Encryption",
+     "enum": [
+      "required",
+      "verify",
+      "off"
+     ],
+     "default": "required",
+     "description": "Required: traffic is encrypted. Verify: also checks the server's certificate against trusted authorities (use for servers outside your network). Off: local testing only."
+    },
+    "schemas": {
+     "type": "array",
+     "items": {
+      "type": "string"
+     },
+     "title": "Schemas to list",
+     "default": [
+      "public"
+     ]
+    }
+   }
+  },
+  "secrets_schema": {
+   "type": "object",
+   "required": [
+    "password"
+   ],
+   "properties": {
+    "password": {
+     "type": "string",
+     "title": "Password",
+     "format": "password"
+    }
+   }
+  },
+  "maturity": "stable"
+ },
+ {
+  "type": "postgres_cdc",
+  "display_name": "PostgreSQL (live changes)",
+  "category": "database",
+  "modes": [
+   "cdc"
+  ],
+  "description": "Streams row changes from PostgreSQL 12+ as they commit, using logical replication. Needs wal_level=logical, a user with the REPLICATION attribute and a publication.",
+  "settings_schema": {
+   "type": "object",
+   "required": [
+    "host",
+    "port",
+    "database",
+    "user",
+    "publication"
+   ],
+   "properties": {
+    "host": {
+     "type": "string",
+     "title": "Host",
+     "examples": [
+      "db.example.com"
+     ]
+    },
+    "port": {
+     "type": "integer",
+     "title": "Port",
+     "default": 5432
+    },
+    "database": {
+     "type": "string",
+     "title": "Database"
+    },
+    "user": {
+     "type": "string",
+     "title": "User with REPLICATION and SELECT"
+    },
+    "publication": {
+     "type": "string",
+     "title": "Publication",
+     "default": "liveops",
+     "description": "Created by an admin: CREATE PUBLICATION liveops FOR TABLE public.my_table;"
+    },
+    "encryption": {
+     "type": "string",
+     "title": "Encryption",
+     "enum": [
+      "required",
+      "verify",
+      "off"
+     ],
+     "default": "required",
+     "description": "Use 'off' only for local testing."
+    },
+    "schemas": {
+     "type": "array",
+     "items": {
+      "type": "string"
+     },
+     "title": "Schemas to list",
+     "default": [
+      "public"
+     ]
+    }
+   }
+  },
+  "secrets_schema": {
+   "type": "object",
+   "required": [
+    "password"
+   ],
+   "properties": {
+    "password": {
+     "type": "string",
+     "title": "Password",
+     "format": "password"
+    }
+   }
+  },
+  "maturity": "beta"
+ },
+ {
+  "type": "rest",
+  "display_name": "REST API (JSON)",
+  "category": "api",
+  "modes": [
+   "poll"
+  ],
+  "description": "Polls a JSON HTTP API endpoint (GET) and diffs the records it returns.",
+  "settings_schema": {
+   "type": "object",
+   "required": [
+    "base_url"
+   ],
+   "properties": {
+    "base_url": {
+     "type": "string",
+     "title": "Base URL",
+     "examples": [
+      "https://api.example.com"
+     ]
+    },
+    "path": {
+     "type": "string",
+     "title": "Path",
+     "default": "",
+     "examples": [
+      "/v1/beds"
+     ]
+    },
+    "method": {
+     "type": "string",
+     "title": "Method",
+     "enum": [
+      "GET"
+     ],
+     "default": "GET"
+    },
+    "query": {
+     "type": "object",
+     "title": "Query parameters",
+     "additionalProperties": {
+      "type": "string"
+     },
+     "default": {}
+    },
+    "record_path": {
+     "type": "string",
+     "title": "Where the records are",
+     "description": "Dotted path to the list of records in the response, e.g. data.items. Leave empty if the response itself is the list.",
+     "default": ""
+    },
+    "dataset_name": {
+     "type": "string",
+     "title": "Dataset name",
+     "description": "Name shown in the mapping screen. Defaults to the path."
+    },
+    "auth": {
+     "type": "string",
+     "title": "Sign-in method",
+     "enum": [
+      "none",
+      "api_key",
+      "bearer",
+      "oauth2_client_credentials"
+     ],
+     "default": "none"
+    },
+    "api_key_header": {
+     "type": "string",
+     "title": "API key header name",
+     "default": "X-API-Key"
+    },
+    "token_url": {
+     "type": "string",
+     "title": "OAuth2 token URL"
+    },
+    "oauth_scope": {
+     "type": "string",
+     "title": "OAuth2 scope (optional)"
+    },
+    "pagination": {
+     "type": "string",
+     "title": "Pagination",
+     "enum": [
+      "none",
+      "page_number",
+      "cursor",
+      "link_header"
+     ],
+     "default": "none"
+    },
+    "page_param": {
+     "type": "string",
+     "title": "Page number parameter",
+     "default": "page"
+    },
+    "page_size_param": {
+     "type": "string",
+     "title": "Page size parameter",
+     "default": "per_page"
+    },
+    "page_size": {
+     "type": "integer",
+     "title": "Page size",
+     "default": 100,
+     "minimum": 1
+    },
+    "start_page": {
+     "type": "integer",
+     "title": "First page number",
+     "default": 1
+    },
+    "cursor_param": {
+     "type": "string",
+     "title": "Cursor parameter",
+     "default": "cursor"
+    },
+    "cursor_path": {
+     "type": "string",
+     "title": "Where the next cursor is",
+     "description": "Dotted path in the response, e.g. meta.next_cursor.",
+     "default": "next_cursor"
+    },
+    "max_pages": {
+     "type": "integer",
+     "title": "Max pages per poll",
+     "default": 50,
+     "minimum": 1,
+     "maximum": 1000
+    },
+    "timeout_s": {
+     "type": "number",
+     "title": "Timeout (seconds)",
+     "default": 15,
+     "minimum": 1
+    },
+    "max_response_mb": {
+     "type": "number",
+     "title": "Max response size (MB)",
+     "default": 10
+    },
+    "allow_http": {
+     "type": "boolean",
+     "title": "Allow plain HTTP",
+     "default": false,
+     "description": "Only for local testing. Company APIs should use HTTPS."
+    }
+   }
+  },
+  "secrets_schema": {
+   "type": "object",
+   "properties": {
+    "api_key": {
+     "type": "string",
+     "title": "API key",
+     "format": "password"
+    },
+    "bearer_token": {
+     "type": "string",
+     "title": "Bearer token",
+     "format": "password"
+    },
+    "client_id": {
+     "type": "string",
+     "title": "OAuth2 client ID"
+    },
+    "client_secret": {
+     "type": "string",
+     "title": "OAuth2 client secret",
+     "format": "password"
+    }
+   }
+  },
+  "maturity": "beta"
+ },
+ {
+  "type": "s3_files",
+  "display_name": "S3 / object storage files",
+  "category": "file",
+  "modes": [
+   "poll"
+  ],
+  "description": "Reads CSV, Excel and JSON-lines files from an S3-compatible bucket (AWS S3, MinIO, ...).",
+  "settings_schema": {
+   "type": "object",
+   "required": [
+    "bucket"
+   ],
+   "properties": {
+    "bucket": {
+     "type": "string",
+     "title": "Bucket"
+    },
+    "prefix": {
+     "type": "string",
+     "title": "Folder / prefix",
+     "default": "",
+     "examples": [
+      "exports/"
+     ]
+    },
+    "region": {
+     "type": "string",
+     "title": "Region",
+     "default": "us-east-1"
+    },
+    "endpoint_url": {
+     "type": "string",
+     "title": "Endpoint URL (not AWS)",
+     "description": "For MinIO and other S3-compatible stores, e.g. https://minio.example.com:9000. Leave empty for AWS."
+    },
+    "encryption": {
+     "type": "string",
+     "title": "Encryption",
+     "enum": [
+      "required",
+      "verify",
+      "off"
+     ],
+     "default": "required",
+     "description": "HTTPS with certificate checks. Use 'off' (plain HTTP) only for local testing."
+    },
+    "delimiter": {
+     "type": "string",
+     "title": "CSV delimiter",
+     "default": ",",
+     "maxLength": 1
+    },
+    "encoding": {
+     "type": "string",
+     "title": "CSV encoding",
+     "default": "utf-8-sig"
+    },
+    "sheet": {
+     "type": "string",
+     "title": "Excel sheet (default: first sheet)"
+    }
+   }
+  },
+  "secrets_schema": {
+   "type": "object",
+   "properties": {
+    "access_key_id": {
+     "type": "string",
+     "title": "Access key ID"
+    },
+    "secret_access_key": {
+     "type": "string",
+     "title": "Secret access key",
+     "format": "password"
+    },
+    "session_token": {
+     "type": "string",
+     "title": "Session token (optional)",
+     "format": "password"
+    }
+   }
+  },
+  "maturity": "needs_real_test"
+ },
+ {
+  "type": "webhook",
+  "display_name": "Webhook (push)",
+  "category": "api",
+  "modes": [
+   "push"
+  ],
+  "description": "Your system POSTs signed JSON records to a Live Ops URL; changes show up immediately.",
+  "settings_schema": {
+   "type": "object",
+   "required": [
+    "key_field"
+   ],
+   "properties": {
+    "key_field": {
+     "type": "string",
+     "title": "Record ID field",
+     "default": "id",
+     "description": "Field that identifies a record, e.g. bed_id. Every record must have it."
+    },
+    "dataset_name": {
+     "type": "string",
+     "title": "Dataset name",
+     "default": "events"
+    },
+    "max_body_kb": {
+     "type": "integer",
+     "title": "Max request size (KB)",
+     "default": 1024,
+     "minimum": 1,
+     "maximum": 10240
+    },
+    "max_records": {
+     "type": "integer",
+     "title": "Records kept as current state",
+     "default": 10000,
+     "minimum": 1,
+     "maximum": 100000
+    }
+   }
+  },
+  "secrets_schema": {
+   "type": "object",
+   "required": [
+    "signing_secret"
+   ],
+   "properties": {
+    "signing_secret": {
+     "type": "string",
+     "title": "Signing secret",
+     "format": "password",
+     "minLength": 16,
+     "description": "Shared with the sender; used for HMAC-SHA256 signatures. 16+ characters."
+    }
+   }
+  },
+  "maturity": "beta"
+ }
+]

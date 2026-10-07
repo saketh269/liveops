@@ -100,11 +100,12 @@ export default function HealthPage() {
                   <div><dt>Events / min</dt><dd>{h.events_per_min}</dd></div>
                   <div><dt>Lag p95</dt><dd>{formatMs(h.lag_ms_p95)}</dd></div>
                   <div><dt>Events total</dt><dd>{h.events_total}</dd></div>
-                  <div><dt>Skipped records</dt><dd>{h.skipped_records}</dd></div>
+                  <div><dt>Rows skipped (no ID)</dt><dd>{h.skipped_records}</dd></div>
                 </dl>
                 {h.skipped_records > 0 && (
                   <p className="muted" style={{ margin: 0 }}>
-                    Skipped records had no value in the ID column. Check the mapping's ID column or fill the gaps in the source.
+                    Some rows had no value in the ID or match key column, so they aren't on the map. Check the mapping's
+                    ID column, or fill in the missing values in the source.
                   </p>
                 )}
                 {h.last_error && (

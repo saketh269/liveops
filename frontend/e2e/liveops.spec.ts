@@ -89,6 +89,36 @@ test("connect Postgres, test it, create a site, map beds, and see it running on 
   await expect(row.locator("dt", { hasText: "Events / min" }).locator("xpath=following-sibling::dd")).not.toHaveText("0");
 });
 
+test("edit mapping keeps its config; REST query parameters are saved as an object (LIVEOPS-32, LIVEOPS-20)", async ({ page }) => {
+  // Mapping from the first test: open Edit, save without changes, the stored config is unchanged.
+  const before = (await (await page.request.get("/api/mappings")).json())[0];
+  await page.goto(`/mapping/${before.id}/edit`);
+  await expect(page.getByRole("region", { name: "Preview of records" }).getByRole("row")).toHaveCount(5);
+  await page.getByRole("button", { name: "Save changes" }).click();
+  await expect(page.getByText(/Mapping saved/)).toBeVisible();
+  const after = (await (await page.request.get("/api/mappings")).json())[0];
+  expect(after.config).toEqual(before.config);
+  expect(after.config.state_map).toEqual({ occupied: "in_use", vacant: "free" });
+  expect(after.config.attributes).toEqual(["patient_count"]);
+
+  // REST source with query parameters, through the real API.
+  await page.goto("/sources/new");
+  await page.getByRole("button", { name: /^REST API/ }).click();
+  await page.getByLabel(/^Name/).fill("E2E REST");
+  await page.getByLabel(/^Base URL/).fill("https://api.example.com");
+  await page.getByRole("button", { name: "Add query parameter" }).click();
+  await page.getByLabel("Query parameters: name 1").fill("status");
+  await page.getByLabel("Query parameters: value 1").fill("active");
+  await page.getByRole("button", { name: "Save and test" }).click();
+  await expect(page.getByRole("heading", { name: "E2E REST", level: 1 })).toBeVisible();
+  const sources = await (await page.request.get("/api/sources")).json();
+  const rest = sources.find((x: { name: string }) => x.name === "E2E REST");
+  expect(rest.settings.query).toEqual({ status: "active" });
+  // Edit page shows the saved parameter as a row, not "[object Object]".
+  await expect(page.getByLabel("Query parameters: name 1")).toHaveValue("status");
+  await expect(page.getByLabel("Query parameters: value 1")).toHaveValue("active");
+});
+
 test("pages fit a 400 px wide screen without sideways scrolling, light and dark", async ({ page }, info) => {
   await page.setViewportSize({ width: 400, height: 800 });
   const paths = ["/sources", "/sources/new", "/sites", "/mapping", "/mapping/new", "/health"];

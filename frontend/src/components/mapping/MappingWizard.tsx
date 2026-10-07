@@ -7,6 +7,10 @@ import { useLoad } from "../useLoad";
 
 /** States the live map colors (see --state-* tokens). Anything else shows as "unknown". */
 export const MAP_STATES = ["free", "in_use", "cleaning", "alert"];
+/** Mirrors MIN_POLL_INTERVAL_S in backend/app/connectors/base.py. */
+export const MIN_POLL_S = 0.5;
+const MAIN_FIELDS = ["zone", "state", "label"] as const;
+type ExtraField = { name: string; column: string };
 
 type Props = {
   sites: Site[];
@@ -43,6 +47,7 @@ function ColumnSelect({ id, value, onChange, columns, noneLabel, invalid, descri
   return (
     <select id={id} value={value} onChange={(e) => onChange(e.target.value)} aria-invalid={invalid} aria-describedby={describedBy}>
       <option value="">{noneLabel ?? "Choose a column"}</option>
+      {value && !columns.some((c) => c.name === value) && <option value={value}>{value} (not in this table)</option>}
       {columns.map((c) => <option key={c.name} value={c.name}>{c.name} ({c.type})</option>)}
     </select>
   );
@@ -57,6 +62,11 @@ export function MappingWizard({ sites, sources, connectors, existing, initialSit
   const [fields, setFields] = useState<Record<"zone" | "state" | "label", string>>({
     zone: cfg?.fields.zone ?? "", state: cfg?.fields.state ?? "", label: cfg?.fields.label ?? "",
   });
+  // Any other asset field the config maps (e.g. x, y, cleaning) is kept and editable (LIVEOPS-32).
+  const [extraFields, setExtraFields] = useState<ExtraField[]>(() =>
+    Object.entries(cfg?.fields ?? {})
+      .filter(([k]) => !(MAIN_FIELDS as readonly string[]).includes(k))
+      .map(([name, column]) => ({ name, column })));
   const [kind, setKind] = useState(cfg?.kind ?? "");
   const [attributes, setAttributes] = useState<string[]>(cfg?.attributes ?? []);
   const [stateMap, setStateMap] = useState<Record<string, string>>(cfg?.state_map ?? {});
@@ -84,8 +94,9 @@ export function MappingWizard({ sites, sources, connectors, existing, initialSit
         if (v !== null && v !== undefined && v !== "") seen.add(String(v));
       }
     }
-    for (const k of Object.keys(stateMap)) seen.add(k);
-    return [...seen].slice(0, 40);
+    const fromPreview = [...seen].slice(0, 40);
+    // Saved translations are always shown, even beyond the preview cap, so none are lost on save.
+    return [...new Set([...fromPreview, ...Object.keys(stateMap)])];
   }, [pv.data, fields.state, stateMap]);
 
   const pickDataset = (name: string) => {
@@ -95,6 +106,7 @@ export function MappingWizard({ sites, sources, connectors, existing, initialSit
     setIdField(d?.primary_key[0] ?? "");
     const guess = (re: RegExp) => cols.find((c) => re.test(c)) ?? "";
     setFields({ zone: guess(GUESS.zone), state: guess(GUESS.state), label: guess(GUESS.label) });
+    setExtraFields([]);
     setAttributes([]);
     setStateMap({});
     setMatchMode("id");
@@ -115,19 +127,28 @@ export function MappingWizard({ sites, sources, connectors, existing, initialSit
     if (!dataset) errs.dataset = "Choose a table or dataset.";
     if (!idField) errs.id = "Choose the column that identifies each asset, such as bed_id.";
     if (matchMode === "other" && !matchKey) errs.match = "Choose the shared key column, or use the ID column.";
-    const pollN = Number(poll);
-    if (!(pollN >= 1 && pollN <= 3600)) errs.poll = "Enter a number of seconds between 1 and 3600.";
+    const pollN = Number(poll.trim().replace(",", "."));
+    if (poll.trim() === "" || !(pollN >= MIN_POLL_S && pollN <= 3600)) errs.poll = `Enter a number of seconds between ${MIN_POLL_S} and 3600.`;
+    const names = extraFields.filter((f) => f.name.trim() || f.column).map((f) => f.name.trim());
+    if (extraFields.some((f) => (f.name.trim() === "") !== (f.column === ""))) errs.extra = "Each extra field needs both a name and a column.";
+    else if (names.some((n) => (MAIN_FIELDS as readonly string[]).includes(n) || n === "kind")) errs.extra = "Zone, state, label and kind are set above; use another name.";
+    else if (new Set(names).size !== names.length) errs.extra = "Each extra field name can be used only once.";
     setErrors(errs);
     setServerError(null);
     if (Object.keys(errs).length) return;
 
     const config: MappingConfig = {
+      // Keep any config keys this screen doesn't know about.
+      ...(cfg ?? {}),
       id_field: idField,
-      match_key: matchMode === "other" ? matchKey : null,
-      fields: Object.fromEntries(Object.entries(fields).filter(([, c]) => c)),
-      state_map: fields.state
-        ? Object.fromEntries(Object.entries(stateMap).filter(([raw, to]) => to.trim() && to.trim() !== raw).map(([r, t]) => [r, t.trim()]))
-        : {},
+      // "Use the ID column": keep an explicit match_key equal to the ID column as it was saved.
+      match_key: matchMode === "other" ? matchKey : cfg?.match_key && cfg.match_key === idField ? cfg.match_key : null,
+      fields: {
+        ...Object.fromEntries(Object.entries(fields).filter(([, c]) => c)),
+        ...Object.fromEntries(extraFields.filter((f) => f.name.trim() && f.column).map((f) => [f.name.trim(), f.column])),
+      },
+      state_map: Object.fromEntries(
+        Object.entries(stateMap).filter(([raw, to]) => to.trim() && to.trim() !== raw).map(([r, t]) => [r, t.trim()])),
       attributes,
       kind: kind.trim() || null,
     };
@@ -254,17 +275,40 @@ export function MappingWizard({ sites, sources, connectors, existing, initialSit
             </div>
           </div>
           <fieldset>
+            <legend>More fields</legend>
+            <p className="help muted" style={{ marginTop: 0 }}>
+              Other asset fields, such as x and y for a fixed position, or a field another source also sets.
+            </p>
+            {extraFields.map((f, i) => (
+              <div className="kv-row" key={i} style={{ marginBottom: 6 }}>
+                <input aria-label={`Field name ${i + 1}`} placeholder="field name, e.g. x" value={f.name} autoComplete="off"
+                  aria-invalid={!!errors.extra}
+                  onChange={(e) => setExtraFields(extraFields.map((x, j) => (j === i ? { ...x, name: e.target.value } : x)))} />
+                <select aria-label={`Column for field ${i + 1}`} value={f.column}
+                  onChange={(e) => setExtraFields(extraFields.map((x, j) => (j === i ? { ...x, column: e.target.value } : x)))}>
+                  <option value="">Choose a column</option>
+                  {f.column && !columns.some((c) => c.name === f.column) && <option value={f.column}>{f.column} (not in this table)</option>}
+                  {columns.map((c) => <option key={c.name} value={c.name}>{c.name}</option>)}
+                </select>
+                <button type="button" className="btn link" onClick={() => setExtraFields(extraFields.filter((_, j) => j !== i))}
+                  aria-label={`Remove field ${f.name || i + 1}`}>Remove</button>
+              </div>
+            ))}
+            {errors.extra && <p className="err" role="alert" style={{ margin: "0 0 6px" }}>{errors.extra}</p>}
+            <button type="button" className="btn" onClick={() => setExtraFields([...extraFields, { name: "", column: "" }])}>Add a field</button>
+          </fieldset>
+          <fieldset>
             <legend>Extra attributes</legend>
             <p className="help muted" style={{ marginTop: 0 }}>Shown in the asset's details panel on the map.</p>
             <div className="checks">
-              {columns.map((c) => (
-                <label key={c.name} className="check">
+              {[...columns.map((c) => c.name), ...attributes.filter((a) => !columns.some((c) => c.name === a))].map((name) => (
+                <label key={name} className="check">
                   <input
                     type="checkbox"
-                    checked={attributes.includes(c.name)}
-                    onChange={(e) => setAttributes(e.target.checked ? [...attributes, c.name] : attributes.filter((a) => a !== c.name))}
+                    checked={attributes.includes(name)}
+                    onChange={(e) => setAttributes(e.target.checked ? [...attributes, name] : attributes.filter((a) => a !== name))}
                   />
-                  {c.name}
+                  {name}
                 </label>
               ))}
             </div>
@@ -325,11 +369,11 @@ export function MappingWizard({ sites, sources, connectors, existing, initialSit
         <Step title={existing ? "Save" : "Save and start"} locked={!hasDataset} lockedText={lockedText}>
           <div className="field" style={{ maxWidth: 260 }}>
             <label htmlFor="m-poll">Check for changes every (seconds)</label>
-            <input id="m-poll" inputMode="numeric" value={poll} onChange={(e) => setPoll(e.target.value)} aria-invalid={!!errors.poll} aria-describedby="m-poll-help" />
+            <input id="m-poll" inputMode="decimal" value={poll} onChange={(e) => setPoll(e.target.value)} aria-invalid={!!errors.poll} aria-describedby="m-poll-help" />
             <span className="help" id="m-poll-help">
               {spec && !spec.modes.includes("poll")
                 ? "This source sends changes as they happen, so this is only used as a fallback."
-                : "Lower is more live but puts more load on the source. 3 seconds suits most databases."}
+                : `At least ${MIN_POLL_S} seconds. Lower is more live but puts more load on the source; 3 seconds suits most databases.`}
             </span>
             {errors.poll && <span className="err">{errors.poll}</span>}
           </div>
