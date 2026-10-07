@@ -363,3 +363,37 @@ async def test_snapshot_skips_non_matching_rows_without_removing_matching_ones()
     assert rm.health["m1"].status == "running"
     await q.put(None)
     await rm.stop_all()
+
+
+async def test_an_update_to_an_old_closed_row_keeps_the_current_rows_details() -> None:
+    """Two visits share bed B1: an update to the old, already-closed one must not
+    wipe what the open one shows; closing the open one does remove it."""
+    q: asyncio.Queue[Change | None] = asyncio.Queue()
+    CDC_SCRIPTS["visits-old"] = q
+    initial = [
+        {"visit_id": 1, "bed_id": "B1", "patient": "P-1", "discharged_at": "2026-10-06T10:00:00Z"},
+        {"visit_id": 2, "bed_id": "B1", "patient": "P-2", "discharged_at": None},
+    ]
+    store = InMemoryStateStore()
+    rm = RunnerManager(store)
+    await rm.start(mspec("test_filter_cdc", {"initial": initial, "script": "visits-old"}, VISITS))
+    await eventually(store, {"B1": "P-2"}, "label")
+
+    # Someone corrects the old visit's discharge time: still closed, still hidden.
+    await q.put(cdc_change({"visit_id": 1, "bed_id": "B1", "patient": "P-1", "discharged_at": "2026-10-06T11:00:00Z"}))
+    # A marker change after it, so we know the old-row update was processed.
+    await q.put(cdc_change({"visit_id": 3, "bed_id": "B9", "patient": "P-9", "discharged_at": None}))
+    await eventually(store, {"B1": "P-2", "B9": "P-9"}, "label")
+
+    # A second open visit for B1 takes over; closing the first one no longer matters.
+    await q.put(cdc_change({"visit_id": 4, "bed_id": "B1", "patient": "P-4", "discharged_at": None}))
+    await eventually(store, {"B1": "P-4", "B9": "P-9"}, "label")
+    await q.put(cdc_change({"visit_id": 2, "bed_id": "B1", "patient": "P-2", "discharged_at": "2026-10-07T09:00:00Z"}))
+    await q.put(cdc_change({"visit_id": 5, "bed_id": "B8", "patient": "P-8", "discharged_at": None}))
+    await eventually(store, {"B1": "P-4", "B8": "P-8", "B9": "P-9"}, "label")
+
+    # Closing the row that is shown removes it.
+    await q.put(cdc_change({"visit_id": 4, "bed_id": "B1", "patient": "P-4", "discharged_at": "2026-10-07T10:00:00Z"}))
+    await eventually(store, {"B8": "P-8", "B9": "P-9"}, "label")
+    await q.put(None)
+    await rm.stop_all()
