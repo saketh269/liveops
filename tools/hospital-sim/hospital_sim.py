@@ -109,7 +109,8 @@ class Config:
 
 
 def config_from_args(argv=None) -> tuple[Config, argparse.Namespace]:
-    env = os.environ.get
+    def env(name, default=None):
+        return os.environ.get(name) or default   # an empty variable (e.g. from compose) means unset
     p = argparse.ArgumentParser(description="Live Ops hospital simulator (test tool)")
     p.add_argument("--dsn", default=env("SOURCES_DSN", DEFAULT_DSN))
     p.add_argument("--pace", type=float, default=float(env("SIM_PACE", "1")),
@@ -723,7 +724,7 @@ class Hospital:
 
     def arrival_rate(self) -> float:
         mean_los = sum(ER_LOS[a] * w for a, w in zip(range(1, 6), [0.02, 0.15, 0.45, 0.3, 0.08])) * 1.13
-        base = 0.7 * self.cfg.units[ER] / mean_los * self.cfg.arrival_scale
+        base = 0.6 * self.cfg.units[ER] / mean_los * self.cfg.arrival_scale
         hour = ((START_CLOCK + self.t) % 1440) / 60
         diurnal = 1 + 0.3 * math.sin(2 * math.pi * (hour - 10) / 24)
         return base * diurnal * (2.5 if self.t < self.surge_until else 1.0)
@@ -782,11 +783,12 @@ class Hospital:
     def arrivals(self):
         rate = self.arrival_rate()
         peds_ok = PEDS in self.cfg.units
-        for _ in range(self.poisson(rate * 0.78)):
+        for _ in range(self.poisson(rate * 0.7)):
             p = Patient(self.new_ref(), self.draw_acuity("walk-in"), "walk-in",
                         peds_ok and self.rng.random() < 0.15, "arriving", ENTRANCE)
             self.arrive(p, ENTRANCE, "arriving")
-        amb_rate = rate * 0.22 * (0.7 if self.t < self.surge_until else 1.0)
+        # about one ambulance every 30-45 simulated minutes, more during a rush
+        amb_rate = max(rate * 0.3, 1 / 45) * (1.5 if self.t < self.surge_until else 1.0)
         if self.rng.random() < amb_rate:
             idle = [a for a in self.ambulances.values() if a.status == "idle"]
             if idle:
