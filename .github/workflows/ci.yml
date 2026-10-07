@@ -3,6 +3,9 @@ on:
   push: { branches: [main] }
   pull_request:
 
+permissions:
+  contents: read  # least privilege for the default token (LIVEOPS-69)
+
 jobs:
   backend:
     runs-on: ubuntu-latest
@@ -19,6 +22,7 @@ jobs:
     env:
       LIVEOPS_TEST_PG_DSN: postgresql://postgres:postgres@localhost:5432/postgres
       LIVEOPS_TEST_REDIS_URL: redis://localhost:6379/0
+      LIVEOPS_TEST_MYSQL_DSN: mysql://root:root@127.0.0.1:3306/
     defaults: { run: { working-directory: backend } }
     steps:
       - uses: actions/checkout@v4
@@ -27,6 +31,16 @@ jobs:
           docker exec ${{ job.services.postgres.id }} sh -c "echo 'wal_level = logical' >> /var/lib/postgresql/data/postgresql.conf"
           docker restart ${{ job.services.postgres.id }}
           for i in $(seq 1 30); do pg_isready -h localhost -U postgres && break; sleep 1; done
+      # MySQL runs as a step, not under `services:`, because service containers can't take
+      # a command and CDC tests need the binary log in ROW format.
+      - name: Start MySQL 8.0 (binlog on, ROW format)
+        run: |
+          docker run -d --name mysql -p 3306:3306 -e MYSQL_ROOT_PASSWORD=root mysql:8.0 \
+            --log-bin=mysql-bin --binlog-format=ROW --server-id=1
+          for i in $(seq 1 60); do
+            docker exec mysql mysql -uroot -proot -h127.0.0.1 -e "SELECT 1" >/dev/null 2>&1 && break; sleep 2
+          done
+          docker exec mysql mysql -uroot -proot -h127.0.0.1 -e "SELECT @@log_bin, @@binlog_format, @@have_ssl"
       - uses: actions/setup-python@v5
         with: { python-version: "3.12", cache: pip }
       - run: pip install -e ".[dev]"
@@ -37,7 +51,10 @@ jobs:
       - name: Tests (unit, contract, integration)
         run: pytest -q
       - name: Dependency audit
-        run: pip-audit --strict --progress-spinner off || (echo "::warning::pip-audit found issues" && exit 1)
+        # Audit the installed third-party set; our own editable package can't be audited (LIVEOPS-67).
+        run: |
+          pip freeze --exclude-editable > /tmp/requirements-audit.txt
+          pip-audit --strict --no-deps --progress-spinner off -r /tmp/requirements-audit.txt
 
   frontend:
     runs-on: ubuntu-latest
@@ -67,3 +84,64 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: docker compose build
+
+  enterprise-db:
+    # SQL Server and Oracle can only be tested here (the build workspace can't pull these images).
+    runs-on: ubuntu-latest
+    services:
+      mssql:
+        image: mcr.microsoft.com/mssql/server:2022-latest
+        env:
+          ACCEPT_EULA: "Y"
+          MSSQL_SA_PASSWORD: LiveOps_Test_Pw1
+          MSSQL_PID: Developer
+        ports: ["1433:1433"]
+        options: >-
+          --health-cmd "/opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P LiveOps_Test_Pw1 -Q 'SELECT 1' -b"
+          --health-interval 5s --health-timeout 5s --health-retries 40
+      oracle:
+        image: gvenzl/oracle-free:23-slim
+        env:
+          ORACLE_PASSWORD: LiveOps_Test_Pw1
+        ports: ["1521:1521"]
+        options: >-
+          --health-cmd healthcheck.sh
+          --health-interval 10s --health-timeout 5s --health-retries 30
+    env:
+      LIVEOPS_TEST_MSSQL_DSN: mssql://sa:LiveOps_Test_Pw1@localhost:1433/master
+      LIVEOPS_TEST_ORACLE_DSN: oracle://system:LiveOps_Test_Pw1@localhost:1521/FREEPDB1
+    defaults: { run: { working-directory: backend } }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12", cache: pip }
+      - run: pip install -e ".[dev]"
+      - name: Wait until both databases accept logins
+        run: |
+          python - <<'PY'
+          import time
+          import oracledb
+          import pymssql
+
+          def wait(name, fn, tries=60):
+              for i in range(tries):
+                  try:
+                      fn()
+                      print(f"{name} ready")
+                      return
+                  except Exception as e:  # noqa: BLE001
+                      print(f"{name} not ready ({i}): {str(e).splitlines()[0][:120]}")
+                      time.sleep(5)
+              raise SystemExit(f"{name} never became ready")
+
+          wait("SQL Server", lambda: pymssql.connect(server="localhost", port="1433", user="sa",
+               password="LiveOps_Test_Pw1", login_timeout=5).close())
+          wait("Oracle", lambda: oracledb.connect(user="system", password="LiveOps_Test_Pw1",
+               host="localhost", port=1521, service_name="FREEPDB1").close())
+          PY
+      - name: Enterprise DB unit + contract tests (real SQL Server and Oracle)
+        # The contract fixtures create their own databases, schemas and read-only users.
+        run: >-
+          pytest -v -rs
+          tests/unit/test_sqlserver.py tests/unit/test_oracle.py tests/unit/test_oracle_tls.py
+          tests/contract/test_sqlserver_contract.py tests/contract/test_oracle_contract.py

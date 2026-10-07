@@ -1,7 +1,7 @@
 {
   "name": "liveops-frontend",
   "private": true,
-  "version": "0.1.0-dev",
+  "version": "0.1.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -9,7 +9,9 @@
     "typecheck": "tsc -b --noEmit",
     "lint": "eslint src",
     "test": "vitest run",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test:e2e": "node e2e/run.mjs",
+    "bench:map": "npm run build && playwright test -c e2e/bench.config.ts"
   },
   "dependencies": {
     "react": "^18.3.1",
@@ -19,6 +21,8 @@
   },
   "devDependencies": {
     "@eslint/js": "^9.15.0",
+    "@playwright/test": "^1.56.1",
+    "@testing-library/react": "^16.0.1",
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
     "@types/three": "^0.170.0",
@@ -27,7 +31,6 @@
     "eslint-plugin-react-hooks": "^5.0.0",
     "globals": "^15.12.0",
     "jsdom": "^25.0.1",
-    "@testing-library/react": "^16.0.1",
     "typescript": "~5.6.3",
     "typescript-eslint": "^8.15.0",
     "vite": "^5.4.11",

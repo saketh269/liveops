@@ -22,7 +22,13 @@ def _fernet() -> Fernet:
             "LIVEOPS_SECRET_KEY is not set. Generate one with: "
             'python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"'
         )
-    return Fernet(key.encode())
+    try:
+        return Fernet(key.encode())
+    except (ValueError, TypeError) as e:
+        raise SecretsError(
+            "LIVEOPS_SECRET_KEY is not a valid key (it must be 32 random bytes, URL-safe base64, 44 characters). "
+            "See README → Run it for how to generate one."
+        ) from e  # LIVEOPS-81
 
 
 def encrypt(secrets: dict[str, Any]) -> str:

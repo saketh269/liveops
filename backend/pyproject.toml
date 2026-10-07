@@ -1,6 +1,6 @@
 [project]
 name = "liveops-backend"
-version = "0.1.0.dev0"
+version = "0.1.0"
 description = "Live Ops Portal backend: connectors, state store, API"
 requires-python = ">=3.12"
 dependencies = [
@@ -14,6 +14,17 @@ dependencies = [
   "redis>=5.0",
   "cryptography>=43",
   "websockets>=12",
+  "anyio>=4",
+  "psycopg2-binary>=2.9.9",
+  "PyMySQL>=1.1.1,<1.2",  # 1.2.x breaks caching_sha2 sign-in without TLS
+  "mysql-replication>=1.0.9,<1.1",
+  "certifi>=2024.2.2",  # CA bundle fallback for Postgres verify (LIVEOPS-60)
+  "pymssql>=2.3",
+  "oracledb>=2.4",
+  "httpx>=0.27",
+  "openpyxl>=3.1",
+  "boto3>=1.34",
+  "python-multipart>=0.0.9",
 ]
 
 [project.optional-dependencies]
@@ -24,6 +35,7 @@ dev = [
   "ruff>=0.6",
   "mypy>=1.11",
   "pip-audit>=2.7",
+  "moto[server]>=5.0",
 ]
 
 [build-system]

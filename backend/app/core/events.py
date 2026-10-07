@@ -50,13 +50,53 @@ class Asset(BaseModel):
 
     def flat(self) -> dict[str, Any]:
         """Plain view sent to the browser: values plus where each came from."""
-        return {
-            "site_id": self.site_id,
-            "asset_id": self.asset_id,
-            "updated_ts": self.updated_ts,
-            **{k: v.value for k, v in self.fields.items()},
-            "_sources": {k: v.source_id for k, v in self.fields.items()},
-        }
+        return fold_attributes(
+            {
+                "site_id": self.site_id,
+                "asset_id": self.asset_id,
+                "updated_ts": self.updated_ts,
+                **{k: v.value for k, v in self.fields.items()},
+                "_sources": {k: v.source_id for k, v in self.fields.items()},
+            }
+        )
+
+
+# ``attributes`` merge per key across sources (LIVEOPS-44): the store keeps
+# each key as its own field ``attributes.<key>`` with its own source, and the
+# browser view folds them back into one ``attributes`` object.
+ATTRIBUTES = "attributes"
+ATTR_PREFIX = "attributes."
+
+
+def expand_attributes(fields: dict[str, Any]) -> dict[str, Any]:
+    """Event fields as the store merges them: a dict ``attributes`` becomes one
+    field per key. Anything else is kept as is."""
+    if not isinstance(fields.get(ATTRIBUTES), dict):
+        return fields
+    out = {k: v for k, v in fields.items() if k != ATTRIBUTES}
+    for k, v in fields[ATTRIBUTES].items():
+        out[ATTR_PREFIX + str(k)] = v
+    return out
+
+
+def fold_attributes(flat: dict[str, Any]) -> dict[str, Any]:
+    """Fold ``attributes.<key>`` entries of a flat asset into ``attributes``.
+
+    ``_sources`` keeps ``attributes.<key>`` per key, plus ``attributes`` when
+    every key comes from the same source."""
+    keys = [k for k in flat if k.startswith(ATTR_PREFIX)]
+    if not keys:
+        return flat
+    base = flat.get(ATTRIBUTES)
+    attrs: dict[str, Any] = dict(base) if isinstance(base, dict) else {}
+    for k in keys:
+        attrs[k[len(ATTR_PREFIX) :]] = flat.pop(k)
+    flat[ATTRIBUTES] = attrs
+    sources = flat.setdefault("_sources", {})
+    key_sources = {sources[k] for k in keys if k in sources}
+    if ATTRIBUTES not in sources and len(key_sources) == 1:
+        sources[ATTRIBUTES] = key_sources.pop()
+    return flat
 
 
 class StreamMessage(BaseModel):

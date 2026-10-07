@@ -12,5 +12,6 @@ export default defineConfig({
       "/ws": { target: "ws://localhost:8000", ws: true },
     },
   },
-  test: { environment: "jsdom", globals: true },
+  // e2e/ holds Playwright specs (npm run test:e2e); keep them out of vitest.
+  test: { environment: "jsdom", globals: true, include: ["src/**/*.test.{ts,tsx}"] },
 });

@@ -1,6 +1,6 @@
 # Live Ops: design
 
-Status: **frozen for Sprint 1** (changes need a decision record in `docs/adr/`).
+Status: **frozen for Sprint 1**, amended by ADR 0004 and 0005 (changes need a decision record in `docs/adr/`).
 Owner: tech lead. Ticket: LIVEOPS-2.
 
 ## 1. What we are building
@@ -39,7 +39,7 @@ Data flows one way. Live Ops **only reads** from sources.
 
 ## 3. The connector contract
 
-Every source implements `Connector` (`app/connectors/base.py`):
+Every source implements `Connector` (`app/connectors/base.py`). It is constructed as `Connector(settings, secrets, source_id=...)`; `self.source_id` identifies the portal source (ADR 0004).
 
 | Method | Must do |
 |---|---|
@@ -47,7 +47,7 @@ Every source implements `Connector` (`app/connectors/base.py`):
 | `test()` | Check reachability, sign-in, encryption, read-only, permissions. One `TestStep` per check, each failed step with `detail` and a plain-English `hint`. **Never raises. Never includes secret values.** |
 | `discover()` | List readable datasets (tables, views, endpoints, files) with columns and key columns |
 | `preview(dataset, limit)` | Up to `limit` records, already JSON-safe |
-| `stream(dataset, key_fields, options)` | Async iterator of `Change`. First the full current state as `UPSERT`s, then only differences (`UPSERT` / `DELETE`) forever |
+| `stream(dataset, key_fields, options)` | Async iterator of `Change`. First the full current state as `UPSERT`s, then **exactly one `SNAPSHOT_END` marker**, then only differences (`UPSERT` / `DELETE`) forever. Rows without a key are skipped and counted in `skipped_records` (ADR 0004) |
 | `health()` | Optional; default runs `test()` |
 | `close()` | Release connections; safe to call twice |
 
@@ -64,7 +64,7 @@ Rules for every connector:
 3. **Encryption on by default.** Setting values: `required` (default), `verify`, `off` (local testing only; the API warns).
 4. **JSON-safe records.** Run every row through `normalize_record()` (handles datetime, Decimal, UUID, bytes, NaN).
 5. **Secrets stay secret.** Only in `secrets_schema`, never logged, never in reports, errors or API responses.
-6. **Bounded.** Timeouts on connect and queries; row caps on poll snapshots.
+6. **Bounded.** Timeouts on connect and queries. Poll snapshots are complete or raise (`check_row_cap`), never silently truncated. Poll interval ≥ 0.5 s.
 7. **Passes the contract kit** in `backend/tests/contract/kit.py` against a real system.
 
 ## 4. Event format
@@ -81,6 +81,10 @@ Rules for every connector:
  "event": null,
  "ts": 1791350000.2}
 ```
+
+`type: "event"` messages carry `event = {"asset_id", "text", "source_id", "ts", "changes": {field: [old, new]}}`.
+`type: "ping"` is sent every 20 s as a keepalive; clients ignore it (it is not a data update).
+Clients must ignore message types they don't know.
 
 Reserved asset fields: `zone`, `state`, `label`, `kind`, `x`, `y`. Anything else goes in `attributes` or as an extra merged field.
 

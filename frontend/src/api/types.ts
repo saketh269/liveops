@@ -12,6 +12,11 @@ export type JSONSchema = {
   format?: string;
   items?: JSONSchema;
   examples?: unknown[];
+  additionalProperties?: boolean | JSONSchema;
+  minimum?: number;
+  maximum?: number;
+  minLength?: number;
+  maxLength?: number;
 };
 
 export type ConnectorSpec = {
@@ -31,6 +36,7 @@ export type Source = {
   type: string;
   settings: Record<string, unknown>;
   secrets_set: Record<string, boolean>;
+  secrets_unreadable?: boolean;
   warnings: string[];
   created_ts: number;
   updated_ts: number;
@@ -105,9 +111,15 @@ export type Asset = {
 };
 
 export type StreamMessage = {
-  type: "snapshot" | "upsert" | "remove" | "event";
+  type: "snapshot" | "upsert" | "remove" | "event" | "ping";
   site_id: string;
   assets: Asset[];
   event: Record<string, unknown> | null;
   ts: number;
 };
+
+// GET /api/health
+export type AppHealth = { ok: boolean; version: string; portal_db?: "ok" | "unreachable" };
+
+// POST /api/sources/{id}/upload
+export type UploadResult = { dataset: string; bytes: number; rows: number; columns: string[] };

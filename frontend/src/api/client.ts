@@ -1,6 +1,6 @@
 import type {
-  ConnectorSpec, Dataset, Mapping, MappingConfig, MappingHealth, Site, SiteLayout, Source,
-  SourceRecord, StreamMessage, TestReport,
+  AppHealth, ConnectorSpec, Dataset, Mapping, MappingConfig, MappingHealth, Site, SiteLayout, Source,
+  SourceRecord, StreamMessage, TestReport, UploadResult,
 } from "./types";
 
 export class ApiError extends Error {
@@ -25,6 +25,12 @@ async function req<T>(method: string, path: string, body?: unknown): Promise<T> 
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
     const d = data?.detail ?? {};
+    if (Array.isArray(d)) {
+      // FastAPI request validation: [{loc: [...], msg: "..."}]
+      const problems = d.map((p: { loc?: unknown[]; msg?: string }) =>
+        `${(p.loc ?? []).filter((l) => l !== "body").join(".")}: ${p.msg ?? "invalid value"}`);
+      throw new ApiError(res.status, "Some values aren't valid", undefined, problems);
+    }
     const msg = typeof d === "string" ? d : d.message ?? `Request failed (${res.status})`;
     throw new ApiError(res.status, msg, d.hint, d.problems ?? d.fields);
   }
@@ -41,6 +47,18 @@ export const api = {
   updateSource: (id: string, b: { name?: string; settings?: Record<string, unknown>; secrets?: Record<string, unknown> }) =>
     req<Source>("PUT", `/api/sources/${id}`, b),
   deleteSource: (id: string) => req<void>("DELETE", `/api/sources/${id}`),
+  uploadFile: async (id: string, file: File): Promise<UploadResult> => {
+    const body = new FormData();
+    body.append("file", file, file.name);
+    const res = await fetch(`/api/sources/${id}/upload`, { method: "POST", body });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const d = data?.detail ?? {};
+      const msg = typeof d === "string" ? d : d.message ?? (res.status === 413 ? "The file is too large" : `Upload failed (${res.status})`);
+      throw new ApiError(res.status, msg, d.hint);
+    }
+    return data as UploadResult;
+  },
   testSource: (id: string) => req<TestReport>("POST", `/api/sources/${id}/test`),
   datasets: (id: string) => req<Dataset[]>("GET", `/api/sources/${id}/datasets`),
   preview: (id: string, dataset: string, limit = 20) =>
@@ -60,7 +78,7 @@ export const api = {
     req<Mapping>("PUT", `/api/mappings/${id}`, b),
   deleteMapping: (id: string) => req<void>("DELETE", `/api/mappings/${id}`),
 
-  health: () => req<{ ok: boolean; version: string }>("GET", "/api/health"),
+  health: () => req<AppHealth>("GET", "/api/health"),
   mappingHealth: () => req<MappingHealth[]>("GET", "/api/health/mappings"),
 };
 
@@ -69,16 +87,31 @@ export function openSiteStream(siteId: string, onMessage: (m: StreamMessage) => 
   let ws: WebSocket | null = null;
   let stopped = false;
   let delay = 1000;
+  let retry: ReturnType<typeof setTimeout> | null = null;
   const connect = () => {
+    retry = null;
+    if (stopped) return;
     const proto = location.protocol === "https:" ? "wss" : "ws";
-    ws = new WebSocket(`${proto}://${location.host}/ws/sites/${siteId}`);
-    ws.onopen = () => { delay = 1000; onStatus?.("open"); };
-    ws.onmessage = (e) => onMessage(JSON.parse(e.data) as StreamMessage);
-    ws.onclose = () => {
+    const sock = new WebSocket(`${proto}://${location.host}/ws/sites/${siteId}`);
+    ws = sock;
+    sock.onopen = () => { delay = 1000; onStatus?.("open"); };
+    sock.onmessage = (e) => {
+      const msg = JSON.parse(e.data) as StreamMessage;
+      if (msg.type === "ping") return; // keepalive only; not a data update
+      onMessage(msg);
+    };
+    sock.onclose = () => {
+      if (ws !== sock) return;
       onStatus?.("closed");
-      if (!stopped) setTimeout(connect, (delay = Math.min(delay * 2, 15000)));
+      if (!stopped) retry = setTimeout(connect, (delay = Math.min(delay * 2, 15000)));
     };
   };
   connect();
-  return () => { stopped = true; ws?.close(); };
+  // Closing while a reconnect is pending must cancel it, or a socket leaks (LIVEOPS-30).
+  return () => {
+    stopped = true;
+    if (retry !== null) clearTimeout(retry);
+    ws?.close();
+    ws = null;
+  };
 }

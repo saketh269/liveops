@@ -10,6 +10,7 @@ from app import secrets as secrets_mod
 from app.api.deps import mapping_spec, runner
 from app.api.schemas import MappingIn, MappingOut, MappingUpdate
 from app.connectors import build
+from app.connectors.base import ConnectorError
 from app.core.mapping import MappingConfig, validate_against_columns
 from app.core.runner import RunnerManager
 from app.db import Mapping, Site, Source, get_session
@@ -33,9 +34,19 @@ def _out(m: Mapping, rm: RunnerManager) -> MappingOut:
 
 
 async def _check_columns(src: Source, dataset: str, config: MappingConfig) -> None:
-    conn = build(src.type, src.settings or {}, secrets_mod.decrypt(src.secrets_enc))
+    conn = build(src.type, src.settings or {}, secrets_mod.decrypt(src.secrets_enc), source_id=src.id)
     try:
         datasets = {d.name: d for d in await conn.discover()}
+    except ConnectorError as e:
+        raise HTTPException(400, detail={"message": str(e), "hint": e.hint}) from e
+    except Exception as e:  # noqa: BLE001 - the source is unreachable or misconfigured
+        raise HTTPException(
+            502,
+            detail={
+                "message": f"Couldn't read the source: {str(e).splitlines()[0][:200] if str(e) else type(e).__name__}",
+                "hint": "Run Test connection on the source to see which step fails.",
+            },
+        ) from e
     finally:
         await conn.close()
     if dataset not in datasets:
@@ -91,6 +102,7 @@ async def update_mapping(
     config = body.config or MappingConfig.model_validate(m.config)
     if body.dataset or body.config:
         await _check_columns(src, dataset, config)
+    shape_changed = dataset != m.dataset or config.model_dump() != m.config
     m.dataset, m.config = dataset, config.model_dump()
     if body.options is not None:
         m.options = body.options
@@ -98,10 +110,11 @@ async def update_mapping(
         m.active = body.active
     m.updated_ts = time.time()
     session.commit()
+    if shape_changed or not m.active:
+        # Drop what the old mapping put on the map; the restarted stream rebuilds it.
+        await rm.stop(m.id, site_id=m.site_id)
     if m.active:
         await rm.start(mapping_spec(m, src))
-    else:
-        await rm.stop(m.id, site_id=m.site_id)
     return _out(m, rm)
 
 

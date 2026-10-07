@@ -12,3 +12,6 @@ coverage/
 playwright-report/
 test-results/
 .DS_Store
+
+backend/data/
+data/

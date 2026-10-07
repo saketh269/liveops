@@ -145,6 +145,10 @@ class ConnectorContract:
                 seen[ch.key] = ch
             assert set(seen) >= {r["id"] for r in SEED_ROWS}
             json.dumps([s.record for s in seen.values()])
+            marker = await asyncio.wait_for(gen.__anext__(), self.latency_budget_s * 2)
+            assert marker.op == ChangeOp.SNAPSHOT_END, (
+                f"after the initial state, stream() must yield exactly one SNAPSHOT_END marker, got {marker.op}"
+            )
 
             await driver.insert({"id": "A9", "status": "free", "zone": "ER"})
             ch, lat_insert = await _next_matching(
@@ -161,7 +165,29 @@ class ConnectorContract:
             ch, lat_delete = await _next_matching(
                 gen, lambda x: x.key == "A3" and x.op == ChangeOp.DELETE, self.latency_budget_s
             )
+            # Later markers are not allowed: the runner treats each one as "full state".
+            assert ch.op != ChangeOp.SNAPSHOT_END
             print(f"latency insert={lat_insert:.2f}s update={lat_update:.2f}s delete={lat_delete:.2f}s")
+        finally:
+            await gen.aclose()
+            await c.close()
+
+    @pytest.mark.contract
+    async def test_record_without_key_is_skipped_not_fatal(self, driver: SourceDriver) -> None:
+        """A row with a NULL key must be counted and skipped; the stream keeps going (LIVEOPS-23/42)."""
+        insert_null = getattr(driver, "insert_null_key", None)
+        if insert_null is None:
+            pytest.skip("driver cannot create a row without a key (key column is NOT NULL here)")
+        await insert_null({"status": "free", "zone": "ER"})
+        c = self.make_connector(driver)
+        gen = c.stream(driver.dataset, ["id"], self.stream_options).__aiter__()
+        try:
+            ch, _ = await _next_matching(gen, lambda x: x.op == ChangeOp.SNAPSHOT_END, self.latency_budget_s * 2)
+            assert c.skipped_records >= 1
+            await driver.update("A1", {"status": "occupied"})
+            await _next_matching(
+                gen, lambda x: x.key == "A1" and x.record.get("status") == "occupied", self.latency_budget_s
+            )
         finally:
             await gen.aclose()
             await c.close()

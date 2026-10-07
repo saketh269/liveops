@@ -18,21 +18,66 @@ from app.db import Mapping, Source, get_session
 router = APIRouter(prefix="/api", tags=["sources"])
 
 
+# Settings that identify *where* a source lives. Changing one requires the
+# secrets to be entered again (LIVEOPS-24).
+ENDPOINT_FIELDS = (
+    "host",
+    "port",
+    "database",
+    "service_name",
+    "dsn",
+    "base_url",
+    "url",
+    "path",
+    "token_url",
+    "endpoint_url",
+    "bucket",
+    "region",
+    # Weakening transport security also counts as moving the endpoint (LIVEOPS-74).
+    "encryption",
+    "ssl_ca",
+    "ca_file",
+    "allow_private_network",
+    "allow_http",
+)
+
+
 def _warnings(src_type: str, settings: dict[str, Any]) -> list[str]:
     w = []
     if settings.get("encryption") == "off":
         w.append("Encryption is off. Use this only for local testing; company databases should use Required.")
+    if settings.get("encryption") == "required_legacy_auth":
+        w.append(
+            "Older password methods are allowed: someone impersonating the server could learn the password. "
+            "Switch the database user to SCRAM and choose Required."
+        )
+    if settings.get("allow_http"):
+        w.append("Plain HTTP is allowed, so data and keys travel unencrypted. Use this only for local testing.")
+    if settings.get("allow_private_network") is True:
+        w.append("Private network addresses are allowed. Only use this for APIs or storage you trust on your network.")
     return w
 
 
 def _out(s: Source) -> SourceOut:
+    warnings = _warnings(s.type, s.settings or {})
+    try:
+        secrets_set = secrets_mod.mask(secrets_mod.decrypt(s.secrets_enc))
+        unreadable = False
+    except secrets_mod.SecretsError:
+        # Still list the source so the user can re-enter its password (LIVEOPS-91/41).
+        secrets_set, unreadable = {}, True
+        warnings.append(
+            "The saved password or token can't be read because the server's secret key changed. "
+            "Open the source and enter its password again."
+        )
     return SourceOut(
         id=s.id,
         name=s.name,
         type=s.type,
         settings=s.settings or {},
-        secrets_set=secrets_mod.mask(secrets_mod.decrypt(s.secrets_enc)),
-        warnings=_warnings(s.type, s.settings or {}),
+        secrets_set=secrets_set,
+        secrets_unreadable=unreadable,
+        warnings=warnings,
         created_ts=s.created_ts,
         updated_ts=s.updated_ts,
     )
@@ -91,10 +136,35 @@ async def update_source(
     rm: RunnerManager = Depends(runner),
 ) -> SourceOut:
     s = _get(session, source_id)
-    secrets = secrets_mod.decrypt(s.secrets_enc)
-    if body.secrets:
-        secrets.update({k: v for k, v in body.secrets.items() if v not in (None, "")})
+    try:
+        secrets = secrets_mod.decrypt(s.secrets_enc)
+    except secrets_mod.SecretsError:
+        # Saved secrets were encrypted with another key. Let the user re-enter
+        # them here; refuse only if they didn't (LIVEOPS-41 follow-up).
+        if not body.secrets or not any(v not in (None, "") for v in body.secrets.values()):
+            raise
+        secrets = {}
     settings = body.settings if body.settings is not None else (s.settings or {})
+    new_secrets = body.secrets or {}
+    # Saved credentials must not follow the source to a different server.
+    old = s.settings or {}
+    moved = [k for k in ENDPOINT_FIELDS if (k in settings or k in old) and settings.get(k) != old.get(k)]
+    if moved and secrets and not any(v not in (None, "") for v in new_secrets.values()):
+        raise HTTPException(
+            422,
+            detail={
+                "message": f"Re-enter the password or token when changing {', '.join(moved)}",
+                "hint": "Saved credentials are only sent to the server they were entered for.",
+                "fields": sorted(secrets),
+            },
+        )
+    for k, v in new_secrets.items():
+        if v is None:
+            secrets.pop(k, None)  # explicit null clears a secret
+        elif v != "":
+            secrets[k] = v  # "" or omitted keeps the saved value
+    if moved:
+        secrets = {k: v for k, v in secrets.items() if k in new_secrets}
     _validate(s.type, settings, secrets)
     if body.name is not None:
         s.name = body.name
@@ -124,7 +194,7 @@ async def test_source(source_id: str, session: Session = Depends(get_session)) -
     s = _get(session, source_id)
     started = time.monotonic()
     try:
-        conn = build(s.type, s.settings or {}, secrets_mod.decrypt(s.secrets_enc))
+        conn = build(s.type, s.settings or {}, secrets_mod.decrypt(s.secrets_enc), source_id=s.id)
     except ConnectorError as e:
         return TestReport.from_steps([TestStep(name="Set up", ok=False, detail=str(e), hint=e.hint)], started)
     try:
@@ -138,7 +208,7 @@ async def test_source(source_id: str, session: Session = Depends(get_session)) -
 @router.get("/sources/{source_id}/datasets", response_model=list[Dataset])
 async def list_datasets(source_id: str, session: Session = Depends(get_session)) -> list[Dataset]:
     s = _get(session, source_id)
-    conn = build(s.type, s.settings or {}, secrets_mod.decrypt(s.secrets_enc))
+    conn = build(s.type, s.settings or {}, secrets_mod.decrypt(s.secrets_enc), source_id=s.id)
     try:
         return await conn.discover()
     except ConnectorError as e:
@@ -154,7 +224,7 @@ async def preview(
     source_id: str, dataset: str, limit: int = 20, session: Session = Depends(get_session)
 ) -> list[Record]:
     s = _get(session, source_id)
-    conn = build(s.type, s.settings or {}, secrets_mod.decrypt(s.secrets_enc))
+    conn = build(s.type, s.settings or {}, secrets_mod.decrypt(s.secrets_enc), source_id=s.id)
     try:
         return await conn.preview(dataset, max(1, min(limit, 200)))
     except ConnectorError as e:

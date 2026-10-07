@@ -4,9 +4,21 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
+from app.connectors.base import MIN_POLL_INTERVAL_S
 from app.core.mapping import MappingConfig
+
+
+def _check_options(v: dict[str, Any] | None) -> dict[str, Any] | None:
+    if v and "poll_interval_s" in v:
+        try:
+            interval = float(v["poll_interval_s"])
+        except (TypeError, ValueError):
+            raise ValueError("poll_interval_s must be a number of seconds") from None
+        if interval < MIN_POLL_INTERVAL_S:
+            raise ValueError(f"poll_interval_s must be at least {MIN_POLL_INTERVAL_S} seconds")
+    return v
 
 
 class SourceIn(BaseModel):
@@ -29,6 +41,7 @@ class SourceOut(BaseModel):
     type: str
     settings: dict[str, Any]
     secrets_set: dict[str, bool]
+    secrets_unreadable: bool = False  # stored secrets can't be decrypted with the current key
     warnings: list[str] = Field(default_factory=list)
     created_ts: float
     updated_ts: float
@@ -63,12 +76,22 @@ class MappingIn(BaseModel):
     options: dict[str, Any] = Field(default_factory=lambda: {"poll_interval_s": 3})
     active: bool = True
 
+    @field_validator("options")
+    @classmethod
+    def _valid_options(cls, v: dict[str, Any] | None) -> dict[str, Any] | None:
+        return _check_options(v)
+
 
 class MappingUpdate(BaseModel):
     dataset: str | None = None
     config: MappingConfig | None = None
     options: dict[str, Any] | None = None
     active: bool | None = None
+
+    @field_validator("options")
+    @classmethod
+    def _valid_options(cls, v: dict[str, Any] | None) -> dict[str, Any] | None:
+        return _check_options(v)
 
 
 class MappingOut(BaseModel):
