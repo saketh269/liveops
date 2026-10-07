@@ -3,16 +3,21 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import type { Asset, SiteLayout } from "../api/types";
+import { figureGeometry } from "./figureGeometry";
+import { figureKey, type FigureModel } from "./figures";
+import { APPROACH_DISTANCE, Motion } from "./motion";
 import { floorSize, polygonCentroid, type PlacementResult, type Pt, type Rect } from "./placement";
 import { STATE_KEYS, onThemeChange, readStateColors, readToken, stateKey, type StateKey } from "./stateColors";
 
 export type SceneCallbacks = {
   onHover?: (assetId: string | null, clientX: number, clientY: number) => void;
   onSelect?: (assetId: string | null) => void;
+  /** Removed records still walking out (final data kept for the details panel). */
+  onDeparting?: (assets: Map<string, Asset>) => void;
 };
 
 export type SceneStats = {
-  frames: number; lastFrameMs: number; renderer: string; webgl: string; software: boolean; antialias: boolean; instances: number; drawCalls: number;
+  frames: number; lastFrameMs: number; renderer: string; webgl: string; software: boolean; antialias: boolean; instances: number; drawCalls: number; walkers: number;
 };
 
 const SOFTWARE = /swiftshader|llvmpipe|softpipe|software|microsoft basic render/i;
@@ -32,26 +37,15 @@ function isSoftwareRenderer(): boolean {
 }
 
 const PULSE_MS = 700;
-const HEIGHT = 0.9; // asset height relative to its footprint
+const UP = new THREE.Vector3(0, 1, 0);
+/** How quickly the camera catches up with a followed figure (per frame, 0..1). */
+const FOLLOW_EASE = 0.15;
 
 type KindMesh = { mesh: THREE.InstancedMesh; ids: string[]; capacity: number; height: number };
 
-function kindGeometry(kind: string): { geo: THREE.BufferGeometry; height: number } {
-  // Unit-footprint shapes sitting on y=0; one per kind so kinds are told apart by shape, not only color.
-  const k = kind.toLowerCase();
-  if (k === "bed" || k === "asset" || k === "") {
-    const g = new THREE.BoxGeometry(1, 0.45, 1);
-    g.translate(0, 0.225, 0);
-    return { geo: g, height: 0.45 };
-  }
-  let h = 0;
-  for (let i = 0; i < k.length; i++) h = (h * 31 + k.charCodeAt(i)) >>> 0;
-  switch (h % 4) {
-    case 0: { const g = new THREE.CylinderGeometry(0.5, 0.5, HEIGHT, 12); g.translate(0, HEIGHT / 2, 0); return { geo: g, height: HEIGHT }; }
-    case 1: { const g = new THREE.ConeGeometry(0.55, HEIGHT, 12); g.translate(0, HEIGHT / 2, 0); return { geo: g, height: HEIGHT }; }
-    case 2: { const g = new THREE.BoxGeometry(1, HEIGHT, 1); g.translate(0, HEIGHT / 2, 0); return { geo: g, height: HEIGHT }; }
-    default: { const g = new THREE.OctahedronGeometry(0.55); g.translate(0, 0.55, 0); return { geo: g, height: 1.1 }; }
-  }
+/** Mesh group key → figure model (and the raw kind for the "other" fallback shapes). */
+function modelOfKey(key: string): { model: FigureModel; kind: string } {
+  return key.startsWith("other:") ? { model: "other", kind: key.slice(6) } : { model: key as FigureModel, kind: "" };
 }
 
 export class MapScene {
@@ -67,6 +61,10 @@ export class MapScene {
   private colors = new Map<StateKey, THREE.Color>();
   private pulses = new Map<string, number>();
   private reducedMotion: boolean;
+  private motion = new Motion();
+  private motionAllowed = true;
+  private departingSeen = 0;
+  private following = false;
   private raf = 0;
   private frames = 0;
   private lastFrameMs = 0;
@@ -123,10 +121,11 @@ export class MapScene {
 
     const mq = matchMedia("(prefers-reduced-motion: reduce)");
     this.reducedMotion = mq.matches;
-    const onMq = () => { this.reducedMotion = mq.matches; };
+    const onMq = () => { this.reducedMotion = mq.matches; this.applyMotionSetting(); };
     mq.addEventListener("change", onMq);
     this.disposers.push(() => mq.removeEventListener("change", onMq));
     this.disposers.push(onThemeChange(() => this.refreshTheme()));
+    this.motion.setEnabled(this.motionAllowed && !this.reducedMotion);
 
     const ro = new ResizeObserver(() => this.resize());
     ro.observe(container);
@@ -187,6 +186,7 @@ export class MapScene {
     const changed = JSON.stringify(layout) !== JSON.stringify(this.layout) || !this.floor.children.length || unassignedChanged(this.floor.userData.unassigned, unassigned);
     if (!changed) return;
     const first = !this.floor.children.length;
+    if (JSON.stringify(layout) !== JSON.stringify(this.layout)) this.motion.setLayout(layout); // new floor: no walking across layouts
     this.layout = layout;
     this.floor.userData.unassigned = unassigned;
     disposeTree(this.floor);
@@ -297,10 +297,13 @@ export class MapScene {
   /**
    * Update assets. A new `placement` object rebuilds every instance; otherwise
    * only assets whose object identity changed are recoloured (and pulsed).
+   * `instant` (the first snapshot) places everyone without movement.
    */
-  setAssets(assets: ReadonlyMap<string, Asset>, placement: PlacementResult) {
+  setAssets(assets: ReadonlyMap<string, Asset>, placement: PlacementResult, instant = false) {
     const prev = this.assets;
     this.assets = assets;
+    this.motion.update(assets, placement, instant);
+    this.notifyDeparting();
     if (placement !== this.placement) {
       const firstPlacement = this.placement === null;
       this.placement = placement;
@@ -314,6 +317,7 @@ export class MapScene {
       if (before === a) continue;
       const at = this.index.get(id);
       if (!at) continue;
+      if (figureKey(a) !== at.kind) { this.rebuild(prev); return; } // role changed: different figure
       const km = this.meshes.get(at.kind)!;
       km.mesh.setColorAt(at.i, this.colorFor(a));
       km.mesh.instanceColor!.needsUpdate = true;
@@ -322,18 +326,43 @@ export class MapScene {
     this.updateSelectionBox();
   }
 
+  /** ?motion=off: every change jumps. prefers-reduced-motion does the same. */
+  setMotionAllowed(on: boolean) {
+    this.motionAllowed = on;
+    this.applyMotionSetting();
+  }
+
+  private applyMotionSetting() {
+    const on = this.motionAllowed && !this.reducedMotion;
+    if (on === this.motion.isEnabled) return;
+    this.motion.setEnabled(on);
+    if (this.placement) this.rebuild(this.assets);
+    this.notifyDeparting();
+  }
+
+  /** Keep the camera on the selected figure while it moves. */
+  setFollow(on: boolean) {
+    this.following = on;
+    if (on) this.userMoved = true;
+  }
+
+  private notifyDeparting() {
+    if (this.motion.departingVersion === this.departingSeen) return;
+    this.departingSeen = this.motion.departingVersion;
+    this.cb.onDeparting?.(this.motion.departing());
+  }
+
   private colorFor(a: Asset): THREE.Color {
     return this.colors.get(stateKey(a.state)) ?? this.colors.get("unknown")!;
   }
 
   private rebuild(prev: ReadonlyMap<string, Asset>) {
-    const pl = this.placement!;
     const groups = new Map<string, string[]>();
-    for (const [id, a] of this.assets) {
-      if (!pl.positions.has(id)) continue;
-      const k = typeof a.kind === "string" && a.kind ? a.kind : "asset";
+    // Figures: current records plus removed ones still walking out.
+    for (const f of this.motion.all()) {
+      const k = figureKey(f.asset);
       const g = groups.get(k);
-      if (g) g.push(id); else groups.set(k, [id]);
+      if (g) g.push(f.id); else groups.set(k, [f.id]);
     }
     for (const [k, km] of this.meshes) {
       if (!groups.has(k)) {
@@ -357,9 +386,10 @@ export class MapScene {
           (km.mesh.material as THREE.Material).dispose();
           km.mesh.dispose();
         } else {
-          ({ geo, height } = kindGeometry(k));
+          const { model, kind } = modelOfKey(k);
+          ({ geo, height } = figureGeometry(model, kind));
         }
-        const mesh = new THREE.InstancedMesh(geo, new THREE.MeshLambertMaterial({ color: 0xffffff }), capacity);
+        const mesh = new THREE.InstancedMesh(geo, new THREE.MeshLambertMaterial({ color: 0xffffff, vertexColors: true }), capacity);
         mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
         mesh.setColorAt(0, this.colors.get("unknown") ?? new THREE.Color());
         mesh.instanceColor!.setUsage(THREE.DynamicDrawUsage);
@@ -372,7 +402,7 @@ export class MapScene {
       km.ids = ids;
       ids.forEach((id, i) => {
         this.index.set(id, { kind: k, i });
-        const a = this.assets.get(id)!;
+        const a = this.motion.get(id)!.asset;
         this.writeMatrix(km!, i, id, 1);
         km!.mesh.setColorAt(i, this.colorFor(a));
         const before = prev.get(id);
@@ -381,17 +411,25 @@ export class MapScene {
       km.mesh.count = ids.length;
       km.mesh.instanceMatrix.needsUpdate = true;
       km.mesh.instanceColor!.needsUpdate = true;
-      km.mesh.boundingSphere = null;
-      km.mesh.computeBoundingSphere();
+      // Figures move, so picking uses a sphere around the whole floor and its approach roads.
+      km.mesh.boundingSphere = this.floorSphere();
     }
     for (const id of this.pulses.keys()) if (!this.index.has(id)) this.pulses.delete(id);
     this.updateSelectionBox();
   }
 
+  private floorSphere(): THREE.Sphere {
+    const { width, depth } = floorSize(this.layout);
+    const u = this.placement?.unassigned;
+    const r = Math.hypot(width, depth + (u ? u.h + u.y - depth : 0)) / 2 + APPROACH_DISTANCE + 4;
+    return new THREE.Sphere(new THREE.Vector3(0, 0, u ? (u.y + u.h - depth) / 2 : 0), r);
+  }
+
   private writeMatrix(km: KindMesh, i: number, id: string, scale: number) {
-    const p = this.placement!.positions.get(id)!;
-    const s = p.size;
-    this.world(p.x, p.y, this.tmpV).setY(p.level * km.height * s);
+    const f = this.motion.get(id)!;
+    const s = f.size;
+    this.world(f.x, f.y, this.tmpV).setY(f.level * km.height * s);
+    this.tmpQ.setFromAxisAngle(UP, -f.heading);
     this.tmpS.set(s * scale, s * scale, s * scale);
     this.tmpM.compose(this.tmpV, this.tmpQ, this.tmpS);
     km.mesh.setMatrixAt(i, this.tmpM);
@@ -405,11 +443,12 @@ export class MapScene {
   private updateSelectionBox() {
     const id = this.selected;
     const at = id ? this.index.get(id) : undefined;
-    const p = id ? this.placement?.positions.get(id) : undefined;
+    const p = id ? this.motion.get(id) : undefined;
     if (!id || !at || !p) { this.selectionBox.visible = false; return; }
     const km = this.meshes.get(at.kind)!;
     const s = p.size * 1.35;
     this.world(p.x, p.y, this.selectionBox.position).setY(p.level * km.height * p.size - 0.05);
+    this.selectionBox.rotation.y = -p.heading;
     this.selectionBox.scale.set(s, km.height * p.size + 0.3, s);
     this.selectionBox.visible = true;
   }
@@ -439,7 +478,7 @@ export class MapScene {
     });
     for (const km of this.meshes.values()) {
       km.ids.forEach((id, i) => {
-        const a = this.assets.get(id);
+        const a = this.motion.get(id)?.asset;
         if (a) km.mesh.setColorAt(i, this.colorFor(a));
       });
       if (km.mesh.instanceColor) km.mesh.instanceColor.needsUpdate = true;
@@ -470,6 +509,7 @@ export class MapScene {
   private loop = () => {
     this.raf = requestAnimationFrame(this.loop);
     const t0 = performance.now();
+    this.animateMotion();
     this.controls.update();
     if (this.pulses.size) this.animatePulses(t0);
     if (this.pointerDirty) {
@@ -486,6 +526,41 @@ export class MapScene {
     this.frames++;
     this.lastFrameMs = performance.now() - t0;
   };
+
+  /** Advance walking figures; only their instances are rewritten. */
+  private animateMotion() {
+    const { moved, finished } = this.motion.step();
+    if (finished) {
+      this.rebuild(this.assets); // a figure finished walking out: drop its instance
+      this.notifyDeparting();
+    } else if (moved.length) {
+      const now = performance.now();
+      const touched = new Set<KindMesh>();
+      for (const id of moved) {
+        const at = this.index.get(id);
+        if (!at) continue;
+        const km = this.meshes.get(at.kind)!;
+        const start = this.pulses.get(id);
+        this.writeMatrix(km, at.i, id, start === undefined ? 1 : 1 + 0.6 * Math.sin(Math.PI * Math.min(1, (now - start) / PULSE_MS)));
+        touched.add(km);
+      }
+      for (const km of touched) km.mesh.instanceMatrix.needsUpdate = true;
+      if (this.selected && moved.includes(this.selected)) this.updateSelectionBox();
+    }
+    if (this.following) this.followSelected();
+  }
+
+  private followSelected() {
+    const f = this.selected ? this.motion.get(this.selected) : undefined;
+    if (!f) return;
+    const goal = this.world(f.x, f.y, this.tmpV);
+    const ease = this.reducedMotion ? 1 : FOLLOW_EASE;
+    const dx = (goal.x - this.controls.target.x) * ease;
+    const dz = (goal.z - this.controls.target.z) * ease;
+    if (Math.abs(dx) < 1e-4 && Math.abs(dz) < 1e-4) return;
+    this.controls.target.x += dx; this.controls.target.z += dz;
+    this.camera.position.x += dx; this.camera.position.z += dz;
+  }
 
   private animatePulses(now: number) {
     const touched = new Set<KindMesh>();
@@ -518,13 +593,19 @@ export class MapScene {
 
   /** Client (page) coordinates of an asset's centre, for tests and debugging. */
   screenOf(id: string): { x: number; y: number } | null {
-    const p = this.placement?.positions.get(id);
+    const p = this.motion.get(id);
     const at = this.index.get(id);
     if (!p || !at) return null;
     const km = this.meshes.get(at.kind)!;
     const v = this.world(p.x, p.y, new THREE.Vector3()).setY((p.level + 0.5) * km.height * p.size).project(this.camera);
     const r = this.renderer.domElement.getBoundingClientRect();
     return { x: r.left + ((v.x + 1) / 2) * r.width, y: r.top + ((1 - v.y) / 2) * r.height };
+  }
+
+  /** Layout position currently drawn for a figure and whether it is moving, for tests and debugging. */
+  positionOf(id: string): { x: number; y: number; moving: boolean; leaving: boolean } | null {
+    const f = this.motion.get(id);
+    return f ? { x: f.x, y: f.y, moving: this.motion.isMoving(id), leaving: f.leaving } : null;
   }
 
   /** Hex (#rrggbb, sRGB) currently drawn for an asset, for tests and debugging. */
@@ -538,7 +619,7 @@ export class MapScene {
   stats(): SceneStats {
     let instances = 0;
     for (const km of this.meshes.values()) instances += km.mesh.count;
-    return { frames: this.frames, lastFrameMs: this.lastFrameMs, renderer: this.rendererName, webgl: this.webglVersion, software: this.software, antialias: !this.software, instances, drawCalls: this.renderer.info.render.calls };
+    return { frames: this.frames, lastFrameMs: this.lastFrameMs, renderer: this.rendererName, webgl: this.webglVersion, software: this.software, antialias: !this.software, instances, drawCalls: this.renderer.info.render.calls, walkers: this.motion.walkerCount };
   }
 
   dispose() {

@@ -171,6 +171,8 @@ export class Motion {
     for (const [id, p] of placement.positions) {
       const a = assets.get(id);
       if (!a) continue;
+      const known = this.figs.get(id);
+      if (known && known.asset === a && known.target === p && !known.leaving) continue; // unchanged record (the common case)
       const key = motionKey(a);
       const model = figureOf(a);
       const f = this.figs.get(id);

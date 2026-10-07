@@ -131,3 +131,8 @@
 .lm-hints { display: grid; gap: 8px; }
 .lm-hints .notice { display: block; line-height: 1.6; }
 .lm-link-btn { padding: 3px 10px; font-size: 0.8rem; }
+
+/* Figures (LIVEOPS-98): role accents use the panel token so they read on every state color, light and dark. */
+.lm-fig-accent { fill: var(--panel); stroke: none; }
+.lm-asset--leaving { opacity: 0.7; }
+.lm-view-controls .btn[aria-pressed="true"] { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }

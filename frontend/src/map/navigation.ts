@@ -214,6 +214,7 @@ export class NavGrid {
     let mid: Pt[] | null | undefined = this.paths.get(key);
     if (mid === undefined) {
       const cells = this.astar(s, g, za, zb, opts.maxMs ?? NAV_MAX_MS, opts.now ?? defaultNow);
+      if (cells === TIMED_OUT) return straight; // not cached: a later search may have more time
       mid = cells ? this.smooth(cells, za, zb).map((c) => this.centre(c)) : null;
       if (this.paths.size >= NAV_PATH_CACHE) this.paths.delete(this.paths.keys().next().value!);
       this.paths.set(key, mid);
@@ -241,7 +242,8 @@ export class NavGrid {
     return [Math.min(this.floor.width, Math.max(0, p[0])), Math.min(this.floor.depth, Math.max(0, p[1]))];
   }
 
-  private astar(s: number, goal: number, za: number, zb: number, maxMs: number, now: () => number): number[] | null {
+  /** Cell path, null when unreachable, or TIMED_OUT when over the time cap. */
+  private astar(s: number, goal: number, za: number, zb: number, maxMs: number, now: () => number): number[] | null | typeof TIMED_OUT {
     if (s === goal) return [s];
     const gen = ++this.gen;
     if (gen === 0xffffffff) { this.seen.fill(0); this.closed.fill(0); this.gen = 1; }
@@ -265,7 +267,7 @@ export class NavGrid {
         for (let c = cur; c !== -1; c = parent[c]) out.push(c);
         return out.reverse();
       }
-      if ((++n & 255) === 0 && now() - t0 > maxMs) return null;
+      if ((++n & 255) === 0 && now() - t0 > maxMs) return TIMED_OUT;
       const c = cur % cols, r = Math.floor(cur / cols);
       for (let k = 0; k < 8; k++) {
         const dc = DC[k], dr = DR[k];
@@ -331,6 +333,7 @@ export class NavGrid {
   }
 }
 
+const TIMED_OUT = Symbol("timed out");
 const DC = [1, -1, 0, 0, 1, 1, -1, -1];
 const DR = [0, 0, 1, -1, 1, -1, 1, -1];
 const defaultNow = () => (typeof performance !== "undefined" ? performance.now() : Date.now());

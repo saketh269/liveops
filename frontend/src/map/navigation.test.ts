@@ -17,7 +17,13 @@ function samples(pts: Pt[], step = 0.1): Pt[] {
 }
 const inZone = (z: Zone, [x, y]: Pt) => pointInPolygon(x, y, z.polygon);
 const distTo = (pts: Pt[], q: Pt) => Math.min(...samples(pts).map((p) => Math.hypot(p[0] - q[0], p[1] - q[1])));
-const grid = (layout: SiteLayout) => new NavGrid(navFloorOf(layout));
+// Correctness tests use a generous time cap so a busy test runner can't turn them into fallbacks.
+const grid = (layout: SiteLayout) => {
+  const g = new NavGrid(navFloorOf(layout));
+  const route = g.route.bind(g);
+  g.route = (from, to, opts = {}) => route(from, to, { maxMs: 10_000, ...opts });
+  return g;
+};
 
 describe("navFloorOf", () => {
   test("applies the ADR 0006 entrance defaults to an old layout", () => {
@@ -109,8 +115,11 @@ describe("routes", () => {
   test("a search over its time budget falls back to a straight line", () => {
     const zones = Array.from({ length: 30 }, (_, i) => rect(`w${i}`, 5 + i * 6, i % 2 ? 4 : 0, 2, 196));
     let t = 0;
-    const r = grid({ width: 200, depth: 200, zones }).route([1, 1], [199, 199], { maxMs: 5, now: () => (t += 1) });
+    const g = grid({ width: 200, depth: 200, zones });
+    const r = g.route([1, 1], [199, 199], { maxMs: 5, now: () => (t += 1) });
     expect(r.fallback).toBe(true);
+    // A timed-out search is not remembered: with time it is found.
+    expect(g.route([1, 1], [199, 199]).fallback).toBe(false);
   });
 
   test("points off the floor (Unassigned strip) join the route with a straight run", () => {
@@ -129,11 +138,12 @@ describe("routes", () => {
     expect(navGridFor(l)).toBe(g);
     let s = 1;
     const rand = () => ((s = (s * 1664525 + 1013904223) >>> 0) / 2 ** 32);
+    for (let i = 0; i < 20; i++) g.route([rand() * 120, rand() * 72], [rand() * 120, rand() * 72], { maxMs: 10_000 }); // warm up the JIT
     const t0 = performance.now();
     const N = 200;
     let fallbacks = 0;
     for (let i = 0; i < N; i++) {
-      const r = g.route([rand() * 120, rand() * 72], [rand() * 120, rand() * 72]);
+      const r = g.route([rand() * 120, rand() * 72], [rand() * 120, rand() * 72], { maxMs: 10_000 });
       if (r.fallback) fallbacks++;
     }
     const perPath = (performance.now() - t0) / N;
