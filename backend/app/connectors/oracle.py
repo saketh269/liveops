@@ -10,19 +10,26 @@ Safety:
 - Dataset names are only accepted if ``discover()`` (``ALL_TAB_COLUMNS`` for
   the configured schemas) returned them; owner and table come from that
   result and are double-quoted. Values are always bind variables.
-- Encryption defaults to ``required`` (TCPS). ``verify`` also checks the
-  server certificate and host name; ``off`` uses plain TCP (testing only).
+- Encryption defaults to ``required``: TCPS, but the server certificate is
+  NOT verified (eavesdropping protection only). ``verify`` checks the
+  certificate chain (system CAs or ``ca_file``) and that the certificate name
+  matches the host (oracledb ``ssl_server_dn_match``). ``off`` uses plain TCP
+  (testing only).
+- Poll snapshots are complete or raise (``check_row_cap``); rows without a key
+  are skipped and counted by ``PollingConnector`` (ADR 0004).
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import ssl
 import time
 from collections.abc import Callable
 from typing import Any, TypeVar
 
 from app.connectors.base import (
+    MAX_SNAPSHOT_ROWS,
     Category,
     Column,
     ConnectorError,
@@ -33,11 +40,12 @@ from app.connectors.base import (
     Record,
     TestReport,
     TestStep,
+    check_row_cap,
     normalize_record,
 )
 from app.connectors.registry import register
 
-MAX_ROWS = 50_000
+MAX_ROWS = MAX_SNAPSHOT_ROWS
 CONNECT_TIMEOUT_S = 10
 CALL_TIMEOUT_MS = 15_000
 
@@ -53,6 +61,21 @@ def _driver() -> Any:
             hint="Install it with: pip install oracledb, then restart Live Ops.",
         ) from e
     return oracledb
+
+
+async def _in_thread[R](fn: Callable[..., R], *args: Any) -> R:
+    """Run blocking ``fn`` in a worker thread. If the caller is cancelled, still
+    wait for the thread to finish before re-raising, so the connection lock is
+    held until the driver is really done (``close()`` never closes a connection
+    a thread is still using)."""
+    fut = asyncio.ensure_future(asyncio.to_thread(fn, *args))
+    try:
+        return await asyncio.shield(fut)
+    except asyncio.CancelledError:
+        while not fut.done():
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.wait({fut})
+        raise
 
 
 def quote_ident(name: str) -> str:
@@ -80,7 +103,11 @@ class OracleConnector(PollingConnector):
         display_name="Oracle Database",
         category=Category.DATABASE,
         modes=[Mode.POLL],
-        description="Reads tables and views from Oracle 12c+ with a read-only user. No Oracle Client needed.",
+        description=(
+            "Reads tables and views from Oracle 12c+ with a read-only user. No Oracle Client needed. "
+            "Encryption 'required' uses TCPS but does NOT verify the server certificate; choose 'verify' to "
+            "check the certificate and host name."
+        ),
         maturity="needs_real_test",
         settings_schema={
             "type": "object",
@@ -101,8 +128,9 @@ class OracleConnector(PollingConnector):
                     "enum": ["required", "verify", "off"],
                     "default": "required",
                     "description": (
-                        "'required' connects over TCPS (TLS). 'verify' also checks the server certificate "
-                        "and host name. 'off' uses plain TCP: local testing only."
+                        "'required' connects over TCPS (TLS) but does NOT verify the server certificate. "
+                        "'verify' also checks the certificate chain and that it matches the host name. "
+                        "'off' uses plain TCP: local testing only."
                     ),
                 },
                 "ca_file": {
@@ -172,35 +200,41 @@ class OracleConnector(PollingConnector):
         return text.replace(pw, "***") if len(pw) >= 4 else text
 
     def _error_text(self, e: BaseException) -> str:
-        text = str(e).strip()
-        return self._scrub(text.splitlines()[0] if text else type(e).__name__)
+        # oracledb puts the useful reason on later lines (e.g. "DPY-6005: cannot connect ... | [SSL: ...]").
+        lines = [ln.strip() for ln in str(e).splitlines() if ln.strip() and not ln.strip().startswith("Help:")]
+        return self._scrub(" | ".join(lines)[:500] if lines else type(e).__name__)
 
     async def _ensure(self) -> Any:
         if self._conn is None:
-            self._conn = await asyncio.to_thread(self._open)
+            await _in_thread(self._open_into_self)
         return self._conn
+
+    def _open_into_self(self) -> None:
+        # Stored from the worker thread, so a cancelled caller can't leak the connection.
+        self._conn = self._open()
 
     async def _run(self, fn: Callable[[Any], T]) -> T:
         async with self._lock:
             conn = await self._ensure()
             try:
-                return await asyncio.to_thread(fn, conn)
+                return await _in_thread(fn, conn)
             except ConnectorError:
                 raise
             except Exception as e:  # noqa: BLE001 - driver errors become ConnectorError
                 if type(e).__name__ in {"OperationalError", "InterfaceError"}:
                     self._conn = None
-                    await asyncio.to_thread(_close_quietly, conn)
+                    await _in_thread(_close_quietly, conn)
                 raise ConnectorError(
                     f"Oracle query failed: {self._error_text(e)}",
                     hint="Check the database is up and the user still has SELECT on the table.",
                 ) from None
 
     async def close(self) -> None:
+        # Holding the lock means any in-flight call has finished with the connection.
         async with self._lock:
             conn, self._conn = self._conn, None
-        if conn is not None:
-            await asyncio.to_thread(_close_quietly, conn)
+            if conn is not None:
+                await _in_thread(_close_quietly, conn)
 
     def _schemas(self) -> list[str]:
         given = [str(x) for x in (self.settings.get("schemas") or []) if str(x)]
@@ -268,7 +302,13 @@ class OracleConnector(PollingConnector):
             TestStep(
                 name="Encryption",
                 ok=enc or want == "off",
-                detail="encrypted (TCPS)" if enc else "not encrypted (TCP)",
+                detail=(
+                    "not encrypted (TCP)"
+                    if not enc
+                    else "encrypted (TCPS); server certificate verified"
+                    if want == "verify"
+                    else "encrypted (TCPS); server certificate NOT verified"
+                ),
                 hint=""
                 if enc or want == "off"
                 else "Configure a TCPS listener on the database (usually port 2484) or set Encryption "
@@ -341,6 +381,15 @@ class OracleConnector(PollingConnector):
         return list(out.values())
 
     async def snapshot(self, dataset: str) -> list[Record]:
+        """The whole table, or ConnectorError if it has more than MAX_ROWS rows (never truncated)."""
+        rows = await self._read(dataset, MAX_ROWS + 1)
+        check_row_cap(len(rows), dataset, MAX_ROWS)
+        return rows
+
+    async def preview(self, dataset: str, limit: int = 20) -> list[Record]:
+        return await self._read(dataset, max(0, min(int(limit), MAX_ROWS)))
+
+    async def _read(self, dataset: str, n: int) -> list[Record]:
         owner, table = await self._resolve(dataset)
         query = f"SELECT * FROM {quote_ident(owner)}.{quote_ident(table)} FETCH FIRST :n ROWS ONLY"  # noqa: S608
 
@@ -349,7 +398,7 @@ class OracleConnector(PollingConnector):
             cur = c.cursor()
             cur.execute("SET TRANSACTION READ ONLY")
             try:
-                cur.execute(query, {"n": MAX_ROWS}, fetch_lobs=False)
+                cur.execute(query, {"n": n}, fetch_lobs=False)
                 return _fetch_dicts(cur)
             finally:
                 c.rollback()
@@ -378,6 +427,24 @@ def _close_quietly(conn: Any) -> None:
 
 def _connection_hint(message: str, encryption: str) -> str:
     m = message.lower()
+    # Resolver errors first: "Name or service not known" mentions "service" (LIVEOPS-47).
+    if any(
+        w in m
+        for w in (
+            "getaddrinfo",
+            "name or service not known",
+            "nodename nor servname",
+            "temporary failure in name resolution",
+            "no address associated",
+            "errno -2",
+            "errno -3",
+            "errno -5",
+        )
+    ):
+        return (
+            "Check the host name. From Docker on Windows or Mac, "
+            "use host.docker.internal for a database on your own computer."
+        )
     if encryption != "off" and ("ssl" in m or "tls" in m or "certificate" in m or "tcps" in m):
         if encryption == "verify":
             return (
@@ -388,13 +455,8 @@ def _connection_hint(message: str, encryption: str) -> str:
             "The server didn't accept an encrypted (TCPS) connection. Use the TCPS port (often 2484), "
             "or set Encryption to Off for local testing only."
         )
-    if "ora-12514" in m or "dpy-6001" in m or "service" in m and "not" in m:
+    if "ora-12514" in m or "dpy-6001" in m or "ora-12505" in m:
         return "Check the service name (for example FREEPDB1 or ORCLPDB1); ask your DBA for the right one."
-    if "getaddrinfo" in m or "name or service not known" in m or "dpy-6005" in m and "resolve" in m:
-        return (
-            "Check the host name. From Docker on Windows or Mac, "
-            "use host.docker.internal for a database on your own computer."
-        )
     if "refused" in m or "timed out" in m or "timeout" in m or "dpy-6005" in m:
         return "Check the host and port (default 1521, TCPS often 2484) and that a firewall allows the connection."
     return "Check the host, port, service name, user and password."

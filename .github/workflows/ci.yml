@@ -137,5 +137,5 @@ jobs:
         # The contract fixtures create their own databases, schemas and read-only users.
         run: >-
           pytest -v -rs
-          tests/unit/test_sqlserver.py tests/unit/test_oracle.py
+          tests/unit/test_sqlserver.py tests/unit/test_oracle.py tests/unit/test_oracle_tls.py
           tests/contract/test_sqlserver_contract.py tests/contract/test_oracle_contract.py

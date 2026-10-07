@@ -10,6 +10,7 @@ from __future__ import annotations
 import datetime as dt
 import decimal
 import json
+import re
 import uuid
 from typing import Any
 
@@ -73,7 +74,9 @@ class FakeMssql:
         if "CHANGE_TRACKING_MIN_VALID_VERSION(OBJECT_ID" in sql:
             return ["c", "m"], [(self.version, self.min_valid)]
         if "CHANGETABLE" in sql:
-            limit, since = params
+            assert params is None, "queries with identifiers must not use driver parameters"
+            limit = int(re.search(r"TOP \((\d+)\)", sql).group(1))  # type: ignore[union-attr]
+            since = int(re.search(r"CHANGETABLE\(CHANGES .*, (\d+)\) AS ct", sql).group(1))  # type: ignore[union-attr]
             out = []
             latest: dict[str, int] = {}
             for v, i in self.changes:
@@ -83,8 +86,10 @@ class FakeMssql:
                 row = self.rows.get(i, (None, None, None))
                 out.append((v, i, *row))
             return ["SYS_CHANGE_VERSION", "id", *COLS], out[:limit]
-        if sql.startswith("SELECT TOP (%s) * FROM"):
-            return COLS, list(self.rows.values())[: params[0]]
+        m = re.match(r"SELECT TOP \((\d+)\) \* FROM ", sql)
+        if m:
+            assert params is None, "queries with identifiers must not use driver parameters"
+            return COLS, list(self.rows.values())[: int(m.group(1))]
         raise AssertionError(f"unexpected SQL: {sql}")
 
 
@@ -134,8 +139,8 @@ async def test_discover_binds_schemas_and_snapshot_sql_is_quoted() -> None:
         assert params == (json.dumps(["dbo", "o'brien"]),)
     await c.snapshot("dbo.we]ird")
     sql, params, _ = fake.executed[-1]
-    assert sql == "SELECT TOP (%s) * FROM [dbo].[we]]ird]"
-    assert params == (MAX_ROWS,)
+    assert sql == f"SELECT TOP ({MAX_ROWS + 1}) * FROM [dbo].[we]]ird]"
+    assert params is None
 
 
 async def test_unknown_dataset_is_rejected_without_running_it() -> None:
@@ -273,7 +278,10 @@ async def start_tracker(db: FakeMssql) -> tuple[ChangeTracker, FakeConnection, l
 async def test_cdc_initial_state_then_changes_and_cursor_advances() -> None:
     db = FakeMssql()
     t, fake, first = await start_tracker(db)
-    assert [(ch.op, ch.key) for ch in first] == [(ChangeOp.UPSERT, k) for k in ("A1", "A2", "A3")]
+    assert [(ch.op, ch.key) for ch in first] == [
+        *[(ChangeOp.UPSERT, k) for k in ("A1", "A2", "A3")],
+        (ChangeOp.SNAPSHOT_END, ""),
+    ]
     assert t.version == 10
 
     db.change("A9", ("A9", "free", "ER"))
@@ -287,11 +295,12 @@ async def test_cdc_initial_state_then_changes_and_cursor_advances() -> None:
     ]
     assert t.version == 13
     sql, params, _ = fake.executed[-1]
-    assert "FROM CHANGETABLE(CHANGES [dbo].[assets], %s) AS ct" in sql
+    assert sql.startswith(f"SELECT TOP ({MAX_ROWS + 1}) ct.SYS_CHANGE_VERSION, ct.[id], t.* ")
+    assert "FROM CHANGETABLE(CHANGES [dbo].[assets], 10) AS ct" in sql
     assert "LEFT OUTER JOIN [dbo].[assets] AS t ON t.[id] = ct.[id]" in sql
-    assert params == (MAX_ROWS + 1, 10)
+    assert params is None
     assert await t.poll() == []  # nothing new
-    assert fake.executed[-1][1] == (MAX_ROWS + 1, 13)
+    assert "CHANGETABLE(CHANGES [dbo].[assets], 13)" in fake.executed[-1][0]
 
 
 async def test_cdc_dedupes_rows_seen_again_and_deletes_of_unknown_rows() -> None:
@@ -312,6 +321,7 @@ async def test_cdc_cursor_older_than_retention_triggers_full_resync() -> None:
     db.version, db.min_valid = 50, 40
     out = await t.poll()
     assert t.resyncs == 1 and t.version == 50
+    # Differences only, with explicit deletes; no second SNAPSHOT_END (ADR 0004: one per stream()).
     assert sorted((ch.op.value, ch.key) for ch in out) == [("delete", "A2"), ("upsert", "A1"), ("upsert", "A7")]
     assert all(ch.key != "A3" for ch in out)  # unchanged rows are not re-sent
 
@@ -349,6 +359,7 @@ async def test_cdc_stream_yields_initial_state_then_diffs() -> None:
     gen = c.stream("dbo.assets", ["id"], {"poll_interval_s": 0})
     first = [await gen.__anext__() for _ in range(3)]
     assert {ch.key for ch in first} == {"A1", "A2", "A3"}
+    assert (await gen.__anext__()).op == ChangeOp.SNAPSHOT_END
     db.change("A2", ("A2", "free", "ICU"))
     ch = await gen.__anext__()
     assert (ch.op, ch.key, ch.record["status"]) == (ChangeOp.UPSERT, "A2", "free")
@@ -362,8 +373,139 @@ async def test_poll_mode_stream_uses_snapshots() -> None:
     gen = c.stream("dbo.assets", ["id"], {"poll_interval_s": 0})
     first = [await gen.__anext__() for _ in range(3)]
     assert {ch.key for ch in first} == {"A1", "A2", "A3"}
+    assert (await gen.__anext__()).op == ChangeOp.SNAPSHOT_END
     db.rows.pop("A1")
     ch = await gen.__anext__()
     assert (ch.op, ch.key) == (ChangeOp.DELETE, "A1")
     assert not any("CHANGETABLE" in s for s in fake.sql())
     await gen.aclose()
+
+
+# -- ADR 0004: keyless rows, row cap ------------------------------------------
+
+
+async def test_cdc_rows_without_key_are_skipped_and_counted() -> None:
+    """LIVEOPS-23: a NULL key must not stop the change-tracking stream."""
+    db = FakeMssql()
+    db.rows["N1"] = ("N1", "free", None)  # mapping keys on 'zone'; this row has none
+    c, _ = make(db, mode="cdc")
+    t = ChangeTracker(c, "dbo.assets", ["zone"])
+    await t.start()
+    first = t.initial()
+    assert [ch.key for ch in first] == ["ER", "ICU", "General", ""]
+    assert c.skipped_records == 1
+
+    db.change("A1", ("A1", "occupied", None))  # key becomes NULL: drop it from the map, count it
+    db.change("A9", ("A9", "free", "Lab"))  # other changes keep flowing
+    out = await t.poll()
+    assert [(ch.op, ch.key) for ch in out] == [(ChangeOp.DELETE, "ER"), (ChangeOp.UPSERT, "Lab")]
+    assert c.skipped_records == 2
+
+    db.change("N1", ("N1", "free", "Ward"))  # key filled in later
+    db.change("A1", None)  # keyless row deleted
+    out = await t.poll()
+    assert [(ch.op, ch.key) for ch in out] == [(ChangeOp.UPSERT, "Ward")]
+    assert c.skipped_records == 0
+
+
+async def test_cdc_resync_skips_keyless_rows() -> None:
+    db = FakeMssql()
+    c, _ = make(db, mode="cdc")
+    t = ChangeTracker(c, "dbo.assets", ["zone"])
+    await t.start()
+    t.initial()
+    db.rows["A2"] = ("A2", "occupied", None)
+    db.version, db.min_valid = 99, 50
+    out = await t.poll()
+    assert t.resyncs == 1
+    assert [(ch.op, ch.key) for ch in out] == [(ChangeOp.DELETE, "ICU")]
+    assert c.skipped_records == 1
+
+
+async def test_poll_snapshot_over_cap_raises_instead_of_truncating(monkeypatch: pytest.MonkeyPatch) -> None:
+    """LIVEOPS-34: fetch cap+1 and refuse, never return a partial table."""
+    from app.connectors import sqlserver
+
+    monkeypatch.setattr(sqlserver, "MAX_ROWS", 2)
+    db = FakeMssql()
+    c, fake = make(db)
+    with pytest.raises(ConnectorError) as e:
+        await c.snapshot("dbo.assets")
+    assert "more than 2 rows" in str(e.value) and "view" in e.value.hint
+    assert fake.executed[-1][0] == "SELECT TOP (3) * FROM [dbo].[assets]"
+    db.rows.pop("A3")
+    assert len(await c.snapshot("dbo.assets")) == 2
+    db.rows["A3"] = ("A3", "x", "y")
+    assert len(await c.preview("dbo.assets", limit=1)) == 1  # preview is capped by limit, never raises
+
+
+async def test_cdc_initial_snapshot_over_cap_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.connectors import sqlserver
+
+    monkeypatch.setattr(sqlserver, "MAX_ROWS", 2)
+    c, _ = make(FakeMssql(), mode="cdc")
+    with pytest.raises(ConnectorError, match="more than 2 rows"):
+        await ChangeTracker(c, "dbo.assets", ["id"]).start()
+
+
+async def test_table_name_with_percent_is_not_treated_as_a_placeholder() -> None:
+    db = FakeMssql(table="load%s_100%")
+    c, fake = make(db, mode="cdc")
+    t = ChangeTracker(c, "dbo.load%s_100%", ["id"])
+    await t.start()
+    t.initial()
+    db.change("A1", ("A1", "occupied", "ER"))
+    out = await t.poll()
+    assert [ch.key for ch in out] == ["A1"]
+    for sql, params, _ in fake.executed:
+        if "[load%s_100%]" in sql:
+            assert params is None  # pymssql would substitute %s inside the identifier otherwise
+
+
+def test_real_pymssql_would_not_touch_unparameterised_identifiers() -> None:
+    """The identifier queries are sent without params, which pymssql passes through verbatim."""
+    mssql = pytest.importorskip("pymssql._mssql")
+    sql = f"SELECT TOP ({MAX_ROWS + 1}) * FROM [dbo].[load%s_100%]"
+    assert mssql.substitute_params(sql) == sql.encode()
+
+
+# -- cancellation vs close() ----------------------------------------------------
+
+
+async def test_close_waits_for_a_cancelled_in_flight_query() -> None:
+    import asyncio
+    import threading
+
+    entered, release = threading.Event(), threading.Event()
+    order: list[str] = []
+    db = FakeMssql()
+
+    def responder(sql: str, params: Any) -> Result:
+        if sql.startswith("SELECT TOP"):
+            entered.set()
+            release.wait(5)
+            order.append("query finished")
+        return db(sql, params)
+
+    c, fake = make(responder)
+    await c.discover()
+    real_close = fake.close
+
+    def close() -> None:
+        order.append("close")
+        real_close()
+
+    fake.close = close  # type: ignore[method-assign]
+    task = asyncio.create_task(c.snapshot("dbo.assets"))
+    await asyncio.to_thread(entered.wait, 5)
+    task.cancel()
+    closing = asyncio.create_task(c.close())
+    await asyncio.sleep(0.05)
+    assert not closing.done(), "close() must wait while the worker thread still uses the connection"
+    assert order == []
+    release.set()
+    await closing
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert order == ["query finished", "close"]
+    assert fake.closed == 1
