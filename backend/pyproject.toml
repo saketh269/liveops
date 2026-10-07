@@ -14,6 +14,7 @@ dependencies = [
   "redis>=5.0",
   "cryptography>=43",
   "websockets>=12",
+  "anyio>=4",
 ]
 
 [project.optional-dependencies]
