@@ -49,8 +49,21 @@ export type Column = { name: string; type: string; nullable: boolean };
 export type Dataset = { name: string; columns: Column[]; primary_key: string[]; supports_cdc: boolean };
 export type SourceRecord = Record<string, unknown>;
 
-export type Zone = { id: string; name: string; polygon: [number, number][]; color?: string };
-export type SiteLayout = { zones?: Zone[]; width?: number; depth?: number };
+// Layout v2: see docs/adr/0006-hospital-map.md. Old layouts (no floors) stay valid.
+export type ZoneKind = "unit" | "room" | "bay" | "corridor" | "waiting" | "entrance";
+export type Zone = {
+  id: string;
+  name: string;
+  polygon: [number, number][];
+  color?: string;
+  floor_id?: string;
+  kind?: ZoneKind;
+  doors?: [number, number][];
+};
+export type FloorPlan = { asset_id: string; x: number; y: number; w: number; h: number; opacity?: number };
+export type Floor = { id: string; name: string; level: number; width: number; depth: number; plan?: FloorPlan };
+export type Entrance = { id: string; name: string; floor_id?: string; point: [number, number]; kind: "walk" | "ambulance" };
+export type SiteLayout = { zones?: Zone[]; width?: number; depth?: number; floors?: Floor[]; entrances?: Entrance[] };
 export type Site = {
   id: string;
   name: string;
@@ -67,6 +80,13 @@ export type MappingConfig = {
   state_map?: Record<string, string>;
   attributes?: string[];
   kind?: string | null;
+  filter?: RowFilter[];
+};
+
+export type RowFilter = {
+  column: string;
+  op: "eq" | "ne" | "in" | "not_in" | "is_null" | "not_null" | "gt" | "gte" | "lt" | "lte" | "contains";
+  value?: unknown;
 };
 
 export type Mapping = {
