@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import re
 import time
 import zlib
@@ -401,7 +402,9 @@ class RestConnector(PollingConnector):
             raise ConnectorError(f"The token URL answered HTTP {status}", hint="Check the token URL.")
         try:
             body = json.loads(raw)
-            token = str(body["access_token"])
+            token = body["access_token"]
+            if not isinstance(token, str) or not token.strip():
+                raise ValueError("empty access_token")
         except (ValueError, KeyError, TypeError):
             raise ConnectorError(
                 "The token URL didn't return an access_token", hint="Check the token URL is the OAuth2 token endpoint."
@@ -410,6 +413,9 @@ class RestConnector(PollingConnector):
             expires_in = float(body.get("expires_in") or 300)
         except (TypeError, ValueError):
             expires_in = 300.0
+        if not math.isfinite(expires_in) or expires_in <= 0:
+            expires_in = 300.0
+        expires_in = min(expires_in, 24 * 3600.0)  # never trust a token for more than a day
         self._token = token
         self._token_expires = time.monotonic() + max(0.0, expires_in - TOKEN_REFRESH_MARGIN_S)
         return token

@@ -29,6 +29,7 @@ class MockApi:
         self.requests = 0
         self.tokens: set[str] = set()
         self.redirect_target = ""
+        self.token_body: Any = {}
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), self._handler())
         self.port = self.server.server_address[1]
         self.base = f"http://127.0.0.1:{self.port}"
@@ -82,6 +83,10 @@ class MockApi:
                     n = int(self.headers.get("Content-Length") or 0)
                     self.rfile.read(n)
                     return self._send(200, api.bomb(1), {"Content-Encoding": "gzip"})
+                if urlsplit(self.path).path == "/oauth/custom":  # token body set by the test
+                    n = int(self.headers.get("Content-Length") or 0)
+                    self.rfile.read(n)
+                    return self._send(200, api.token_body)
                 if urlsplit(self.path).path != "/oauth/token":
                     return self._send(404, {"error": "not found"})
                 n = int(self.headers.get("Content-Length") or 0)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import time
 from collections.abc import AsyncIterator, Iterator
 from typing import Any
 
@@ -453,3 +454,35 @@ def test_site_local_and_embedded_v4_are_not_public() -> None:
     for a in ("64:ff9b::a9fe:a9fe", "2002:a9fe:a9fe::1"):  # NAT64 / 6to4 forms of 169.254.169.254
         with pytest.raises(ConnectorError, match="blocked"):
             check_ip(ipaddress.ip_address(a), allow_private=True)
+
+
+# -- LIVEOPS-58: token response parsing ---------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "body,ok",
+    [
+        ({"access_token": None}, False),
+        ({"access_token": ""}, False),
+        ({"access_token": 123}, False),
+        ({"token": "x"}, False),
+        ({"access_token": "t1", "expires_in": "3600s"}, True),
+        ({"access_token": "t1", "expires_in": "NaN"}, True),
+        ({"access_token": "t1", "expires_in": 1e300}, True),
+    ],
+)
+async def test_token_response_parsing(api: MockApi, body: dict[str, Any], ok: bool) -> None:
+    api.token_body = body
+    c = RestConnector(
+        settings(api, auth="oauth2_client_credentials", token_url=f"{api.base}/oauth/custom"),
+        {"client_id": CLIENT_ID, "client_secret": CLIENT_SECRET},
+    )
+    try:
+        if ok:
+            assert await c._oauth_token() == "t1"
+            assert c._token_expires - time.monotonic() <= 24 * 3600
+        else:
+            with pytest.raises(ConnectorError, match="didn't return an access_token"):
+                await c._oauth_token()
+    finally:
+        await c.close()
