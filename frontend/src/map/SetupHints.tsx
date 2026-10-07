@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { api } from "../api/client";
-import type { Asset, Site, SiteLayout } from "../api/types";
+import type { Asset, Mapping, Site, SiteLayout } from "../api/types";
 import { appendMissingZones, buildAutoLayout, stateCoverage, zoneCoverage } from "./autoZones";
 
 type Props = {
@@ -28,6 +28,13 @@ export default function SetupHints({ site, assets, ready, onSite, onEditLayout }
   const [error, setError] = useState<string | null>(null);
   const autoTried = useRef(false);
   const [hideStates, setHideStates] = useState(false);
+  const [mappings, setMappings] = useState<Mapping[] | null>(null);
+  const [sourceNames, setSourceNames] = useState<Record<string, string>>({});
+
+  useEffect(() => {
+    api.mappings(site.id).then(setMappings, () => setMappings(null));
+    api.sources().then((l) => setSourceNames(Object.fromEntries(l.map((x) => [x.id, x.name]))), () => {});
+  }, [site.id]);
 
   const save = async (layout: SiteLayout, previous: SiteLayout, names: string[]) => {
     setBusy(true);
@@ -53,7 +60,10 @@ export default function SetupHints({ site, assets, ready, onSite, onEditLayout }
 
   if (!ready || assets.size === 0) return null;
   const missingCount = [...zones.missing.values()].reduce((a, b) => a + b, 0);
-  const grey = states.total - states.colored;
+  const unrecognisedCount = [...states.unrecognised.values()].reduce((a, b) => a + b, 0);
+  const incomplete = (mappings ?? []).filter((m) => m.active)
+    .map((m) => ({ m, gaps: [!m.config.fields.zone && "Zone", !m.config.fields.state && "State"].filter(Boolean) as string[] }))
+    .filter((x) => x.gaps.length > 0);
 
   return (
     <div className="lm-hints">
@@ -74,19 +84,29 @@ export default function SetupHints({ site, assets, ready, onSite, onEditLayout }
           </button>
         </div>
       )}
-      {zones.noZone > 0 && (
+      {(zones.noZone > 0 || states.noState > 0) && (
         <div className="notice">
-          {zones.noZone} asset{zones.noZone === 1 ? " has" : "s have"} no zone, so {zones.noZone === 1 ? "it sits" : "they sit"} in Unassigned.{" "}
-          In the <Link to="/mapping">mapping</Link>, set <strong>Zone</strong> to the column that says where each one is (for example a unit or ward).
+          {zones.noZone > 0 && <>{zones.noZone} asset{zones.noZone === 1 ? " has" : "s have"} no zone, so {zones.noZone === 1 ? "it sits" : "they sit"} in Unassigned. </>}
+          {states.noState > 0 && <>{states.noState} asset{states.noState === 1 ? " has" : "s have"} no state, so {states.noState === 1 ? "it is" : "they are"} grey. </>}
+          {incomplete.length > 0 ? (
+            <ul>
+              {incomplete.map(({ m, gaps }) => (
+                <li key={m.id}>
+                  <strong>{sourceNames[m.source_id] ?? "Source"}</strong> · <span className="mono">{m.dataset}</span>: {gaps.join(" and ")} not set.{" "}
+                  {gaps.length === 2 && <>This table may not describe things on the map; check it's the one you meant. </>}
+                  <Link to={`/mapping/${m.id}/edit`}>Fix this mapping</Link>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <>In the <Link to="/mapping">mapping</Link>, set <strong>Zone</strong> to the column that says where each one is and <strong>State</strong> to the status column.</>
+          )}
         </div>
       )}
-      {grey > 0 && !hideStates && (
+      {states.unrecognised.size > 0 && !hideStates && (
         <div className="notice">
-          {grey} asset{grey === 1 ? " is" : "s are"} grey because{" "}
-          {states.noState === states.total
-            ? <>no state column is mapped. In the <Link to="/mapping">mapping</Link>, set <strong>State</strong> to the status column.</>
-            : <>{states.unrecognised.size > 0 ? <>these state values aren't recognised: {list(states.unrecognised)}</> : "they have no state value"}.
-                {" "}In the <Link to="/mapping">mapping</Link>, translate each value to Free, In use, Cleaning or Alert.</>}
+          {unrecognisedCount} asset{unrecognisedCount === 1 ? " is" : "s are"} grey because these state values aren't recognised: {list(states.unrecognised)}.
+          {" "}In the <Link to="/mapping">mapping</Link>, translate each value to Free, In use, Cleaning or Alert.
           {" "}<button type="button" className="btn lm-link-btn" onClick={() => setHideStates(true)}>Dismiss</button>
         </div>
       )}

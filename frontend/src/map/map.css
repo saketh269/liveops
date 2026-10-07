@@ -129,5 +129,5 @@
 
 /* Setup notices above the map */
 .lm-hints { display: grid; gap: 8px; }
-.lm-hints .notice { line-height: 1.6; }
+.lm-hints .notice { display: block; line-height: 1.6; }
 .lm-link-btn { padding: 3px 10px; font-size: 0.8rem; }

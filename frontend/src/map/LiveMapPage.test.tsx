@@ -9,6 +9,7 @@ const site: Site = {
 let push: ((m: StreamMessage) => void) | null = null;
 let status: ((s: "open" | "closed") => void) | undefined;
 const updateSite = vi.fn();
+let mappingsList: unknown[] = [];
 
 vi.mock("../api/client", () => ({
   ApiError: class extends Error { status = 500; },
@@ -16,6 +17,7 @@ vi.mock("../api/client", () => ({
     sites: () => Promise.resolve([site]),
     site: () => Promise.resolve(site),
     sources: () => Promise.resolve([{ id: "src", name: "Hospital EHR" }]),
+    mappings: () => Promise.resolve(mappingsList),
     updateSite: (...args: unknown[]) => updateSite(...args),
   },
   openSiteStream: (_id: string, onMessage: (m: StreamMessage) => void, onStatus?: (s: "open" | "closed") => void) => {
@@ -109,4 +111,15 @@ test("zones are created from the data when the layout matches none of it", async
   const zones = updateSite.mock.calls[0][1].layout.zones.map((z: { name: string }) => z.name);
   expect(zones).toEqual(["ER", "General"]);
   expect(await screen.findByText(/Created 2 zones from your data: ER, General/)).toBeTruthy();
+});
+
+test("records with no zone or state point at the mapping that needs fixing", async () => {
+  mappingsList = [{ id: "m9", site_id: "s1", source_id: "src", dataset: "epic.triage_queue", active: true, config: { id_field: "id", fields: {} } }];
+  renderAt("/map/s1");
+  await screen.findByRole("heading", { level: 1, name: "General Hospital" });
+  await send({ type: "snapshot", site_id: "s1", assets: [{ site_id: "s1", asset_id: "1", updated_ts: 1, _sources: {} }], event: null, ts: 1 });
+  expect(await screen.findByText(/epic\.triage_queue/)).toBeTruthy();
+  expect(screen.getByText(/Zone and State not set/)).toBeTruthy();
+  expect(screen.getByRole("link", { name: "Fix this mapping" }).getAttribute("href")).toBe("/mapping/m9/edit");
+  mappingsList = [];
 });
