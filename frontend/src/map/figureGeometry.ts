@@ -2,13 +2,14 @@
 // into merged batches by figureLayer). The models themselves live in
 // map/models/modelGeometry.ts; colors in map/models/palette.ts.
 import * as THREE from "three";
-import type { FigureModel } from "./figures";
+import { canLie, type FigureModel } from "./figures";
 import { modelTemplate, type ModelTemplate } from "./models/modelGeometry";
 
 const cache = new Map<string, ModelTemplate>();
 
 /** Shared, read-only template for a model (lying only applies to models that can lie). */
 export function figureTemplate(model: FigureModel, lying = false): ModelTemplate {
+  lying = lying && canLie(model);
   const key = `${model}${lying ? ":lying" : ""}`;
   let t = cache.get(key);
   if (!t) { t = modelTemplate(model, lying); cache.set(key, t); }

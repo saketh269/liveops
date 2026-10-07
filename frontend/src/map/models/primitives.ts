@@ -94,10 +94,16 @@ export function disc(r: number, seg = 6): THREE.BufferGeometry {
   return make(pos, nrm, idx);
 }
 
-/** Wheel with its axle along z, centred on y = 0. */
-export function wheel(r: number, width: number, seg = 6): THREE.BufferGeometry {
-  const g = frustum(r, r, width, seg, { top: true, bottom: true });
+/** Flat horizontal plate on y = 0 facing up: 4 vertices (roof markings, seats seen from above). */
+export function plate(w: number, d: number): THREE.BufferGeometry {
+  const x = w / 2, z = d / 2;
+  return make([-x, 0, -z, -x, 0, z, x, 0, z, x, 0, -z], [0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0], [0, 1, 2, 0, 2, 3]);
+}
+
+/** Wheel with its axle along z, centred on y = 0; only the hub facing `side` (+1 = +z) is closed. */
+export function wheel(r: number, width: number, side: 1 | -1, seg = 6): THREE.BufferGeometry {
+  const g = frustum(r, r, width, seg, side > 0 ? { top: true } : { bottom: true });
   g.translate(0, -width / 2, 0);
-  g.rotateX(Math.PI / 2);
+  g.rotateX(Math.PI / 2); // (x, y, z) → (x, -z, y): the top cap ends up facing +z
   return g;
 }

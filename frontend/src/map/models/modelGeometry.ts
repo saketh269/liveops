@@ -6,7 +6,7 @@
 import * as THREE from "three";
 import type { FigureModel } from "../figures";
 import type { PaletteKey } from "./palette";
-import { cuboid, disc, frustum, gem, wheel } from "./primitives";
+import { cuboid, disc, frustum, gem, plate, wheel } from "./primitives";
 
 /** Paint for a part: a palette key, or the record's state color. */
 export type Paint = PaletteKey | "state";
@@ -109,7 +109,7 @@ function person(o: Outfit, extra: (dx: number) => Part[] = () => []): Part[] {
     leg(0.065, 1), leg(-0.065, -1),
     part(frustum(hem.r, 0.11, SHOULDER - hem.y, 6, { top: true }), o.top, [dx, hem.y, 0]),
     arm(0.15, -1), arm(-0.15, 1),
-    part(gem(0.1), "skin", [dx, 0.87, 0]),
+    part(gem(0.11, 6, 1.05), "skin", [dx, 0.875, 0]),
     ...extra(dx),
   ];
 }
@@ -135,11 +135,10 @@ function people(model: FigureModel): ModelTemplate | null {
       ]), PERSON_H);
     case "transporter":
       return build(person({ top: "transporter", pants: "transporterPants", back: 0.14 }, () => [
-        part(cuboid(0.24, 0.04, 0.26), "wheelchairSeat", [0.3, 0.25, 0]),
+        part(plate(0.24, 0.26), "wheelchairSeat", [0.3, 0.28, 0]),
         part(cuboid(0.04, 0.24, 0.26), "wheelchairSeat", [0.19, 0.29, 0]),
-        part(wheel(0.13, 0.03), "wheelchair", [0.25, 0.13, 0.15]),
-        part(wheel(0.13, 0.03), "wheelchair", [0.25, 0.13, -0.15]),
-        part(cuboid(0.03, 0.06, 0.2), "wheelchair", [0.42, 0.04, 0]), // footrest
+        part(wheel(0.13, 0.03, 1), "wheelchair", [0.25, 0.13, 0.15]),
+        part(wheel(0.13, 0.03, -1), "wheelchair", [0.25, 0.13, -0.15]),
       ]), PERSON_H);
     case "paramedic":
       return build(person({ top: "medic", pants: "medicPants" }, (dx) => [
@@ -197,14 +196,13 @@ function van(ambulance: boolean): ModelTemplate {
     part(cuboid(0.66, 0.4, 0.46), body, [-0.16, 0.1, 0]),
     part(cuboid(0.3, 0.3, 0.44), body, [0.33, 0.1, 0]),
     part(cuboid(0.02, 0.12, 0.38), "glass", [0.48, 0.26, 0]),
-    ...[[-0.3, 0.21], [-0.3, -0.21], [0.3, 0.21], [0.3, -0.21]].map(([x, z]) => part(wheel(0.09, 0.06), "tire", [x, 0.09, z])),
-    part(cuboid(0.5, 0.012, 0.3), "state", [-0.18, 0.5, 0]), // roof panel shows the record's state
+    ...([[-0.3, 0.21], [-0.3, -0.21], [0.3, 0.21], [0.3, -0.21]] as const).map(([x, z]) => part(wheel(0.09, 0.06, z > 0 ? 1 : -1), "tire", [x, 0.09, z])),
+    part(plate(0.5, 0.3), "state", [-0.18, 0.505, 0]), // roof panel shows the record's state
   ];
   if (ambulance) parts.push(
     part(cuboid(0.665, 0.06, 0.465), "vanStripe", [-0.16, 0.3, 0]),
-    part(cuboid(0.305, 0.05, 0.445), "vanStripe", [0.33, 0.18, 0]),
-    part(cuboid(0.2, 0.012, 0.06), "vanStripe", [-0.18, 0.512, 0]),
-    part(cuboid(0.06, 0.012, 0.2), "vanStripe", [-0.18, 0.512, 0]),
+    part(plate(0.2, 0.06), "vanStripe", [-0.18, 0.51, 0]),
+    part(plate(0.06, 0.2), "vanStripe", [-0.18, 0.511, 0]),
     part(cuboid(0.06, 0.05, 0.12), "lightRed", [0.36, 0.4, -0.07], { flash: 1 }),
     part(cuboid(0.06, 0.05, 0.12), "lightBlue", [0.36, 0.4, 0.07], { flash: -1 }),
   );
