@@ -1,6 +1,6 @@
 [project]
 name = "liveops-backend"
-version = "0.1.0.dev0"
+version = "0.1.0"
 description = "Live Ops Portal backend: connectors, state store, API"
 requires-python = ">=3.12"
 dependencies = [
