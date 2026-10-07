@@ -26,6 +26,8 @@ type Props = {
   motion?: boolean;
   /** Removed records still walking out, with their final data (for the details panel). */
   onDeparting?: (assets: Map<string, Asset>) => void;
+  /** Zone id to fly the camera to (e.g. a room picked in a panel); changing it flies again. */
+  focusZone?: string | null;
 };
 
 declare global {
@@ -35,7 +37,7 @@ declare global {
 }
 
 /** Hosts the Three.js scene. Asset updates bypass React and go straight to the scene. */
-export default function MapView3D({ layout, stateRef, listen, selectedId, onHover, onSelect, onFail, debug, plan, assetFilter, viewKey, motion = true, onDeparting }: Props) {
+export default function MapView3D({ layout, stateRef, listen, selectedId, onHover, onSelect, onFail, debug, plan, assetFilter, viewKey, motion = true, onDeparting, focusZone }: Props) {
   const hostRef = useRef<HTMLDivElement>(null);
   const labelsRef = useRef<HTMLDivElement>(null);
   const [scene, setScene] = useState<MapScene | null>(null);
@@ -89,6 +91,7 @@ export default function MapView3D({ layout, stateRef, listen, selectedId, onHove
         colorOf: (id: string) => scene.colorOf(id),
         screenOf: (id: string) => scene.screenOf(id),
         positionOf: (id: string) => scene.positionOf(id),
+        roomTintOf: (zoneId: string) => scene.roomTintOf(zoneId),
         assetCount: () => stateRef.current.assets.size,
       };
     }
@@ -108,6 +111,7 @@ export default function MapView3D({ layout, stateRef, listen, selectedId, onHove
   useEffect(() => { scene?.setPlan(plan ?? null); }, [scene, plan]);
 
   useEffect(() => { scene?.setSelected(selectedId); }, [scene, selectedId]);
+  useEffect(() => { if (focusZone) scene?.flyToZone(focusZone); }, [scene, focusZone]);
   useEffect(() => { scene?.setMotionAllowed(motion); }, [scene, motion]);
   const following = follow && !!selectedId;
   useEffect(() => { scene?.setFollow(following); }, [scene, following]);
