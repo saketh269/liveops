@@ -349,3 +349,107 @@ async def test_snapshot_over_row_cap_raises_not_truncates(seeded: MockApi) -> No
         assert "filter" in e.value.hint
     finally:
         await c.close()
+
+
+# -- LIVEOPS-64: compression bombs ------------------------------------------------------
+
+
+@pytest.mark.parametrize("layers", [1, 2])
+async def test_gzip_bomb_is_refused_with_bounded_memory(api: MockApi, layers: int) -> None:
+    import tracemalloc
+
+    wire = len(MockApi.bomb(layers))
+    c = RestConnector(
+        settings(api, path="/v1/bomb", query={"layers": str(layers)}, max_response_mb=1), {"api_key": API_KEY}
+    )
+    tracemalloc.start()
+    try:
+        with pytest.raises(ConnectorError) as e:
+            await c.fetch_all()
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+        await c.close()
+    assert "larger than 1 MB" in str(e.value) or "encoding" in str(e.value)
+    if layers == 2:
+        assert "encoding" in str(e.value), "stacked encodings are refused outright"
+    assert peak < 8 * 1024 * 1024, f"{layers} layer(s), {wire} B on the wire: peak {peak / 1e6:.1f} MB"
+    print(f"bomb layers={layers} wire={wire}B peak={peak / 1e6:.2f}MB")
+
+
+@pytest.mark.parametrize("enc", ["br", "zstd", "compress", "gzip, identity, gzip", "deflate, gzip"])
+async def test_unknown_or_stacked_encodings_refused(api: MockApi, enc: str) -> None:
+    c = RestConnector(settings(api, path="/v1/bomb", query={"enc": enc}), {"api_key": API_KEY})
+    with pytest.raises(ConnectorError, match="encoding") as e:
+        await c.fetch_all()
+    assert "gzip" in e.value.hint
+    await c.close()
+
+
+async def test_normal_gzip_response_still_works(seeded: MockApi) -> None:
+    rows = await _fetch(seeded, path="/v1/gzipped", record_path="", pagination="none")
+    assert len(rows) == 7
+
+
+async def test_oauth_token_response_is_capped(seeded: MockApi) -> None:
+    import tracemalloc
+
+    c = RestConnector(
+        settings(seeded, path="/v1/oauth", auth="oauth2_client_credentials", token_url=f"{seeded.base}/oauth/bomb"),
+        {"client_id": CLIENT_ID, "client_secret": CLIENT_SECRET},
+    )
+    tracemalloc.start()
+    try:
+        report = await c.test()
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+        await c.close()
+    assert not report.ok and "larger than" in report.steps[-1].detail
+    assert peak < 4 * 1024 * 1024, peak
+
+
+# -- LIVEOPS-24: path can't name another server -------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["https://evil.example/x", "//evil.example/x", "\\\\evil.example\\x", "/\\evil.example", "http:x", "/v1\n/x"],
+)
+async def test_absolute_path_is_refused(seeded: MockApi, path: str) -> None:
+    c = RestConnector(settings(seeded, path=path), {"api_key": API_KEY})
+    report = await c.test()
+    assert not report.ok and report.steps[0].name == "Check the settings"
+    assert "not a full address" in report.steps[0].detail
+    with pytest.raises(ConnectorError, match="not a full address"):
+        await c.fetch_all()
+    await c.close()
+    assert seeded.requests == 0, "no request (with the saved API key) may be sent"
+
+
+async def test_relative_paths_still_work(seeded: MockApi) -> None:
+    for p in ("v1/assets", "/v1/assets", "./v1/assets"):
+        assert len(await _fetch(seeded, path=p)) == 7
+
+
+# -- LIVEOPS-56: relative Link with a host-name base URL --------------------------------
+
+
+async def test_link_header_relative_with_hostname_base(seeded: MockApi) -> None:
+    rows = await _fetch(
+        seeded, base_url=f"http://localhost:{seeded.port}", path="/v1/linked", record_path="", pagination="link_header"
+    )
+    assert len(rows) == 7
+
+
+def test_site_local_and_embedded_v4_are_not_public() -> None:
+    import ipaddress
+
+    from app.connectors.netguard import check_ip
+
+    for a in ("fec0::1", "::ffff:10.0.0.1", "2002:a00:1::1", "64:ff9b::a00:1"):
+        with pytest.raises(ConnectorError, match="private"):
+            check_ip(ipaddress.ip_address(a), allow_private=False)
+    for a in ("64:ff9b::a9fe:a9fe", "2002:a9fe:a9fe::1"):  # NAT64 / 6to4 forms of 169.254.169.254
+        with pytest.raises(ConnectorError, match="blocked"):
+            check_ip(ipaddress.ip_address(a), allow_private=True)
