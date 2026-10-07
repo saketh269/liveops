@@ -3,6 +3,7 @@ import { Link, Route, Routes, useParams, useSearchParams } from "react-router-do
 import { api } from "../api/client";
 import type { Mapping, Site } from "../api/types";
 import { formatDate } from "../components/format";
+import { LayoutImport } from "../components/setup/LayoutImport";
 import { SetupFromSource } from "../components/setup/SetupFromSource";
 import { ConfirmDelete, EmptyState, ErrorNotice, Loading } from "../components/ui";
 import { useLoad } from "../components/useLoad";
@@ -136,6 +137,12 @@ function SiteSetupPage() {
         <EmptyState title="Connect a source first" action={<Link className="btn primary" to="/sources/new">Connect a source</Link>}>
           Suggestions are made from a source's tables. Connect one, test it, then come back here.
         </EmptyState>
+      )}
+      {data && data[1].some((s) => s.type === "rest") && (
+        <details className="panel">
+          <summary>Import the floor layout from a source (optional)</summary>
+          <LayoutImport site={data[0]} onImported={reload} />
+        </details>
       )}
       {data && data[1].length > 0 && (
         <SetupFromSource site={data[0]} sources={data[1]} initialSourceId={params.get("source") ?? undefined}

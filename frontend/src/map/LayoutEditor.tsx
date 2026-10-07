@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type KeyboardEvent, type PointerEvent } from "react";
 import { ApiError, api } from "../api/client";
+import { LayoutImport } from "../components/setup/LayoutImport";
 import type { Entrance, Floor, FloorPlan, Site, Zone } from "../api/types";
 import { EntrancesPanel, FloorsPanel, PlanPanel, ZoneForm } from "./EditorPanels";
 import { FloorPlanImage } from "./FloorPlanImage";
@@ -38,6 +39,7 @@ export default function LayoutEditor({ site, onSaved, onClose, initialFloorId }:
   const [planError, setPlanError] = useState<string | null>(null);
   const [message, setMessage] = useState<{ kind: "ok" | "bad"; text: string; items?: string[] } | null>(null);
   const [dirty, setDirty] = useState(false);
+  const [importing, setImporting] = useState(false);
   const svgRef = useRef<SVGSVGElement>(null);
   // Plan images: those the saved layout uses, and those uploaded in this session.
   // Images nothing refers to any more are deleted on save (or on leaving without saving).
@@ -254,6 +256,23 @@ export default function LayoutEditor({ site, onSaved, onClose, initialFloorId }:
     }
   };
 
+  // Import saves on the server; show the result here and on the map (ADR 0007).
+  const onImported = (updated: Site) => {
+    const m = toEditModel(updated.layout);
+    setModel(m);
+    setDirty(false);
+    setSelection(null);
+    setDrag(null);
+    if (!m.floors.some((f) => f.id === floorId)) setFloorId(m.floors[0].id);
+    const keep = planAssetIds(updated.layout);
+    for (const id of new Set([...savedPlans.current, ...uploaded.current])) {
+      if (!keep.has(id)) void api.deletePlan(site.id, id).catch(() => undefined);
+    }
+    savedPlans.current = keep;
+    uploaded.current = new Set();
+    onSaved(updated);
+  };
+
   const cancel = () => {
     if (dirty && !window.confirm("Discard your layout changes?")) return;
     onClose();
@@ -366,6 +385,18 @@ export default function LayoutEditor({ site, onSaved, onClose, initialFloorId }:
       </div>
 
       <aside className="lm-editor-side">
+        <section className="panel lm-panel">
+          {importing ? (
+            <LayoutImport
+              site={site}
+              onImported={onImported}
+              onClose={() => setImporting(false)}
+              confirmImport={() => !dirty || window.confirm("Importing saves the layout from the source. Your unsaved changes here will be lost. Continue?")}
+            />
+          ) : (
+            <button type="button" className="btn" onClick={() => setImporting(true)}>Import layout from a source</button>
+          )}
+        </section>
         <FloorsPanel
           floors={model.floors}
           current={floor}

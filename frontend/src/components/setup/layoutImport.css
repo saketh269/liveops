@@ -1,0 +1,26 @@
+/* Import layout from a source. Tokens only. */
+.li { min-width: 0; }
+.li-head { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 8px; }
+.li-head h2 { margin: 0; font-size: 1.05rem; }
+.li-small { margin: 0; font-size: 0.85rem; }
+.li-grid { display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
+.li-grid .field { min-width: 0; }
+.li-grid input, .li-grid select { width: 100%; min-width: 0; }
+.li-mode { display: grid; gap: 6px; }
+.li-mode label { display: flex; gap: 6px; align-items: baseline; font-weight: 400; }
+.li-more summary { cursor: pointer; font-weight: 600; }
+.li-more .field { margin-top: 8px; }
+.li-summary { margin: 0; overflow-wrap: anywhere; }
+.li .notice.warn { border-left-color: var(--warn); background: var(--warn-soft); }
+.li .notice ul { overflow-wrap: anywhere; }
+.li-thumbs { display: grid; gap: 10px; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); }
+.li-thumb { margin: 0; display: grid; gap: 4px; }
+.li-thumb svg { width: 100%; height: auto; max-height: 160px; background: var(--panel-2); border: 1px solid var(--line); border-radius: var(--radius); }
+.li-thumb figcaption { font-size: 0.85rem; overflow-wrap: anywhere; }
+.li-thumb-floor { fill: var(--panel); stroke: var(--line); stroke-width: 0.3; }
+.li-thumb-zone { fill: var(--panel-2); stroke: var(--muted); stroke-width: 0.15; }
+.li-thumb-zone--room { fill: var(--accent-soft); stroke: var(--accent); }
+.li-thumb-zone--corridor { fill: var(--panel-2); stroke: var(--line); }
+.li-thumb-zone--waiting { fill: var(--warn-soft); stroke: var(--warn); }
+.li-thumb-zone--bay { fill: var(--info-soft); stroke: var(--info); }
+.li-thumb-zone--unit { fill: none; stroke: var(--muted); }
