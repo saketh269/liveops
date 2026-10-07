@@ -17,7 +17,13 @@ from tests.contract.test_postgres_contract import PgDriver
 
 
 class PgCdcDriver(PgDriver):
-    """The poll driver's table and reader role, plus REPLICATION and a publication."""
+    """The poll driver's table and reader role, plus REPLICATION and a publication.
+
+    The mapping key ``id`` is a nullable UNIQUE column and the primary key is a
+    separate ``pk``: this exercises keyless rows and key changes that don't touch
+    the replica identity (LIVEOPS-28)."""
+
+    key_ddl = "UNIQUE"
 
     def __init__(self, dbname: str) -> None:
         super().__init__(dbname)
@@ -26,6 +32,7 @@ class PgCdcDriver(PgDriver):
     async def setup(self) -> None:
         await super().setup()
         async with await psycopg.AsyncConnection.connect(**self.admin, autocommit=True) as c:
+            await c.execute("ALTER TABLE assets ADD COLUMN pk bigserial PRIMARY KEY")
             await c.execute(f"ALTER ROLE {self.role} WITH REPLICATION")
             await c.execute(f"CREATE PUBLICATION {self.publication} FOR TABLE assets")
 
@@ -46,6 +53,9 @@ class PgCdcDriver(PgDriver):
                         await c.execute("SELECT pg_drop_replication_slot(%s)", (name,))
                 await asyncio.sleep(0.1)
         await super().teardown()
+
+    async def insert_null_key(self, row: dict[str, object]) -> None:
+        await self._insert_null_key(row)
 
     async def slots(self) -> list[str]:
         async with await psycopg.AsyncConnection.connect(**{**self.admin, "dbname": "postgres"}, autocommit=True) as c:
@@ -79,11 +89,15 @@ class TestPostgresCdcContract(ConnectorContract):
     # -- extra checks -----------------------------------------------------
 
     async def _initial(self, gen: AsyncIterator, n: int = len(SEED_ROWS)) -> dict[str, object]:
+        """Consume the initial state and the one SNAPSHOT_END marker."""
         seen = {}
-        while len(seen) < n:
+        while True:
             ch = await asyncio.wait_for(gen.__anext__(), 10)
+            if ch.op == ChangeOp.SNAPSHOT_END:
+                break
             assert ch.op == ChangeOp.UPSERT
             seen[ch.key] = ch
+        assert len(seen) == n
         return seen
 
     async def test_no_full_table_reread_per_change(self, driver: PgCdcDriver) -> None:
@@ -216,3 +230,90 @@ class TestPostgresCdcContract(ConnectorContract):
             assert "reader_pw" not in report.model_dump_json()
         finally:
             await c.close()
+
+    # -- fix round (LIVEOPS-28, 43, 29, ADR 0004) ----------------------------
+
+    async def test_key_change_without_pk_change_deletes_old_key(self, driver: PgCdcDriver) -> None:
+        """LIVEOPS-28: the mapping key is not the PK, so pgoutput sends no old tuple."""
+        await driver._exec("UPDATE assets SET zone = %s WHERE id = 'A1'", ("z" * 100_000,))  # TOAST
+        c = PostgresCdcConnector(driver.cdc_settings(), {"password": "reader_pw"})
+        gen = c.stream(driver.dataset, ["id"]).__aiter__()
+        try:
+            await self._initial(gen)
+            await driver._exec("UPDATE assets SET id = 'A1-renamed' WHERE id = 'A1'", ())
+            ops = [await asyncio.wait_for(gen.__anext__(), 5) for _ in range(2)]
+            assert [(x.op, x.key) for x in ops] == [(ChangeOp.DELETE, "A1"), (ChangeOp.UPSERT, "A1-renamed")]
+            assert ops[1].record["zone"] == "z" * 100_000  # unchanged TOAST value carried over
+            await driver._exec("UPDATE assets SET id = NULL WHERE id = 'A2'", ())
+            ch = await asyncio.wait_for(gen.__anext__(), 5)
+            assert (ch.op, ch.key) == (ChangeOp.DELETE, "A2") and c.skipped_records == 1
+        finally:
+            await gen.aclose()
+            await c.close()
+
+    async def test_dropped_table_is_reported(self, driver: PgCdcDriver) -> None:
+        """LIVEOPS-43: pgoutput is silent about DROP TABLE; the periodic check raises."""
+        c = PostgresCdcConnector(driver.cdc_settings(), {"password": "reader_pw"})
+        gen = c.stream(driver.dataset, ["id"]).__aiter__()
+        try:
+            await self._initial(gen)
+            await driver._exec("DROP TABLE assets", ())
+            t0 = time.monotonic()
+            with pytest.raises(ConnectorError) as e:
+                await asyncio.wait_for(gen.__anext__(), 10)
+            assert "no longer exists" in str(e.value) and e.value.hint
+            assert time.monotonic() - t0 < 7
+        finally:
+            await gen.aclose()
+            await c.close()
+        await driver._exec("CREATE TABLE assets (id text)", ())  # teardown revokes on it
+
+    async def test_renamed_table_is_reported(self, driver: PgCdcDriver) -> None:
+        """LIVEOPS-43: a change on the renamed table arrives with a new Relation message."""
+        c = PostgresCdcConnector(driver.cdc_settings(), {"password": "reader_pw"})
+        gen = c.stream(driver.dataset, ["id"]).__aiter__()
+        try:
+            await self._initial(gen)
+            await driver._exec("ALTER TABLE assets RENAME TO assets_old", ())
+            await driver._exec("UPDATE assets_old SET status = 'renamed' WHERE id = 'A1'", ())
+            t0 = time.monotonic()
+            with pytest.raises(ConnectorError) as e:
+                await asyncio.wait_for(gen.__anext__(), 10)
+            assert "renamed to public.assets_old" in str(e.value) and "mapping" in e.value.hint
+            assert time.monotonic() - t0 < 2
+        finally:
+            await gen.aclose()
+            await c.close()
+        await driver._exec("ALTER TABLE assets_old RENAME TO assets", ())
+
+    async def test_renamed_table_without_changes_is_reported(self, driver: PgCdcDriver) -> None:
+        c = PostgresCdcConnector(driver.cdc_settings(), {"password": "reader_pw"})
+        gen = c.stream(driver.dataset, ["id"]).__aiter__()
+        try:
+            await self._initial(gen)
+            await driver._exec("ALTER TABLE assets RENAME TO assets_old", ())
+            with pytest.raises(ConnectorError) as e:
+                await asyncio.wait_for(gen.__anext__(), 10)
+            assert "renamed" in str(e.value)
+        finally:
+            await gen.aclose()
+            await c.close()
+        await driver._exec("ALTER TABLE assets_old RENAME TO assets", ())
+
+    async def test_verify_checks_the_server_certificate(self, driver: PgCdcDriver) -> None:
+        """LIVEOPS-29: the local server's self-signed certificate must not pass 'verify'."""
+        c = PostgresCdcConnector({**driver.cdc_settings(), "encryption": "verify"}, {"password": "reader_pw"})
+        try:
+            report = await c.test()
+        finally:
+            await c.close()
+        assert not report.ok and report.steps[0].name == "Reach the server" and not report.steps[0].ok
+        assert "certificate" in report.steps[0].detail.lower() or "ssl" in report.steps[0].detail.lower()
+        assert "reader_pw" not in report.model_dump_json()
+        c = PostgresCdcConnector({**driver.cdc_settings(), "encryption": "required"}, {"password": "reader_pw"})
+        try:
+            report = await c.test()
+        finally:
+            await c.close()
+        enc = next(s for s in report.steps if s.name == "Encryption")
+        assert enc.ok and "NOT verified" in enc.detail
