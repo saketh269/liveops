@@ -380,3 +380,125 @@ async def test_big_batch_does_not_resync_a_healthy_client(store_factory: StoreFa
     assert store._fanout.resyncs == before
     assert not any(m.type == "snapshot" for m in got)
     assert sum(m.type == "upsert" for m in got) == 1500 and sum(m.type == "event" for m in got) == 1500
+
+
+# LIVEOPS-92: a shared field falls back to the other source's value.
+
+
+async def test_shared_field_falls_back_when_newer_source_leaves(store: StateStore) -> None:
+    await store.apply(ev({"label": "Bed 01", "state": "free"}, src="ehr", mapping="m1", ts=1))
+    await store.apply(ev({"label": "Isolation"}, src="wh", mapping="m2", ts=2))
+    [asset] = await store.site_assets("s")
+    assert asset.flat()["label"] == "Isolation" and asset.flat()["_sources"]["label"] == "wh"
+    msg = await store.apply(ev(src="wh", mapping="m2", op=AssetOp.REMOVE, ts=3))
+    assert msg is not None and msg.type == "upsert"
+    assert msg.assets[0]["label"] == "Bed 01" and msg.assets[0]["_sources"]["label"] == "ehr"
+    last = (await store.events("s"))[-1]
+    assert last["changes"] == {"label": ["Isolation", "Bed 01"]} and not last["removed"]
+    assert describe(last) == "B1 label Isolation → Bed 01"
+
+
+async def test_shared_field_falls_back_on_clear_mapping_and_for_attribute_keys(store: StateStore) -> None:
+    await store.apply(ev({"label": "Bed 01", "attributes": {"note": "a"}}, src="ehr", mapping="m1", ts=1))
+    await store.apply(ev({"label": "Isolation", "attributes": {"note": "b"}}, src="wh", mapping="m2", ts=2))
+    await store.clear_mapping("s", "m2")
+    [asset] = await store.site_assets("s")
+    flat = asset.flat()
+    assert flat["label"] == "Bed 01" and flat["attributes"] == {"note": "a"}
+    assert flat["_sources"] == {"label": "ehr", "attributes.note": "ehr", "attributes": "ehr"}
+
+
+async def test_older_contribution_waits_hidden_and_shows_when_winner_leaves(store: StateStore) -> None:
+    await store.apply(ev({"label": "new"}, src="a", mapping="m1", ts=2))
+    assert await store.apply(ev({"label": "old"}, src="b", mapping="m2", ts=1)) is None  # older: not visible
+    [asset] = await store.site_assets("s")
+    assert asset.flat()["label"] == "new"
+    # The hidden contribution leaving changes nothing visible.
+    assert await store.apply(ev(src="b", mapping="m2", op=AssetOp.REMOVE, ts=3)) is None
+    await store.apply(ev({"label": "old"}, src="b", mapping="m2", ts=1))
+    msg = await store.apply(ev(src="a", mapping="m1", op=AssetOp.REMOVE, ts=4))
+    assert msg is not None and msg.assets[0]["label"] == "old" and msg.assets[0]["_sources"] == {"label": "b"}
+    # Same mapping, older ts: ignored (its own newer value stands).
+    assert await store.apply(ev({"label": "older"}, src="b", mapping="m2", ts=0.5)) is None
+    msg = await store.apply(ev(src="b", mapping="m2", op=AssetOp.REMOVE, ts=5))
+    assert msg is not None and msg.type == "remove"
+    assert await store.site_assets("s") == []
+
+
+@requires_redis
+async def test_random_merge_sequences_match_between_stores(store_factory: StoreFactory) -> None:
+    """Parity: the Redis store gives exactly the reference store's results."""
+    if store_factory.kind != "redis":  # type: ignore[attr-defined]
+        pytest.skip("compares the Redis store against the in-memory reference")
+    from app.core.state import InMemoryStateStore
+
+    rnd = random.Random(92)
+    redis_store, ref = store_factory(), InMemoryStateStore()
+    for step in range(600):
+        mapping = rnd.choice(["m1", "m2", "m3"])
+        asset = rnd.choice(["A", "B", "C"])
+        ts = float(rnd.randint(1, 40))  # small range: plenty of equal timestamps
+        if rnd.random() < 0.25:
+            e = ev(asset=asset, src=f"src-{mapping}", mapping=mapping, op=AssetOp.REMOVE, ts=ts)
+        else:
+            names = rnd.sample(["state", "label", "zone"], rnd.randint(1, 3))
+            fields: dict[str, Any] = {n: rnd.choice(["x", "y", "z"]) for n in names}
+            if rnd.random() < 0.3:
+                fields["attributes"] = {rnd.choice(["k1", "k2"]): rnd.randint(0, 2)}
+            e = ev(fields, asset=asset, src=f"src-{mapping}", mapping=mapping, ts=ts)
+        got, want = await redis_store.apply(e), await ref.apply(e)
+        assert (got and (got.type, got.assets)) == (want and (want.type, want.assets)), f"step {step}: {e}"
+    assert {a.asset_id: a.flat() for a in await redis_store.site_assets("s")} == {
+        a.asset_id: a.flat() for a in await ref.site_assets("s")
+    }
+
+    def changes(entries: list) -> list:
+        return [(e["asset_id"], e["changes"], e["removed"]) for e in entries]
+
+    assert changes(await redis_store.events("s", limit=1000)) == changes(await ref.events("s", limit=1000))
+
+
+# LIVEOPS-55: a burst of removes (pause/delete/reconcile) must not resync viewers.
+
+
+async def test_remove_burst_does_not_resync_a_healthy_client(store_factory: StoreFactory) -> None:
+    store = store_factory()
+    n = 2000
+    for i in range(n):
+        await store.apply(ev({"state": "free"}, asset=f"B{i:04d}", mapping="m2", ts=1.0))
+    gen = store.subscribe("s")
+    assert len((await next_msg(gen)).assets) == n
+    got: list[StreamMessage] = []
+    all_in = asyncio.Event()
+
+    async def reader() -> None:
+        async for m in gen:
+            got.append(m)
+            if sum(x.type == "remove" for x in got) >= n:
+                all_in.set()
+
+    task = asyncio.create_task(reader())
+    before = store._fanout.resyncs
+    await store.clear_mapping("s", "m2")
+    with contextlib.suppress(TimeoutError):
+        await asyncio.wait_for(all_in.wait(), 15)
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+    assert store._fanout.resyncs == before
+    assert sum(m.type == "remove" for m in got) == n and not any(m.type == "snapshot" for m in got)
+
+
+# LIVEOPS-53: more concurrent Redis calls than the pool has connections wait instead of failing.
+
+
+@requires_redis
+@pytest.mark.parametrize("pool", [200, 10])
+async def test_many_parallel_snapshots_succeed(store_factory: StoreFactory, pool: int) -> None:
+    if store_factory.kind != "redis":  # type: ignore[attr-defined]
+        pytest.skip("Redis connection pool")
+    store = store_factory(max_connections=pool)
+    await store.apply(ev({"state": "free"}))
+    results = await asyncio.gather(*(store.site_assets("s") for _ in range(400)), return_exceptions=True)
+    errors = [r for r in results if isinstance(r, BaseException)]
+    assert not errors, f"{len(errors)} of 400 failed, e.g. {errors[0]!r}"

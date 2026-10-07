@@ -88,7 +88,6 @@ def wait_health(be: Backend, mapping_id: str, pred: Any, timeout: float = 60) ->
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason="LIVEOPS-44: attributes from two sources overwrite each other")
 @pytest.mark.parametrize("store", ["memory", "redis"])
 def test_multi_source_merge(store: str, pg: PgSource) -> None:
     be = Backend(redis=store == "redis")

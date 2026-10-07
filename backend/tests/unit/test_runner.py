@@ -282,3 +282,104 @@ async def test_cluster_takes_over_when_owner_dies(cluster: Cluster) -> None:
     await wait_until(live, "changes flow again")
     assert OPEN["f1"] == 1
     owner._bg = []  # already cancelled; let close() skip it
+
+
+# LIVEOPS-54 ------------------------------------------------------------------
+
+
+class DoubleMarker(FakeTable):
+    """Breaks ADR 0004: initial state, marker, a change, then a second marker."""
+
+    async def stream(
+        self, dataset: str, key_fields: list[str], options: dict[str, Any] | None = None
+    ) -> AsyncIterator[Change]:
+        from app.connectors.base import ChangeOp, snapshot_end
+
+        for i in range(3):
+            yield Change(op=ChangeOp.UPSERT, dataset=dataset, key=f"A{i}", record={"id": f"A{i}", "state": "free"})
+        yield snapshot_end(dataset)
+        yield Change(op=ChangeOp.UPSERT, dataset=dataset, key="A0", record={"id": "A0", "state": "in_use"})
+        yield snapshot_end(dataset)
+        DONE[0].set()
+        await asyncio.Event().wait()
+
+
+DONE: list[asyncio.Event] = []
+
+
+async def test_second_snapshot_end_is_ignored(store_factory: StoreFactory, monkeypatch: pytest.MonkeyPatch) -> None:
+    DONE[:] = [asyncio.Event()]
+    monkeypatch.setattr(
+        "app.core.runner.build",
+        lambda _type, settings, secrets, source_id=None: DoubleMarker(settings, secrets, source_id=source_id),
+    )
+    store = store_factory()
+    rm = RunnerManager(store)
+    await rm.start(spec("unused"))
+    await asyncio.wait_for(DONE[0].wait(), 5)
+    await asyncio.sleep(0.1)
+    assert await states(store) == {"A0": "in_use", "A1": "free", "A2": "free"}
+    assert rm.health["m1"].status == "running"
+    await rm.stop_all()
+
+
+# LIVEOPS-52 ------------------------------------------------------------------
+
+
+@requires_redis
+async def test_owner_stops_before_its_lease_lapses_when_renewal_errors(cluster: Cluster) -> None:
+    from redis.exceptions import ConnectionError as RedisConnectionError
+
+    TABLES["r1"] = [{"id": "B01", "state": "free"}]
+    cluster.db["m1"] = spec("r1")
+    for rm in cluster.rms:
+        await rm.adopt(spec("r1"))
+    await wait_until(lambda: len(cluster.owners()) == 1 and OPEN["r1"] == 1, "an owner")
+    owner_i = cluster.owners()[0]
+    owner, other = cluster.rms[owner_i], cluster.rms[1 - owner_i]
+
+    async def broken_renew(*_a: Any, **_k: Any) -> int:
+        raise RedisConnectionError("Timeout reading from socket")
+
+    owner._renew = broken_renew  # type: ignore[method-assign]
+    started = time.monotonic()
+    max_open, stopped_at, taken_at = 0, None, None
+    while time.monotonic() - started < 5:
+        max_open = max(max_open, OPEN["r1"], len(cluster.owners()))
+        if stopped_at is None and not owner.owns("m1"):
+            stopped_at = time.monotonic() - started
+        if taken_at is None and other.owns("m1"):
+            taken_at = time.monotonic() - started
+        await asyncio.sleep(0.01)
+    print(f"renew errors: owner stopped after {stopped_at}s, other took over after {taken_at}s (ttl 1.5 s)")
+    assert max_open == 1, "two runners at the same time"
+    assert stopped_at is not None and taken_at is not None and stopped_at < taken_at
+    assert stopped_at < 1.5
+
+
+# LIVEOPS-79 ------------------------------------------------------------------
+
+
+@requires_redis
+async def test_process_with_no_mappings_at_boot_still_takes_over(cluster: Cluster) -> None:
+    a, b = cluster.rms
+    TABLES["j1"] = [{"id": "B01", "state": "free"}]
+    await b.join()  # B boots first: nothing active yet
+    await a.join()
+    cluster.db["m1"] = spec("j1")
+    await a.start(spec("j1"))  # created through A
+    await wait_until(lambda: a.owns("m1"), "A runs it")
+    await wait_until(
+        lambda: b.is_running("m1") and b.health["m1"].status == "running", "B sees it running (shared health)"
+    )
+    for t in [*a._bg, *a._tasks.values()]:  # kill -9 A
+        t.cancel()
+    a._bg = []
+    took = await wait_until(lambda: b.owns("m1"), "B takes over", within=6)
+    print(f"late joiner took over {took:.2f}s after the owner died (ttl 1.5 s)")
+    TABLES["j1"][0]["state"] = "after-kill"
+
+    async def live() -> bool:
+        return await states(cluster.stores[1]) == {"B01": "after-kill"}
+
+    await wait_until(live, "changes flow through B")
