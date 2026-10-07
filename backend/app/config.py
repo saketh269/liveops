@@ -12,6 +12,7 @@ class Settings(BaseSettings):
     # Fernet key (urlsafe base64, 32 bytes) used to encrypt source secrets at rest.
     secret_key: str = ""
     redis_url: str | None = None  # None = in-memory state store (single process)
+    redis_key_prefix: str = "liveops"  # all Redis keys start with this (no { or })
     cors_origins: list[str] = ["http://localhost:5173"]
     start_runners: bool = True  # tests switch this off
     log_level: str = "INFO"

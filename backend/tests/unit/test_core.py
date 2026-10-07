@@ -11,7 +11,7 @@ import pytest
 from app.connectors.base import Change, ChangeOp, diff_snapshots, normalize_record, record_key
 from app.core.events import AssetEvent, AssetOp
 from app.core.mapping import MappingConfig, MappingProblem, apply_mapping, validate_against_columns
-from app.core.state import InMemoryStateStore
+from app.core.state import StateStore
 
 
 def test_normalize_record_is_json_safe() -> None:
@@ -92,8 +92,10 @@ def _ev(src: str, mapping: str, fields: dict, op: AssetOp = AssetOp.UPSERT, ts: 
     )
 
 
-async def test_state_merges_two_sources_and_removes_per_source() -> None:
-    store = InMemoryStateStore()
+# The state-store tests below run against both stores (see tests/unit/conftest.py).
+
+
+async def test_state_merges_two_sources_and_removes_per_source(store: StateStore) -> None:
     await store.apply(_ev("ehr", "m1", {"state": "in_use", "zone": "ICU"}, ts=1))
     await store.apply(_ev("housekeeping", "m2", {"cleaning": "due"}, ts=2))
     [asset] = await store.site_assets("s")
@@ -111,14 +113,12 @@ async def test_state_merges_two_sources_and_removes_per_source() -> None:
     assert await store.site_assets("s") == []
 
 
-async def test_state_unchanged_value_not_broadcast() -> None:
-    store = InMemoryStateStore()
+async def test_state_unchanged_value_not_broadcast(store: StateStore) -> None:
     assert await store.apply(_ev("a", "m", {"state": "x"}, ts=1)) is not None
     assert await store.apply(_ev("a", "m", {"state": "x"}, ts=2)) is None
 
 
-async def test_subscribe_snapshot_then_live() -> None:
-    store = InMemoryStateStore()
+async def test_subscribe_snapshot_then_live(store: StateStore) -> None:
     await store.apply(_ev("a", "m", {"state": "x"}, ts=1))
     gen = store.subscribe("s")
     first = await anext(gen)

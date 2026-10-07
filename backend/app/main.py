@@ -20,7 +20,12 @@ log = logging.getLogger("liveops")
 
 
 def make_store() -> StateStore:
-    # agent-core: return the Redis store when settings.redis_url is set.
+    """Redis when ``LIVEOPS_REDIS_URL`` is set (several processes share state), else in-memory."""
+    settings = get_settings()
+    if settings.redis_url:
+        from app.core.redis_state import RedisStateStore
+
+        return RedisStateStore.from_url(settings.redis_url, prefix=settings.redis_key_prefix)
     return InMemoryStateStore()
 
 
@@ -39,6 +44,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     log.info("Live Ops %s started", __version__)
     yield
     await app.state.runner.stop_all()
+    await app.state.store.close()
 
 
 def create_app() -> FastAPI:
