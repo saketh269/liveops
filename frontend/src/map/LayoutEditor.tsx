@@ -354,7 +354,11 @@ export default function LayoutEditor({ site, onSaved, onClose, initialFloorId }:
                 onKeyDown={(e) => onEntranceKey(e, en)}
                 onFocus={() => setSelection({ type: "entrance", id: en.id })}
               />
-              <text className="lm-entrance-text" x={en.point[0]} y={en.point[1] - hs * 1.3}>{en.name}</text>
+              <text className="lm-entrance-text" x={en.point[0]} y={en.point[1] - hs * 1.3}
+                // keep the label on the floor when the entrance is near a side edge
+                textAnchor={en.point[0] < width * 0.15 ? "start" : en.point[0] > width * 0.85 ? "end" : "middle"}>
+                {en.name}
+              </text>
             </g>
           ))}
           {preview && <rect className="lm-draft" x={preview.x} y={preview.y} width={preview.w} height={preview.h} />}

@@ -130,7 +130,7 @@
 /* Floors (LIVEOPS-97) */
 .lm-floors { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
 .lm-floor-btn { display: inline-flex; gap: 8px; align-items: center; padding: 5px 12px; }
-.lm-floor-btn--active { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
+.btn.lm-floor-btn--active { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
 .lm-floor-count { font-size: 0.72rem; padding: 0 6px; border-radius: 999px; background: var(--panel-2); color: var(--muted); }
 .lm-floor-btn--active .lm-floor-count { background: color-mix(in srgb, var(--accent-fg) 18%, transparent); color: inherit; }
 .lm-sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
@@ -165,5 +165,5 @@
 .lm-entrance--walk circle { fill: var(--ok); }
 .lm-entrance--ambulance circle { fill: var(--bad); }
 .lm-entrance circle:focus-visible, .lm-entrance--sel circle { outline: none; stroke: var(--fg); stroke-width: 0.5; }
-.lm-entrance-text { font: 600 1.6px var(--f-body); fill: var(--fg); text-anchor: middle; pointer-events: none;
+.lm-entrance-text { font: 600 1.6px var(--f-body); fill: var(--fg); pointer-events: none;
   paint-order: stroke; stroke: var(--panel); stroke-width: 0.35; }
