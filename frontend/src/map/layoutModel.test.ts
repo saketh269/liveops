@@ -1,7 +1,7 @@
 import type { SiteLayout } from "../api/types";
 import { translatePolygon } from "./geometry";
 import {
-  addFloor, deleteFloor, edgeMidpoint, edgeNames, fromEditModel, moveDoors, moveFloor, patchFloor, reshapeZone, toEditModel,
+  addEntrance, addFloor, deleteFloor, doorClick, edgeMidpoint, edgeNames, fromEditModel, moveDoors, moveFloor, patchFloor, reshapeZone, toEditModel,
   toggleDoor, validateModel,
 } from "./layoutModel";
 
@@ -94,4 +94,28 @@ test("validation names the floor and explains the fix", () => {
   // single floor: no floor prefix
   const one = toEditModel({ ...old, zones: [{ id: "a", name: "", polygon: sq(0, 0) }] });
   expect(validateModel(one)[0]).toMatch(/^Zone a has no name/);
+});
+
+test("entrances are added at the default spots and do not stack", () => {
+  const m0 = toEditModel(old);
+  const a = addEntrance(m0, "main", "walk");
+  expect(a.model.entrances[0]).toEqual({ id: "entrance-1", name: "Walk-in entrance", floor_id: "main", point: [40, 40], kind: "walk" });
+  const b = addEntrance(a.model, "main", "walk");
+  expect(b.model.entrances[1]).toMatchObject({ name: "Walk-in entrance 2", point: [42, 40] });
+  const c = addEntrance(b.model, "main", "ambulance");
+  expect(c.model.entrances[2]).toMatchObject({ kind: "ambulance", point: [0, 40], name: "Ambulance bay" });
+  // entrances make the saved layout explicit, with no data lost
+  expect(fromEditModel(old, c.model).entrances).toHaveLength(3);
+});
+
+test("a door click adds on the nearest zone edge and removes a door it hits", () => {
+  const zones = [
+    { id: "a", name: "A", polygon: sq(0, 0) },
+    { id: "b", name: "B", polygon: sq(12, 0) },
+  ];
+  const add = doorClick(zones, [11.2, 5], 1.5);
+  expect(add).toEqual({ zoneId: "b", doors: [[12, 5]], change: "added" });
+  expect(doorClick(zones, [30, 30], 1.5)).toBeNull();
+  const withDoor = [zones[0], { ...zones[1], doors: add!.doors }];
+  expect(doorClick(withDoor, [12.4, 5.3], 1.5)).toEqual({ zoneId: "b", doors: [], change: "removed" });
 });

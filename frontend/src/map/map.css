@@ -127,7 +127,43 @@
   .lm-inline-field input { max-width: 150px; }
 }
 
+/* Floors (LIVEOPS-97) */
+.lm-floors { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.lm-floor-btn { display: inline-flex; gap: 8px; align-items: center; padding: 5px 12px; }
+.lm-floor-btn--active { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
+.lm-floor-count { font-size: 0.72rem; padding: 0 6px; border-radius: 999px; background: var(--panel-2); color: var(--muted); }
+.lm-floor-btn--active .lm-floor-count { background: color-mix(in srgb, var(--accent-fg) 18%, transparent); color: inherit; }
+.lm-sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+.lm-plan { pointer-events: none; mix-blend-mode: var(--plan-blend, multiply);
+  filter: invert(var(--plan-invert, 0)) hue-rotate(calc(var(--plan-invert, 0) * 180deg)); }
+
 /* Setup notices above the map */
 .lm-hints { display: grid; gap: 8px; }
 .lm-hints .notice { display: block; line-height: 1.6; }
 .lm-link-btn { padding: 3px 10px; font-size: 0.8rem; }
+
+/* Layout editor: floors, plan, doors, entrances (LIVEOPS-97) */
+.lm-wrap { flex-wrap: wrap; }
+.lm-editor-title { font-size: 1rem; margin: 0; }
+.lm-tight { margin: 0 0 8px; }
+.lm-floor-list { list-style: none; margin: 0 0 10px; padding: 0; display: grid; gap: 4px; }
+.lm-floor-item { display: flex; justify-content: space-between; align-items: center; gap: 8px; min-width: 0; }
+.lm-floor-tools { display: inline-flex; gap: 4px; flex: none; }
+.lm-icon-btn { padding: 2px 8px; min-width: 30px; line-height: 1.3; }
+.lm-icon-btn:disabled { opacity: 0.4; cursor: default; }
+.lm-fieldset { border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; margin: 0; min-width: 0; }
+.lm-fieldset legend { font-size: 0.85rem; font-weight: 600; padding: 0 4px; }
+.lm-door-add { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.lm-door-add select, .lm-zone-form select { font: inherit; color: var(--fg); background: var(--panel-2);
+  border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; min-width: 0; }
+.lm-editor-svg--plan .lm-zone { fill-opacity: 0.4; }
+.lm-editor-svg--doors { cursor: copy; }
+.lm-editor-svg--doors .lm-zone--edit { cursor: copy; }
+.lm-zone--corridor { fill: var(--panel); stroke: var(--muted); stroke-dasharray: 1 0.6; }
+.lm-door { fill: var(--panel); stroke: var(--accent); stroke-width: 0.35; pointer-events: none; }
+.lm-entrance circle { stroke: var(--panel); stroke-width: 0.3; cursor: move; }
+.lm-entrance--walk circle { fill: var(--ok); }
+.lm-entrance--ambulance circle { fill: var(--bad); }
+.lm-entrance circle:focus-visible, .lm-entrance--sel circle { outline: none; stroke: var(--fg); stroke-width: 0.5; }
+.lm-entrance-text { font: 600 1.6px var(--f-body); fill: var(--fg); text-anchor: middle; pointer-events: none;
+  paint-order: stroke; stroke: var(--panel); stroke-width: 0.35; }

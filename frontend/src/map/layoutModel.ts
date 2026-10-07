@@ -183,3 +183,47 @@ export function validateModel(m: EditModel): string[] {
   for (const [name, n] of names) if (n > 1) out.push(`${n} floors are named "${name}". Floor names must be different so assets can name their floor.`);
   return out;
 }
+
+export const ENTRANCE_LABELS: Record<Entrance["kind"], string> = { walk: "Walk-in entrance", ambulance: "Ambulance bay" };
+
+/**
+ * Add an entrance on a floor. It starts where the default would be (walk-in:
+ * middle of the bottom edge; ambulance: bottom-left corner), nudged if taken.
+ */
+export function addEntrance(m: EditModel, floorId: string, kind: Entrance["kind"]): { model: EditModel; id: string } {
+  const f = m.floors.find((x) => x.id === floorId) ?? m.floors[0];
+  const id = uniqueEntranceId(m.entrances);
+  const taken = (p: Pt) => m.entrances.some((e) => e.floor_id === f.id && e.point[0] === p[0] && e.point[1] === p[1]);
+  const p: Pt = kind === "walk" ? [r1(f.width / 2), f.depth] : [0, f.depth];
+  while (taken(p) && p[0] + 2 <= f.width) p[0] = r1(p[0] + 2);
+  const same = m.entrances.filter((e) => e.kind === kind).length;
+  const name = same ? `${ENTRANCE_LABELS[kind]} ${same + 1}` : ENTRANCE_LABELS[kind];
+  return { model: { ...m, entrances: [...m.entrances, { id, name, floor_id: f.id, point: p, kind }] }, id };
+}
+
+/**
+ * Click at `p` while placing doors on a floor: removes the door nearest the
+ * click if one is within `tol`, else adds a door on the zone edge nearest the
+ * click (within `tol`). Returns null when the click is near no zone edge.
+ */
+export function doorClick(zones: readonly Zone[], p: Pt, tol: number): { zoneId: string; doors: Pt[]; change: "added" | "removed" } | null {
+  let removeAt: { z: Zone; d: number } | null = null;
+  for (const z of zones) {
+    for (const [x, y] of z.doors ?? []) {
+      const d = Math.hypot(x - p[0], y - p[1]);
+      if (d <= tol && (!removeAt || d < removeAt.d)) removeAt = { z, d };
+    }
+  }
+  if (removeAt) {
+    const r = toggleDoor(removeAt.z, p, tol);
+    return { zoneId: removeAt.z.id, doors: r.doors, change: "removed" };
+  }
+  let best: { z: Zone; d: number } | null = null;
+  for (const z of zones) {
+    const near = nearestEdgePoint(z.polygon, p);
+    if (near && near.dist <= tol && (!best || near.dist < best.d)) best = { z, d: near.dist };
+  }
+  if (!best) return null;
+  const r = toggleDoor(best.z, p, tol);
+  return { zoneId: best.z.id, doors: r.doors, change: "added" };
+}

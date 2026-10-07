@@ -141,5 +141,8 @@ export type StreamMessage = {
 // GET /api/health
 export type AppHealth = { ok: boolean; version: string; portal_db?: "ok" | "unreachable" };
 
+// POST /api/sites/{id}/plans (floor plan image; ADR 0006)
+export type PlanUpload = { asset_id: string; width_px: number; height_px: number; content_type: string };
+
 // POST /api/sources/{id}/upload
 export type UploadResult = { dataset: string; bytes: number; rows: number; columns: string[] };
