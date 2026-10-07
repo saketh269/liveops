@@ -1,5 +1,5 @@
 import type {
-  ConnectorSpec, Dataset, Mapping, MappingConfig, MappingHealth, Site, SiteLayout, Source,
+  AppHealth, ConnectorSpec, Dataset, Mapping, MappingConfig, MappingHealth, Site, SiteLayout, Source,
   SourceRecord, StreamMessage, TestReport,
 } from "./types";
 
@@ -25,6 +25,12 @@ async function req<T>(method: string, path: string, body?: unknown): Promise<T> 
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
     const d = data?.detail ?? {};
+    if (Array.isArray(d)) {
+      // FastAPI request validation: [{loc: [...], msg: "..."}]
+      const problems = d.map((p: { loc?: unknown[]; msg?: string }) =>
+        `${(p.loc ?? []).filter((l) => l !== "body").join(".")}: ${p.msg ?? "invalid value"}`);
+      throw new ApiError(res.status, "Some values aren't valid", undefined, problems);
+    }
     const msg = typeof d === "string" ? d : d.message ?? `Request failed (${res.status})`;
     throw new ApiError(res.status, msg, d.hint, d.problems ?? d.fields);
   }
@@ -60,7 +66,7 @@ export const api = {
     req<Mapping>("PUT", `/api/mappings/${id}`, b),
   deleteMapping: (id: string) => req<void>("DELETE", `/api/mappings/${id}`),
 
-  health: () => req<{ ok: boolean; version: string }>("GET", "/api/health"),
+  health: () => req<AppHealth>("GET", "/api/health"),
   mappingHealth: () => req<MappingHealth[]>("GET", "/api/health/mappings"),
 };
 
