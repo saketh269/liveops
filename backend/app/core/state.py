@@ -25,25 +25,30 @@ from collections.abc import AsyncGenerator
 from typing import Any
 
 from app.core.eventlog import EventEntry, InMemoryEventLog, feed_item
-from app.core.events import Asset, AssetEvent, AssetOp, FieldValue, StreamMessage
+from app.core.events import Asset, AssetEvent, AssetOp, FieldValue, StreamMessage, expand_attributes
 
 RESYNC = "resync"  # internal marker: subscriber fell behind, send a fresh snapshot
 
 
 class Fanout:
-    """Delivers messages to this process's subscribers, one bounded queue each.
+    """Delivers messages to this process's subscribers, one queue each.
 
-    Slow-client protection: when a subscriber's queue is full, its backlog is
-    dropped and it gets a fresh snapshot instead, so a slow browser never
-    blocks others and never ends up with a stale map.
+    Each queue may hold ``queue_size + 2 × (assets on the site)`` messages: a
+    full poll diff (one upsert + one feed event per asset) always fits, so a
+    client that keeps up is never resynced by a big batch (LIVEOPS-48).
+    Slow-client protection: a client that falls further behind has its backlog
+    dropped and gets a fresh snapshot instead, so it never blocks others and
+    never ends up with a stale map.
     """
 
     def __init__(self, queue_size: int) -> None:
         self._queue_size = queue_size
         self._subs: dict[str, set[asyncio.Queue[StreamMessage]]] = defaultdict(set)
+        self._known: dict[str, set[str]] = defaultdict(set)  # asset ids per site with subscribers
+        self.resyncs = 0  # slow-client resyncs so far (for tests and diagnostics)
 
     def add(self, site_id: str) -> asyncio.Queue[StreamMessage]:
-        q: asyncio.Queue[StreamMessage] = asyncio.Queue(self._queue_size)
+        q: asyncio.Queue[StreamMessage] = asyncio.Queue()  # bounded by limit() in publish()
         self._subs[site_id].add(q)
         return q
 
@@ -53,6 +58,7 @@ class Fanout:
             subs.discard(q)
             if not subs:
                 del self._subs[site_id]
+                self._known.pop(site_id, None)
 
     def sites(self) -> set[str]:
         return set(self._subs)
@@ -60,19 +66,37 @@ class Fanout:
     def count(self, site_id: str) -> int:
         return len(self._subs.get(site_id, ()))
 
+    def seed(self, site_id: str, asset_ids: list[str]) -> None:
+        """Tell the fan-out how big the site is (from a snapshot)."""
+        if site_id in self._subs:
+            self._known[site_id].update(asset_ids)
+
+    def limit(self, site_id: str) -> int:
+        return self._queue_size + 2 * len(self._known.get(site_id, ()))
+
     def publish(self, msg: StreamMessage) -> None:
-        for q in list(self._subs.get(msg.site_id, ())):
-            try:
-                q.put_nowait(msg)
-            except asyncio.QueueFull:
+        subs = self._subs.get(msg.site_id)
+        if not subs:
+            return
+        known = self._known[msg.site_id]
+        for a in msg.assets:
+            if msg.type == "upsert":
+                known.add(a["asset_id"])
+            elif msg.type == "remove":
+                known.discard(a["asset_id"])
+        limit = self.limit(msg.site_id)
+        for q in list(subs):
+            if q.qsize() >= limit:
                 self._resync_queue(q, msg.site_id)
+            else:
+                q.put_nowait(msg)
 
     def resync(self, site_id: str) -> None:
         for q in list(self._subs.get(site_id, ())):
             self._resync_queue(q, site_id)
 
-    @staticmethod
-    def _resync_queue(q: asyncio.Queue[StreamMessage], site_id: str) -> None:
+    def _resync_queue(self, q: asyncio.Queue[StreamMessage], site_id: str) -> None:
+        self.resyncs += 1
         while not q.empty():
             q.get_nowait()
         q.put_nowait(StreamMessage(type=RESYNC, site_id=site_id))
@@ -208,7 +232,7 @@ class InMemoryStateStore(StateStore):
                 asset = Asset(site_id=event.site_id, asset_id=event.asset_id)
                 site[event.asset_id] = asset
             changed = False
-            for k, v in event.fields.items():
+            for k, v in expand_attributes(event.fields).items():
                 cur = asset.fields.get(k)
                 if cur is not None and cur.updated_ts > event.received_ts:
                     continue  # a newer value already won

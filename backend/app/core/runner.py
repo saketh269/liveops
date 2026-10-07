@@ -79,43 +79,68 @@ class MappingSpec:
     options: dict[str, Any]
 
 
+# Yield to the event loop every this many events, so WebSocket senders drain
+# while a big poll batch or CDC burst is applied (LIVEOPS-48).
+YIELD_EVERY = 50
+
+
 class RunnerManager:
+    """Runs mappings in this process. ``ClusterRunnerManager`` (core/cluster.py)
+    adds Redis-based ownership when several backend processes share a store."""
+
     def __init__(self, state: StateStore) -> None:
         self.state = state
         self._tasks: dict[str, asyncio.Task[None]] = {}
-        self.health: dict[str, MappingHealth] = {}
+        self._health: dict[str, MappingHealth] = {}
+
+    @property
+    def health(self) -> dict[str, MappingHealth]:
+        return self._health
 
     def is_running(self, mapping_id: str) -> bool:
         t = self._tasks.get(mapping_id)
         return t is not None and not t.done()
 
     async def start(self, spec: MappingSpec) -> None:
-        await self.stop(spec.mapping_id, clear=False)
-        self.health[spec.mapping_id] = MappingHealth(spec.mapping_id, spec.source_id)
+        """Start (or restart with a new spec) a mapping."""
+        await self._start_local(spec)
+
+    async def adopt(self, spec: MappingSpec) -> None:
+        """At startup: run an active mapping. Same as ``start`` in one process;
+        in a cluster it joins without restarting the current owner."""
+        await self._start_local(spec)
+
+    async def _start_local(self, spec: MappingSpec) -> None:
+        await self._stop_local(spec.mapping_id)
+        self._health[spec.mapping_id] = MappingHealth(spec.mapping_id, spec.source_id)
         self._tasks[spec.mapping_id] = asyncio.create_task(self._run(spec), name=f"mapping:{spec.mapping_id}")
 
     def mark_error(self, mapping_id: str, source_id: str, message: str, hint: str | None = None) -> None:
         """Record a mapping that could not be started at all."""
-        h = self.health.setdefault(mapping_id, MappingHealth(mapping_id, source_id))
+        h = self._health.setdefault(mapping_id, MappingHealth(mapping_id, source_id))
         h.status, h.last_error, h.last_error_hint, h.last_error_ts = "error", message, hint, time.time()
 
     async def stop(self, mapping_id: str, *, clear: bool = True, site_id: str | None = None) -> None:
+        await self._stop_local(mapping_id)
+        if clear and site_id:
+            await self.state.clear_mapping(site_id, mapping_id)
+
+    async def _stop_local(self, mapping_id: str) -> None:
         task = self._tasks.pop(mapping_id, None)
         if task is not None:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
-        if mapping_id in self.health:
-            self.health[mapping_id].status = "paused"
-        if clear and site_id:
-            await self.state.clear_mapping(site_id, mapping_id)
+        if mapping_id in self._health:
+            self._health[mapping_id].status = "paused"
 
     async def stop_all(self) -> None:
+        """Shutdown: stop this process's runners (state is kept)."""
         for mid in list(self._tasks):
-            await self.stop(mid, clear=False)
+            await self._stop_local(mid)
 
     async def _run(self, spec: MappingSpec) -> None:
-        h = self.health[spec.mapping_id]
+        h = self._health[spec.mapping_id]
         backoff = 1.0
         while True:
             connector: Connector | None = None
@@ -150,6 +175,8 @@ class RunnerManager:
                         seen.add(event.asset_id)
                     await self.state.apply(event)
                     h.record_event(change.source_ts, change.received_ts)
+                    if h.events_total % YIELD_EVERY == 0:
+                        await asyncio.sleep(0)
                     if snapshot_done:
                         h.status = "running"
                         backoff = 1.0

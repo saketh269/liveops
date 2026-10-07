@@ -4,6 +4,8 @@ in-memory and the Redis store (see conftest.py)."""
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import json
 import random
 import time
 from typing import Any
@@ -59,7 +61,7 @@ async def test_values_round_trip_exactly(store: StateStore) -> None:
     flat = asset.flat()
     for k, v in fields.items():
         assert flat[k] == v and type(flat[k]) is type(v), k
-    assert set(flat["_sources"]) == set(fields)
+    assert set(flat["_sources"]) == set(fields) | {"attributes.a", "attributes.b"}
 
 
 async def test_remove_is_per_mapping_and_noop_when_nothing_to_drop(store: StateStore) -> None:
@@ -241,3 +243,140 @@ async def test_two_processes_share_state_and_updates(store_factory: StoreFactory
     assert asset.flat()["cleaning"] == "due"
     assert len(await viewer.events("s")) == 2
     await gen.aclose()
+
+
+# LIVEOPS-44: attributes merge per key, with a source per key.
+
+
+async def test_attributes_merge_per_key_across_sources(store: StateStore) -> None:
+    await store.apply(ev({"state": "in_use", "attributes": {"patient_count": 0}}, src="ehr", mapping="m1", ts=1))
+    msg = await store.apply(ev({"cleaning": "due", "attributes": {"cleaner": "C0"}}, src="hk", mapping="m2", ts=2))
+    assert msg is not None and msg.assets[0]["attributes"] == {"patient_count": 0, "cleaner": "C0"}
+    [asset] = await store.site_assets("s")
+    flat = asset.flat()
+    assert flat["attributes"] == {"patient_count": 0, "cleaner": "C0"}
+    assert flat["_sources"]["attributes.patient_count"] == "ehr"
+    assert flat["_sources"]["attributes.cleaner"] == "hk"
+    assert "attributes" not in flat["_sources"]  # two sources: no single owner
+    assert not any(k.startswith("attributes.") for k in flat if k != "_sources")
+
+    # A newer poll of the EHR only changes its own key.
+    await store.apply(ev({"state": "in_use", "attributes": {"patient_count": 2}}, src="ehr", mapping="m1", ts=3))
+    [asset] = await store.site_assets("s")
+    assert asset.flat()["attributes"] == {"patient_count": 2, "cleaner": "C0"}
+    last = (await store.events("s"))[-1]
+    assert last["changes"] == {"attributes.patient_count": [0, 2]}
+    assert describe(last) == "B1 attributes.patient_count 0 → 2"
+
+    # Removing housekeeping drops only its attribute key.
+    msg = await store.apply(ev(src="hk", mapping="m2", op=AssetOp.REMOVE, ts=4))
+    assert msg is not None and msg.assets[0]["attributes"] == {"patient_count": 2}
+    assert msg.assets[0]["_sources"]["attributes"] == "ehr"  # one source again
+    await store.clear_mapping("s", "m1")
+    assert await store.site_assets("s") == []
+
+
+async def test_single_source_attributes_keep_shape(store: StateStore) -> None:
+    msg = await store.apply(ev({"attributes": {"a": 1, "b": None}}, src="ehr"))
+    assert msg is not None and msg.assets[0]["attributes"] == {"a": 1, "b": None}
+    assert msg.assets[0]["_sources"]["attributes"] == "ehr"
+    gen = store.subscribe("s")
+    snap = await next_msg(gen)
+    assert snap.assets[0]["attributes"] == {"a": 1, "b": None}
+    await gen.aclose()
+
+
+# LIVEOPS-40: reconcile after a snapshot.
+
+
+async def test_reconcile_drops_only_unseen_assets_of_that_mapping(store: StateStore) -> None:
+    for a in ("B01", "B02", "B10"):
+        await store.apply(ev({"state": "free"}, asset=a, src="ehr", mapping="m1", ts=1))
+    await store.apply(ev({"cleaning": "due"}, asset="B10", src="hk", mapping="m2", ts=2))
+    await store.apply(ev({"cleaning": "due"}, asset="B20", src="hk", mapping="m2", ts=2))
+    gen = store.subscribe("s")
+    await next_msg(gen)
+    assert await store.reconcile("s", "m1", {"B01", "B02"}) == 1
+    assets = {a.asset_id: a.flat() for a in await store.site_assets("s")}
+    assert set(assets) == {"B01", "B02", "B10", "B20"}
+    assert "state" not in assets["B10"] and assets["B10"]["cleaning"] == "due"  # hk keeps its fields
+    up = await next_msg(gen)
+    assert up.type == "upsert" and up.assets[0]["asset_id"] == "B10"
+    assert (await next_msg(gen)).event["changes"] == {"state": ["free", None]}  # type: ignore[index]
+    assert await store.reconcile("s", "m2", set()) == 2
+    assert {a.asset_id for a in await store.site_assets("s")} == {"B01", "B02"}
+    assert await store.reconcile("s", "m1", {"B01", "B02"}) == 0
+    await gen.aclose()
+
+
+@requires_redis
+async def test_redis_reconcile_matches_generic_reconcile(store_factory: StoreFactory) -> None:
+    if store_factory.kind != "redis":  # type: ignore[attr-defined]
+        pytest.skip("parity of the Redis override with the generic default")
+    import uuid
+
+    from app.core.redis_state import RedisStateStore
+    from tests.unit.conftest import REDIS_URL, delete_prefix
+
+    fast = store_factory()
+    generic_prefix = f"lotest-{uuid.uuid4().hex}"
+    assert REDIS_URL
+    generic = RedisStateStore.from_url(REDIS_URL, prefix=generic_prefix)
+    try:
+        for s in (fast, generic):
+            for i in range(30):
+                await s.apply(ev({"state": "x", "attributes": {"n": i}}, asset=f"A{i}", src="e", mapping="m1", ts=1))
+                if i % 3 == 0:
+                    await s.apply(ev({"cleaning": "due"}, asset=f"A{i}", src="h", mapping="m2", ts=2))
+        keep = {f"A{i}" for i in range(0, 30, 2)}
+        n_fast = await fast.reconcile("s", "m1", keep)
+        n_generic = await StateStore.reconcile(generic, "s", "m1", keep)  # the base-class default
+        assert n_fast == n_generic == 15
+
+        def view(assets: list) -> dict:
+            return {a.asset_id: {k: (v.value, v.source_id, v.mapping_id) for k, v in a.fields.items()} for a in assets}
+
+        assert view(await fast.site_assets("s")) == view(await generic.site_assets("s"))
+
+        def changes(entries: list) -> list:
+            return sorted((e["asset_id"], json.dumps(e["changes"], sort_keys=True), e["removed"]) for e in entries)
+
+        assert changes(await fast.events("s", limit=1000)) == changes(await generic.events("s", limit=1000))
+    finally:
+        await generic.close()
+        await delete_prefix(generic_prefix)
+
+
+# LIVEOPS-48: a big batch must not resync a client that keeps up.
+
+
+async def test_big_batch_does_not_resync_a_healthy_client(store_factory: StoreFactory) -> None:
+    store = store_factory()
+    n = 2000
+    for i in range(n):
+        await store.apply(ev({"state": "free"}, asset=f"B{i:04d}", ts=1.0))
+    gen = store.subscribe("s")
+    snap = await next_msg(gen)
+    assert len(snap.assets) == n
+    got: list[StreamMessage] = []
+    all_in = asyncio.Event()
+
+    async def reader() -> None:
+        async for m in gen:
+            got.append(m)
+            if len(got) >= 3000:
+                all_in.set()
+
+    task = asyncio.create_task(reader())
+    before = store._fanout.resyncs
+    # One poll's worth of changes applied back to back, without yielding in between.
+    for i in range(1500):
+        await store.apply(ev({"state": "in_use"}, asset=f"B{i:04d}", ts=2.0))
+    with contextlib.suppress(TimeoutError):
+        await asyncio.wait_for(all_in.wait(), 10)
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+    assert store._fanout.resyncs == before
+    assert not any(m.type == "snapshot" for m in got)
+    assert sum(m.type == "upsert" for m in got) == 1500 and sum(m.type == "event" for m in got) == 1500
