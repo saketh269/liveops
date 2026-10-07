@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from app.connectors import build
-from app.connectors.base import ChangeOp, Connector, ConnectorError
+from app.connectors.base import Change, ChangeOp, Connector, ConnectorError
 from app.core.mapping import MappingConfig, MappingProblem, apply_mapping
 from app.core.rowfilter import predicate
 from app.core.state import StateStore
@@ -78,6 +78,52 @@ class MappingSpec:
     dataset: str
     config: MappingConfig
     options: dict[str, Any]
+
+
+class _ShownRows:
+    """Which source row a filtered mapping currently shows per asset.
+
+    With a row filter, rows that don't match are not shown. Several rows can
+    share the asset key (``match_key``), such as the open and the closed visits
+    of one bed. A row that stops matching removes the asset's fields only if it
+    is the row being shown: an update to an old closed row never wipes the
+    current row's details. Rows are told apart by the mapping's ``id_field``.
+    """
+
+    def __init__(self, config: MappingConfig) -> None:
+        self.config = config
+        self.track = bool(config.filter) and config.id_field != config.key_field
+        self.shown: dict[str, str] = {}  # asset id -> row id
+
+    def _ids(self, rec: dict[str, Any]) -> tuple[str, str] | None:
+        asset, row = rec.get(self.config.key_field), rec.get(self.config.id_field)
+        if asset is None or asset == "" or row is None:
+            return None
+        return str(asset), str(row)
+
+    def should_apply(self, change: Change, snapshot_done: bool) -> bool:
+        if change.op == ChangeOp.DELETE:
+            self.shown.pop(change.key, None)
+            return True
+        if change.op != ChangeOp.UPSERT:
+            return True
+        ok = self.config.accepts(change.record)
+        ids = self._ids(change.record) if self.track else None
+        if ok:
+            if ids is not None:
+                self.shown[ids[0]] = ids[1]
+            return True
+        if not snapshot_done:
+            # Filtered out of the initial state: simply not shown. Not applying a
+            # remove keeps a matching row with the same key; reconcile drops stale ones.
+            return False
+        if ids is not None:
+            asset, row = ids
+            if asset in self.shown and self.shown[asset] != row:
+                return False  # an old row changed; the asset shows another (current) row
+            self.shown.pop(asset, None)
+        # A row that stops matching becomes a remove (apply_mapping), like a delete.
+        return True
 
 
 # Yield to the event loop every this many events, so WebSocket senders drain
@@ -154,6 +200,7 @@ class RunnerManager:
                 connector.row_filter = predicate(spec.config.filter)
                 h.status = "starting"
                 seen: set[str] = set()
+                rows = _ShownRows(spec.config)
                 snapshot_done = False
                 async for change in connector.stream(spec.dataset, [spec.config.key_field], spec.options):
                     h.connector_skipped = connector.skipped_records
@@ -174,10 +221,7 @@ class RunnerManager:
                         h.status = "running"
                         backoff = 1.0
                         continue
-                    if not snapshot_done and change.op == ChangeOp.UPSERT and not spec.config.accepts(change.record):
-                        # Filtered out of the initial state: simply not shown. Not
-                        # applying a remove here keeps a matching row with the same
-                        # key that came earlier; reconcile drops anything stale.
+                    if not rows.should_apply(change, snapshot_done):
                         continue
                     try:
                         # After the snapshot, a row that stops matching the filter

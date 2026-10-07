@@ -162,3 +162,28 @@ test("no sources yet: link to connect one", async () => {
   renderSetup({ "GET /api/sources": [] });
   expect(await screen.findByRole("link", { name: "Connect a source" })).toBeTruthy();
 });
+
+test("kind read from a column and an anchor are shown, and a fixed kind replaces the column", async () => {
+  const people = {
+    dataset: "rtls.locations", confidence: 0.85, attach_to: null, filter: null,
+    reason: "Each row is a person (patient or staff, from person_type) with a place on the map (unit).",
+    config: { id_field: "person_id", match_key: null, state_map: {}, attributes: [], kind: null, filter: [],
+      fields: { zone: "unit", kind: "person_type", label: "name", role: "role", anchor: "bed_id" } },
+  };
+  const api = renderSetup({
+    "GET /api/sources/src1/suggestions": [people],
+    "GET /api/sources/src1/datasets": [{ name: "rtls.locations", primary_key: ["tag_id"], supports_cdc: true,
+      columns: [col("tag_id"), col("person_id"), col("person_type"), col("unit"), col("name"), col("role"), col("bed_id")] }],
+    "POST /api/mappings": (c: { body: object }) => new Reply(201, { id: "m1", ...c.body }),
+  });
+  const item = await screen.findByRole("listitem", { name: "rtls.locations" });
+  expect(within(item).getByText("from person_type")).toBeTruthy();
+  expect(within(item).getByText("bed_id")).toBeTruthy();
+  fireEvent.click(within(item).getByRole("button", { name: "Edit" }));
+  fireEvent.change(within(item).getByLabelText("Kind"), { target: { value: "person" } });
+  fireEvent.click(screen.getByRole("button", { name: "Create 1 mapping" }));
+  await screen.findByText("Created 1 mapping.");
+  const body = api.find("POST", "/api/mappings")[0].body as { config: { kind: string; fields: Record<string, string> } };
+  expect(body.config.kind).toBe("person");
+  expect(body.config.fields).toEqual({ zone: "unit", label: "name", role: "role", anchor: "bed_id" });
+});

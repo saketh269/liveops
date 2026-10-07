@@ -25,7 +25,7 @@ log = logging.getLogger("liveops.api.sources")
 # Suggestions read a small sample of each table, within a time budget, so a
 # source with hundreds of tables or a slow one still answers quickly.
 SUGGEST_DISCOVER_TIMEOUT_S = 15.0
-SUGGEST_PREVIEW_ROWS = 50
+SUGGEST_PREVIEW_ROWS = 200
 SUGGEST_MAX_PREVIEWS = 25
 SUGGEST_PREVIEW_TIMEOUT_S = 5.0
 SUGGEST_BUDGET_S = 20.0

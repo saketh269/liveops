@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from app.connectors.base import Column, Dataset, Record
 from app.core.suggest import ExistingMapping, Suggestion, guess_kind, preview_priority, propose_state_map, suggest
 
@@ -56,7 +58,7 @@ def test_things_attachments_and_skips_for_any_source() -> None:
     assert trucks.config.kind == "vehicle"
     # Recognised sample values get a color; unknown ones are reported in the reason.
     assert trucks.config.state_map == {"en route": "in_use", "Available": "free"}
-    assert "1 status value needs a color" in trucks.reason
+    assert "Status value without a color yet: Docked" in trucks.reason
     assert 0 < trucks.confidence <= 0.95
 
     jobs = got["ops.forklift_jobs"]
@@ -136,7 +138,7 @@ def test_state_map_vocabulary() -> None:
         "out of service": "alert",
         "idle": "free",
     }
-    assert unknown == 1
+    assert unknown == ["weird"]
 
 
 def test_guess_kind() -> None:
@@ -153,3 +155,159 @@ def test_guess_kind() -> None:
 def test_preview_priority_prefers_likely_tables() -> None:
     order = sorted(WAREHOUSE, key=preview_priority)
     assert order[0].name == "ops.trucks"
+
+
+def test_clear_state_meanings_only() -> None:
+    m, unknown = propose_state_map(
+        ["in_bed", "seeing_patient", "rounds", "station", "available", "busy", "waiting", "charting", "arrived"]
+    )
+    assert m == {
+        "in_bed": "in_use",
+        "seeing_patient": "in_use",
+        "rounds": "in_use",
+        "station": "free",
+        "available": "free",
+        "busy": "in_use",
+    }
+    assert unknown == ["waiting", "charting", "arrived"]  # unclear: left to the user
+
+
+# -- The richer hospital shape: people with live locations ------------------------------------------
+
+
+def _rows(n: int, make: Callable[[int], Record]) -> list[Record]:
+    return [make(i) for i in range(n)]
+
+
+BEDS = [f"B{i:02d}" for i in range(1, 21)]
+STAFF = [f"S{i:02d}" for i in range(1, 11)]
+PATIENTS = [f"P-{1000 + i}" for i in range(15)]
+
+SIM = [
+    ds("epic.adt_beds", {"bed_id": "text", "unit": "text", "status": "text", "room": "text", "in_service": "boolean"},
+       ["bed_id"]),
+    ds("rtls.locations", {"tag_id": "text", "person_id": "text", "person_type": "text", "role": "text", "name": "text",
+                          "unit": "text", "room": "text", "bed_id": "text", "status": "text",
+                          "updated_at": "timestamp with time zone"}, ["tag_id"]),
+    ds("kronos.roster", {"staff_id": "text", "name": "text", "role": "text", "unit": "text", "on_shift": "boolean"},
+       ["staff_id"]),
+    ds("epic.encounters", {"encounter_id": "integer", "patient_ref": "text", "bed_id": "text",
+                           "discharged_at": "timestamp with time zone", "current_unit": "text", "status": "text"},
+       ["encounter_id"], nullable={"discharged_at"}),
+    ds("evs.tasks", {"task_id": "integer", "bed_id": "text", "status": "text", "done_at": "timestamp with time zone",
+                     "unit": "text", "assigned_to": "text"}, ["task_id"], nullable={"done_at"}),
+    ds("kronos.rounds", {"id": "integer", "staff_id": "text", "bed_id": "text", "unit": "text",
+                         "ended_at": "timestamp with time zone"}, ["id"], nullable={"ended_at"}),
+    ds("epic.triage_queue", {"id": "integer", "status": "text", "patient_ref": "text", "acuity": "smallint"}, ["id"]),
+    ds("epic.unit_census", {"unit": "text", "capacity": "integer"}, ["unit"]),
+    ds("gps.ambulances", {"unit_id": "text", "status": "text", "dest_unit": "text", "patient_ref": "text"},
+       ["unit_id"]),
+]  # fmt: skip
+DONE = "2026-10-07T10:00:00+00:00"
+SIM_SAMPLES: dict[str, list[Record]] = {
+    "epic.adt_beds": _rows(20, lambda i: {"bed_id": BEDS[i], "unit": "ER", "status": ["free", "occupied"][i % 2],
+                                          "room": f"Room {i}", "in_service": True}),
+    "rtls.locations": _rows(10, lambda i: {"tag_id": f"TAG-{STAFF[i]}", "person_id": STAFF[i], "person_type": "staff",
+                                           "role": "nurse", "name": f"Nurse {i}", "unit": "ER",
+                                           "bed_id": BEDS[i] if i < 3 else None,
+                                           "status": ["rounds", "station", "charting"][i % 3]})
+    + _rows(15, lambda i: {"tag_id": f"TAG-{PATIENTS[i]}", "person_id": PATIENTS[i], "person_type": "patient",
+                           "role": "patient", "name": PATIENTS[i], "unit": "ER",
+                           "bed_id": BEDS[i] if i < 10 else None, "status": "in_bed" if i < 10 else "waiting"}),
+    "kronos.roster": _rows(14, lambda i: {"staff_id": f"S{i + 1:02d}", "name": f"N{i}", "role": "nurse",
+                                          "unit": "ER", "on_shift": i < 10}),
+    # Open and closed visits; the closed ones are for patients no longer in the building.
+    "epic.encounters": _rows(10, lambda i: {"encounter_id": i, "patient_ref": PATIENTS[i], "bed_id": BEDS[i],
+                                            "discharged_at": None, "current_unit": "ER", "status": "in_bed"})
+    + _rows(10, lambda i: {"encounter_id": 100 + i, "patient_ref": f"P-9{i:02d}", "bed_id": BEDS[i],
+                           "discharged_at": DONE, "current_unit": "ER", "status": "discharged"}),
+    "evs.tasks": _rows(6, lambda i: {"task_id": i, "bed_id": BEDS[i], "status": "done", "done_at": DONE, "unit": "ER",
+                                     "assigned_to": STAFF[i % 2]}),
+    "kronos.rounds": _rows(8, lambda i: {"id": i + 1, "staff_id": STAFF[i % 4], "bed_id": BEDS[i], "unit": "ER",
+                                         "ended_at": None if i < 4 else DONE}),
+    # ``id`` values 1..8 equal kronos.rounds ids: a generic id must never count as a reference.
+    "epic.triage_queue": _rows(8, lambda i: {"id": i + 1, "status": "waiting", "patient_ref": PATIENTS[10 + i % 5],
+                                             "acuity": 3}),
+    "epic.unit_census": [{"unit": "ER", "capacity": 10}],
+    "gps.ambulances": [{"unit_id": "A-1", "status": "inbound", "dest_unit": "ER", "patient_ref": PATIENTS[14]},
+                       {"unit_id": "A-2", "status": "idle", "dest_unit": "ER", "patient_ref": None}],
+}  # fmt: skip
+
+
+def test_people_with_live_locations_take_details_from_the_tables_about_them() -> None:
+    got = by_name(suggest(SIM, SIM_SAMPLES, source_id="src"))
+    people = got["rtls.locations"]
+    assert people.config is not None and people.attach_to is None
+    # Joined on person_id, which other tables refer to; kind and role come from columns.
+    assert people.config.id_field == "person_id"
+    assert people.config.kind is None
+    assert people.config.fields == {
+        "zone": "unit", "kind": "person_type", "state": "status", "label": "name", "role": "role", "anchor": "bed_id",
+    }  # fmt: skip
+    assert people.config.state_map == {"rounds": "in_use", "station": "free", "in_bed": "in_use"}
+    assert "charting, waiting" in people.reason
+
+    beds = got["epic.adt_beds"]
+    assert beds.config is not None and beds.config.kind == "bed" and beds.attach_to is None
+    amb = got["gps.ambulances"]
+    assert amb.config is not None and amb.config.kind == "ambulance" and amb.attach_to is None
+    assert "anchor" not in amb.config.fields  # an ambulance is not drawn at a patient
+
+    def attached(name: str) -> tuple[str, str]:
+        s = got[name]
+        assert s.config is not None and s.attach_to is not None, name
+        return s.attach_to.dataset, s.attach_to.match_key
+
+    # The same people as rtls (staff on shift), and visits by patient: details, not second figures.
+    assert attached("kronos.roster") == ("rtls.locations", "staff_id")
+    assert "drawing them twice" in got["kronos.roster"].reason
+    assert attached("epic.encounters") == ("rtls.locations", "patient_ref")
+    assert attached("kronos.rounds") == ("rtls.locations", "staff_id")
+    # Tasks about beds stay with the beds even though they name a cleaner and have a unit.
+    assert attached("evs.tasks") == ("epic.adt_beds", "bed_id")
+    filters = {n: [f.model_dump(exclude_none=True) for f in (got[n].filter or [])] for n in got}
+    assert filters["kronos.roster"] == [{"column": "on_shift", "op": "eq", "value": True}]
+    assert filters["epic.encounters"] == [{"column": "discharged_at", "op": "is_null"}]
+    assert filters["evs.tasks"] == [{"column": "done_at", "op": "is_null"}]
+    assert filters["kronos.rounds"] == [{"column": "ended_at", "op": "is_null"}]
+
+    for name in ("epic.triage_queue", "epic.unit_census"):
+        assert got[name].config is None and "counts" in got[name].reason
+
+
+def test_without_people_table_visits_and_tasks_attach_to_beds() -> None:
+    no_rtls = [d for d in SIM if d.name != "rtls.locations"]
+    got = by_name(suggest(no_rtls, SIM_SAMPLES, source_id="src"))
+    assert got["epic.encounters"].attach_to is not None
+    assert got["epic.encounters"].attach_to.dataset == "epic.adt_beds"
+    roster = got["kronos.roster"]
+    assert roster.config is not None and roster.attach_to is None and roster.config.kind == "staff"
+    assert got["epic.triage_queue"].config is None
+
+
+def test_a_generic_id_or_unconfirmed_name_is_not_a_reference() -> None:
+    things = [
+        ds("a.rooms", {"id": "integer", "zone": "text"}, ["id"]),
+        ds("a.notes", {"id": "integer", "room_id": "integer", "text": "text"}, ["id"]),
+    ]
+    samples: dict[str, list[Record]] = {
+        "a.rooms": [{"id": i, "zone": "Z"} for i in range(1, 5)],
+        # Same ids as the rooms, and room_id values that are not room ids.
+        "a.notes": [{"id": i, "room_id": 90 + i, "text": "x"} for i in range(1, 5)],
+    }
+    got = by_name(suggest(things, samples))
+    assert got["a.notes"].config is None
+    # With matching values the reference is confirmed.
+    samples["a.notes"] = [{"id": i, "room_id": i, "text": "x"} for i in range(1, 5)]
+    got = by_name(suggest(things, samples))
+    assert got["a.notes"].attach_to is not None and got["a.notes"].attach_to.match_key == "room_id"
+
+
+def test_kind_from_a_column_of_kinds() -> None:
+    fleet = [ds("ops.units", {"unit_id": "text", "unit_type": "text", "depot": "text"}, ["unit_id"])]
+    rows: list[Record] = [
+        {"unit_id": f"U{i}", "unit_type": ["truck", "van", "forklift"][i % 3], "depot": "D1"} for i in range(6)
+    ]
+    (s,) = suggest(fleet, {"ops.units": rows})
+    assert s.config is not None and s.config.fields["kind"] == "unit_type" and s.config.kind is None
+    assert "anchor" not in s.config.fields and "role" not in s.config.fields
