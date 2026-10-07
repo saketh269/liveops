@@ -9,7 +9,9 @@ A mapping config (stored as JSON on the Mapping row) looks like::
       "fields": {                       # asset field -> source column
         "zone": "unit",
         "state": "status",
-        "label": "bed_label"
+        "label": "bed_label",
+        "anchor": "bed_id"              #   (on a patient mapping) the asset
+                                        #   this one is drawn at (ADR 0006)
       },
       "state_map": {"occupied": "in_use"},   # optional value translation
       "attributes": ["patient_count"],       # extra columns passed through
@@ -33,7 +35,24 @@ from app.connectors.base import Change, ChangeOp
 from app.core.events import AssetEvent, AssetOp
 from app.core.rowfilter import RowFilter, filter_problems, matches
 
-RESERVED_FIELDS = {"zone", "state", "label", "kind", "x", "y"}
+RESERVED_FIELDS = {"zone", "state", "label", "kind", "x", "y", "anchor"}
+
+ANCHOR = "anchor"
+
+
+def anchor_value(value: Any, own_id: str) -> str | None:
+    """An ``anchor`` as the asset id it names, or None for no anchor.
+
+    Asset ids are strings, so a numeric bed id (``12`` or ``12.0``) becomes
+    ``"12"``. Blank values and a record pointing at itself mean no anchor."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    text = str(value).strip()
+    if not text or text == own_id:
+        return None
+    return text
 
 
 class MappingConfig(BaseModel):
@@ -106,6 +125,8 @@ def apply_mapping(
     for asset_field, column in config.fields.items():
         if column in rec:
             out[asset_field] = rec[column]
+    if ANCHOR in out:
+        out[ANCHOR] = anchor_value(out[ANCHOR], str(key))
     if "state" in out and out["state"] is not None:
         raw = str(out["state"])
         out["state"] = config.state_map.get(raw, raw)
@@ -132,5 +153,11 @@ def validate_against_columns(config: MappingConfig, columns: set[str] | dict[str
     also check that filter values fit the column types."""
     missing = sorted(c for c in config.required_columns() if c not in columns)
     problems = [f"Column {c!r} isn't in this table" for c in missing]
+    anchor = config.fields.get(ANCHOR)
+    if anchor and anchor == config.key_field:
+        problems.append(
+            f"Anchor column {anchor!r} is the ID column, so every record would point at itself; "
+            "choose the column that holds the other asset's ID, such as a patient's bed_id"
+        )
     types = columns if isinstance(columns, dict) else dict.fromkeys(columns, "")
     return problems + filter_problems(config.filter, types)
