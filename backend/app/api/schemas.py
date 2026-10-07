@@ -41,6 +41,7 @@ class SourceOut(BaseModel):
     type: str
     settings: dict[str, Any]
     secrets_set: dict[str, bool]
+    secrets_unreadable: bool = False  # stored secrets can't be decrypted with the current key
     warnings: list[str] = Field(default_factory=list)
     created_ts: float
     updated_ts: float

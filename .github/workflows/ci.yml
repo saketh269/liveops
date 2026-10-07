@@ -3,6 +3,9 @@ on:
   push: { branches: [main] }
   pull_request:
 
+permissions:
+  contents: read  # least privilege for the default token (LIVEOPS-69)
+
 jobs:
   backend:
     runs-on: ubuntu-latest
@@ -48,7 +51,10 @@ jobs:
       - name: Tests (unit, contract, integration)
         run: pytest -q
       - name: Dependency audit
-        run: pip-audit --strict --progress-spinner off || (echo "::warning::pip-audit found issues" && exit 1)
+        # Audit the installed third-party set; our own editable package can't be audited (LIVEOPS-67).
+        run: |
+          pip freeze --exclude-editable > /tmp/requirements-audit.txt
+          pip-audit --strict --no-deps --progress-spinner off -r /tmp/requirements-audit.txt
 
   frontend:
     runs-on: ubuntu-latest

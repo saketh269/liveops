@@ -320,7 +320,6 @@ def _dump_data(be: Backend) -> str:
     return r.stdout
 
 
-@pytest.mark.xfail(strict=True, reason="LIVEOPS-41: different secret key -> startup crash / 500s")
 def test_upgrade_roundtrip_and_secret_key(pg: PgSource) -> None:
     be = Backend()
     try:

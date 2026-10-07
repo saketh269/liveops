@@ -17,6 +17,7 @@ import pytest
 from cryptography.fernet import Fernet
 
 os.environ.setdefault("LIVEOPS_SECRET_KEY", Fernet.generate_key().decode())
+os.environ.setdefault("LIVEOPS_ALLOWED_HOSTS", "testserver")  # TestClient / ASGI test host
 
 PG_DSN = os.environ.get("LIVEOPS_TEST_PG_DSN")
 requires_pg = pytest.mark.skipif(not PG_DSN, reason="LIVEOPS_TEST_PG_DSN not set")

@@ -31,6 +31,7 @@ services:
     environment:
       LIVEOPS_DATABASE_URL: postgresql+psycopg://liveops:${PORTAL_DB_PASSWORD:-liveops}@portal-db:5432/liveops
       LIVEOPS_REDIS_URL: redis://redis:6379/0
+    volumes: [liveops-data:/data]  # uploaded files and webhook journals (LIVEOPS-65)
     extra_hosts: ["host.docker.internal:host-gateway"]
     depends_on:
       portal-db: { condition: service_healthy }
@@ -48,3 +49,4 @@ services:
 
 volumes:
   portal-db:
+  liveops-data:

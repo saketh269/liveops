@@ -20,7 +20,26 @@ router = APIRouter(prefix="/api", tags=["sources"])
 
 # Settings that identify *where* a source lives. Changing one requires the
 # secrets to be entered again (LIVEOPS-24).
-ENDPOINT_FIELDS = ("host", "port", "base_url", "url", "token_url", "endpoint_url", "bucket", "region")
+ENDPOINT_FIELDS = (
+    "host",
+    "port",
+    "database",
+    "service_name",
+    "dsn",
+    "base_url",
+    "url",
+    "path",
+    "token_url",
+    "endpoint_url",
+    "bucket",
+    "region",
+    # Weakening transport security also counts as moving the endpoint (LIVEOPS-74).
+    "encryption",
+    "ssl_ca",
+    "ca_file",
+    "allow_private_network",
+    "allow_http",
+)
 
 
 def _warnings(src_type: str, settings: dict[str, Any]) -> list[str]:
@@ -40,13 +59,22 @@ def _warnings(src_type: str, settings: dict[str, Any]) -> list[str]:
 
 
 def _out(s: Source) -> SourceOut:
+    warnings = _warnings(s.type, s.settings or {})
+    try:
+        secrets_set = secrets_mod.mask(secrets_mod.decrypt(s.secrets_enc))
+        unreadable = False
+    except secrets_mod.SecretsError:
+        # Still list the source so the user can re-enter its password (LIVEOPS-91/41).
+        secrets_set, unreadable = {}, True
+        warnings.append("The saved password or token can't be read (the server's secret key changed). Enter it again.")
     return SourceOut(
         id=s.id,
         name=s.name,
         type=s.type,
         settings=s.settings or {},
-        secrets_set=secrets_mod.mask(secrets_mod.decrypt(s.secrets_enc)),
-        warnings=_warnings(s.type, s.settings or {}),
+        secrets_set=secrets_set,
+        secrets_unreadable=unreadable,
+        warnings=warnings,
         created_ts=s.created_ts,
         updated_ts=s.updated_ts,
     )
@@ -116,7 +144,8 @@ async def update_source(
     settings = body.settings if body.settings is not None else (s.settings or {})
     new_secrets = body.secrets or {}
     # Saved credentials must not follow the source to a different server.
-    moved = [k for k in ENDPOINT_FIELDS if k in settings and settings.get(k) != (s.settings or {}).get(k)]
+    old = s.settings or {}
+    moved = [k for k in ENDPOINT_FIELDS if (k in settings or k in old) and settings.get(k) != old.get(k)]
     if moved and secrets and not any(v not in (None, "") for v in new_secrets.values()):
         raise HTTPException(
             422,

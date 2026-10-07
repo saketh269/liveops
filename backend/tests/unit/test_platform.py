@@ -234,10 +234,13 @@ def test_changed_secret_key_gives_clear_error(portal_db: str) -> None:
     get_settings.cache_clear()
     try:
         with TestClient(create_app()) as c:  # starts even though secrets can't be read
-            r = c.get(f"/api/sources/{src['id']}")
-            assert r.status_code == 409 and r.json()["detail"]["hint"]
+            r = c.get(f"/api/sources/{src['id']}")  # still listed so the password can be re-entered
+            assert r.status_code == 200 and r.json()["secrets_unreadable"] is True and r.json()["warnings"]
+            assert c.get("/api/sources").status_code == 200
             health = c.get("/api/health/mappings").json()
             assert health and health[0]["status"] == "error"
+            fixed = c.put(f"/api/sources/{src['id']}", json={"secrets": {"password": "x"}})
+            assert fixed.status_code == 200 and fixed.json()["secrets_unreadable"] is False
     finally:
         os.environ["LIVEOPS_SECRET_KEY"] = old
         get_settings.cache_clear()

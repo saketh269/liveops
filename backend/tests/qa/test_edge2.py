@@ -256,9 +256,6 @@ def test_upgrade_from_sprint0_main(pg: PgSource) -> None:
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True, reason="LIVEOPS-41: GET /api/sources and /api/sources/{id} still 409 after a key change"
-)
 def test_secret_key_change_end_to_end(pg: PgSource) -> None:
     be = Backend()
     try:
@@ -341,7 +338,6 @@ def test_config_missing_secret_key(pg: PgSource) -> None:
         be.cleanup()
 
 
-@pytest.mark.xfail(strict=True, reason="LIVEOPS-81: malformed LIVEOPS_SECRET_KEY -> bare 500")
 def test_config_invalid_secret_key() -> None:
     be = DirBackend(HERE, secret_key="not-a-fernet-key")
     try:
@@ -379,7 +375,6 @@ def test_config_wrong_database_url() -> None:
         be.cleanup()
 
 
-@pytest.mark.xfail(strict=True, reason="LIVEOPS-82: override replaces defaults / plain value crashes")
 def test_config_allowed_hosts_override() -> None:
     out: dict[str, Any] = {}
     for label, value in (
