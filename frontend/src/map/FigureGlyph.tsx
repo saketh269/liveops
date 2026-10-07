@@ -4,6 +4,7 @@
 // models palette for the current theme, so roles read the same as in 3D.
 import type { BodyPose, FigureModel } from "./figures";
 import { currentModelTheme, getModelPalette, idHash, type ModelPalette } from "./models/palette";
+import { stateKey } from "./stateColors";
 
 type Outfit = { top: keyof ModelPalette; coat?: boolean };
 
@@ -30,7 +31,8 @@ function Person({ model, p, skin, dx = 0 }: { model: FigureModel; p: ModelPalett
   );
 }
 
-export function FigureGlyph({ model, pose, id = "" }: { model: FigureModel; pose?: BodyPose; id?: string }) {
+/** `pose` (optional, from placement) draws a patient lying; `state` tints a dirty bed's sheet; `id` picks the skin tone. */
+export function FigureGlyph({ model, pose, id = "", state }: { model: FigureModel; pose?: BodyPose; id?: string; state?: unknown }) {
   const p = getModelPalette(currentModelTheme());
   const skin = p.skin[idHash(id) % Math.max(1, p.skin.length)] ?? "#d9a57f";
   switch (model) {
@@ -39,7 +41,7 @@ export function FigureGlyph({ model, pose, id = "" }: { model: FigureModel; pose
         <>
           <rect x={-0.5} y={-0.28} width={1} height={0.56} rx={0.05} style={col(p, "bedFrame")} />
           <rect x={-0.45} y={-0.25} width={0.92} height={0.5} rx={0.05} style={col(p, "mattress")} />
-          <rect x={-0.02} y={-0.26} width={0.48} height={0.52} rx={0.04} style={col(p, "sheet")} />
+          <rect x={-0.02} y={-0.26} width={0.48} height={0.52} rx={0.04} style={col(p, stateKey(state) === "cleaning" ? "sheetDirty" : "sheet")} />
           <rect x={-0.43} y={-0.17} width={0.15} height={0.34} rx={0.05} style={col(p, "pillow")} />
           <rect className="lm-fig-state" x={0.46} y={-0.28} width={0.05} height={0.56} />
           <circle className="lm-fig-state" cx={-0.47} cy={0.18} r={0.06} />

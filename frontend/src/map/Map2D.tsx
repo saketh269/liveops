@@ -3,7 +3,7 @@ import type { Asset, SiteLayout } from "../api/types";
 import { FloorPlanImage } from "./FloorPlanImage";
 import type { PlanView } from "./floors";
 import { FigureGlyph } from "./FigureGlyph";
-import { FIGURE_LABELS } from "./figures";
+import { FIGURE_LABELS, type BodyPose } from "./figures";
 import { Motion, type FigureState } from "./motion";
 import { floorSize, PlacementCache, polygonCentroid } from "./placement";
 import { stateKey } from "./stateColors";
@@ -132,7 +132,8 @@ export default function Map2D({ layout, assets, selectedId, onSelect, onHover, r
             onPointerLeave={(e) => onHover(null, e.clientX, e.clientY)}
           >
             <title>{FIGURE_LABELS[f.model]}</title>
-            <FigureGlyph model={f.model} />
+            {/* models (LIVEOPS-109): pose is optional until placement sets it */}
+            <FigureGlyph model={f.model} pose={(f as { pose?: BodyPose }).pose} id={f.id} state={f.asset.state} />
           </g>
         ))}
         {/* Labels last so assets never hide them. */}
