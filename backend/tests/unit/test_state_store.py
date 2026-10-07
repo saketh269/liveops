@@ -266,7 +266,7 @@ async def test_attributes_merge_per_key_across_sources(store: StateStore) -> Non
     assert asset.flat()["attributes"] == {"patient_count": 2, "cleaner": "C0"}
     last = (await store.events("s"))[-1]
     assert last["changes"] == {"attributes.patient_count": [0, 2]}
-    assert describe(last) == "B1 attributes.patient_count 0 → 2"
+    assert describe(last) == "B1 patient_count 0 → 2"
 
     # Removing housekeeping drops only its attribute key.
     msg = await store.apply(ev(src="hk", mapping="m2", op=AssetOp.REMOVE, ts=4))
