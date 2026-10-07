@@ -26,6 +26,12 @@ type Props = {
   motion?: boolean;
   /** Removed records still walking out, with their final data (for the details panel). */
   onDeparting?: (assets: Map<string, Asset>) => void;
+  // --- ui-shell hook (ADR 0007): HUD pins and camera glide. Keep minimal. ---
+  /** Gets a projector (asset id → page coordinates of its figure) while the scene runs; null when it stops. */
+  onProject?: (screenOf: ((id: string) => { x: number; y: number } | null) | null) => void;
+  /** Each new value eases the camera onto that (selected) asset once. */
+  glide?: { id: string; seq: number } | null;
+  // --- end ui-shell hook ---
 };
 
 declare global {
@@ -35,11 +41,14 @@ declare global {
 }
 
 /** Hosts the Three.js scene. Asset updates bypass React and go straight to the scene. */
-export default function MapView3D({ layout, stateRef, listen, selectedId, onHover, onSelect, onFail, debug, plan, assetFilter, viewKey, motion = true, onDeparting }: Props) {
+export default function MapView3D({ layout, stateRef, listen, selectedId, onHover, onSelect, onFail, debug, plan, assetFilter, viewKey, motion = true, onDeparting, onProject, glide }: Props) {
   const hostRef = useRef<HTMLDivElement>(null);
   const labelsRef = useRef<HTMLDivElement>(null);
   const [scene, setScene] = useState<MapScene | null>(null);
   const [follow, setFollow] = useState(false);
+  const [gliding, setGliding] = useState(false);
+  const projectRef = useRef(onProject);
+  projectRef.current = onProject;
   const cbRef = useRef({ onHover, onSelect, onFail, onDeparting });
   cbRef.current = { onHover, onSelect, onFail, onDeparting };
 
@@ -109,7 +118,20 @@ export default function MapView3D({ layout, stateRef, listen, selectedId, onHove
 
   useEffect(() => { scene?.setSelected(selectedId); }, [scene, selectedId]);
   useEffect(() => { scene?.setMotionAllowed(motion); }, [scene, motion]);
-  const following = follow && !!selectedId;
+  // ui-shell hook: hand the projector to the HUD; a glide follows the asset briefly.
+  useEffect(() => {
+    if (!scene) return;
+    projectRef.current?.((id) => scene.screenOf(id));
+    return () => projectRef.current?.(null);
+  }, [scene]);
+  useEffect(() => {
+    if (!scene || !glide) return;
+    scene.setSelected(glide.id);
+    setGliding(true);
+    const t = setTimeout(() => setGliding(false), 1200);
+    return () => clearTimeout(t);
+  }, [scene, glide]);
+  const following = (follow || gliding) && !!selectedId;
   useEffect(() => { scene?.setFollow(following); }, [scene, following]);
 
   return (
