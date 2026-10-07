@@ -5,6 +5,7 @@ import { Link } from "react-router-dom";
 import { api } from "../api/client";
 import type { Asset, Mapping, Site, SiteLayout } from "../api/types";
 import { appendMissingZones, buildAutoLayout, stateCoverage, zoneCoverage } from "./autoZones";
+import { floorById, floorsOf } from "./floors";
 
 type Props = {
   site: Site;
@@ -12,6 +13,8 @@ type Props = {
   ready: boolean;
   onSite: (s: Site) => void;
   onEditLayout: () => void;
+  /** Floor shown on the map; zones created here go on it. Default: the first floor. */
+  floorId?: string;
 };
 
 const list = (m: Map<string, number>, max = 6) => {
@@ -20,7 +23,7 @@ const list = (m: Map<string, number>, max = 6) => {
   return items.length > max ? `${shown} and ${items.length - max} more` : shown;
 };
 
-export default function SetupHints({ site, assets, ready, onSite, onEditLayout }: Props) {
+export default function SetupHints({ site, assets, ready, onSite, onEditLayout, floorId }: Props) {
   const zones = useMemo(() => zoneCoverage(site.layout, assets.values()), [site.layout, assets]);
   const states = useMemo(() => stateCoverage(assets.values()), [assets]);
   const [created, setCreated] = useState<{ names: string[]; previous: SiteLayout } | null>(null);
@@ -49,12 +52,17 @@ export default function SetupHints({ site, assets, ready, onSite, onEditLayout }
     }
   };
 
+  const floor = floorById(site.layout, floorId) ?? floorsOf(site.layout)[0];
+  // A floor with a plan image was drawn on purpose: never replace its zones without asking.
+  const protectedFloor = !!floor.plan;
+  const onFloorName = floorsOf(site.layout).length > 1 ? ` to ${floor.name}` : "";
+
   // A layout where no zone matches the data is still the starting template: replace it
   // with zones built from the data once, without asking. Undo restores the old layout.
   useEffect(() => {
-    if (!ready || autoTried.current || zones.missing.size === 0 || zones.used.size > 0) return;
+    if (!ready || autoTried.current || zones.missing.size === 0 || zones.used.size > 0 || protectedFloor) return;
     autoTried.current = true;
-    void save(buildAutoLayout(site.layout, zones), site.layout ?? {}, [...zones.missing.keys()]);
+    void save(buildAutoLayout(site.layout, zones, floor.id), site.layout ?? {}, [...zones.missing.keys()]);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ready, zones]);
 
@@ -75,12 +83,12 @@ export default function SetupHints({ site, assets, ready, onSite, onEditLayout }
           <button type="button" className="btn lm-link-btn" disabled={busy} onClick={() => void save(created.previous, created.previous, [])}>Undo</button>
         </div>
       )}
-      {zones.missing.size > 0 && zones.used.size > 0 && (
+      {zones.missing.size > 0 && (zones.used.size > 0 || protectedFloor) && (
         <div className="notice">
           {missingCount} asset{missingCount === 1 ? " is" : "s are"} in zones that aren't on the map yet: {list(zones.missing)}.{" "}
           <button type="button" className="btn primary lm-link-btn" disabled={busy}
-            onClick={() => void save(appendMissingZones(site.layout, zones), site.layout ?? {}, [...zones.missing.keys()])}>
-            Add {zones.missing.size === 1 ? "this zone" : `these ${zones.missing.size} zones`}
+            onClick={() => void save(appendMissingZones(site.layout, zones, floor.id), site.layout ?? {}, [...zones.missing.keys()])}>
+            Add {zones.missing.size === 1 ? "this zone" : `these ${zones.missing.size} zones`}{onFloorName}
           </button>
         </div>
       )}
