@@ -261,6 +261,7 @@ def test_rest(backend: Backend) -> None:
             "record_path": "data",
             "auth": "bearer",
             "allow_http": True,
+            "allow_private_network": True,  # LIVEOPS-21: loopback needs the opt-in
         }
         src, site, m, _ = connect_and_map(backend, "rest", settings, {"bearer_token": "tok-123"}, "beds")
         check_first_snapshot(backend, site["id"])
@@ -429,6 +430,7 @@ def test_s3_files(backend: Backend) -> None:
             "endpoint_url": url,
             "encryption": "off",
             "region": "us-east-1",
+            "allow_private_network": True,  # LIVEOPS-21: loopback needs the opt-in
         }
         src, site, m, ds = connect_and_map(
             backend, "s3_files", settings, {"access_key_id": "test", "secret_access_key": "test"}, "beds"
@@ -458,11 +460,8 @@ def test_s3_files(backend: Backend) -> None:
         ("sqlserver", {"host": "127.0.0.1", "port": 1, "database": "x", "user": "u", "encryption": "off"}),
         ("oracle", {"host": "127.0.0.1", "port": 1, "service_name": "x", "user": "u", "encryption": "off"}),
         ("sqlserver", {"host": "no-such-host.invalid", "port": 1433, "database": "x", "user": "u"}),
-        pytest.param(
-            "oracle",
-            {"host": "no-such-host.invalid", "port": 1521, "service_name": "x", "user": "u"},
-            marks=pytest.mark.xfail(strict=True, reason="LIVEOPS-47: DNS failure gets the service-name hint"),
-        ),
+        # LIVEOPS-47 is fixed (Done): DNS failure now gets the host-name hint.
+        ("oracle", {"host": "no-such-host.invalid", "port": 1521, "service_name": "x", "user": "u"}),
     ],
 )
 def test_enterprise_unreachable(backend: Backend, type_: str, settings: dict[str, Any]) -> None:
