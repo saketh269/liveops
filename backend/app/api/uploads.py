@@ -13,6 +13,7 @@ import contextlib
 import os
 import re
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, BinaryIO
 
@@ -68,22 +69,20 @@ class _TooBig(Exception):
     pass
 
 
-def _too_big(limit: int) -> HTTPException:
-    return HTTPException(
-        413,
-        detail={
-            "message": f"File is larger than {limit // (1024 * 1024)} MB",
-            "hint": "Split it into smaller files, or ask an admin to raise LIVEOPS_MAX_UPLOAD_MB.",
-        },
-    )
+def _too_big(limit: int, hint: str) -> HTTPException:
+    return HTTPException(413, detail={"message": f"File is larger than {limit // (1024 * 1024)} MB", "hint": hint})
+
+
+TOO_BIG_HINT = "Split it into smaller files, or ask an admin to raise LIVEOPS_MAX_UPLOAD_MB."
 
 
 class _MultipartSink:
     """Receives python-multipart callbacks; writes the ``file`` part straight to
-    ``tmp`` and stops as soon as it passes ``limit`` bytes (LIVEOPS-18)."""
+    ``tmp`` and stops as soon as it passes ``limit`` bytes (LIVEOPS-18).
+    ``check_name`` validates the part's file name (raises HTTPException to refuse)."""
 
-    def __init__(self, tmp: Path, limit: int) -> None:
-        self.tmp, self.limit = tmp, limit
+    def __init__(self, tmp: Path, limit: int, check_name: Callable[[str | None], str] = safe_filename) -> None:
+        self.tmp, self.limit, self.check_name = tmp, limit, check_name
         self.filename: str | None = None
         self.size = 0
         self._out: BinaryIO | None = None
@@ -123,7 +122,7 @@ class _MultipartSink:
         if disp != b"form-data" or params.get(b"name") != b"file" or self._done:
             return
         raw = params.get(b"filename")
-        self.filename = safe_filename(raw.decode("utf-8", errors="replace") if raw is not None else None)
+        self.filename = self.check_name(raw.decode("utf-8", errors="replace") if raw is not None else None)
         self._out = self.tmp.open("wb")
         self._in_file = True
 
@@ -147,12 +146,18 @@ class _MultipartSink:
             self._out = None
 
 
-async def _receive_file(request: Request, tmp: Path, limit: int) -> tuple[str, int]:
+async def receive_file(
+    request: Request,
+    tmp: Path,
+    limit: int,
+    check_name: Callable[[str | None], str] = safe_filename,
+    too_big_hint: str = TOO_BIG_HINT,
+) -> tuple[str, int]:
     """Stream the multipart body: refuse early by Content-Length, then count while
     parsing, so an oversized upload is never fully read or spooled anywhere."""
     declared = request.headers.get("content-length")
     if declared and declared.isdigit() and int(declared) > limit + MULTIPART_OVERHEAD:
-        raise _too_big(limit)
+        raise _too_big(limit, too_big_hint)
     ctype, params = parse_options_header(request.headers.get("content-type", ""))
     boundary = params.get(b"boundary")
     if ctype != b"multipart/form-data" or not boundary:
@@ -163,7 +168,7 @@ async def _receive_file(request: Request, tmp: Path, limit: int) -> tuple[str, i
                 "hint": "Send the file as a form upload, e.g. curl -F file=@beds.csv <url>.",
             },
         )
-    sink = _MultipartSink(tmp, limit)
+    sink = _MultipartSink(tmp, limit, check_name)
     parser = MultipartParser(boundary, sink.callbacks())  # type: ignore[arg-type]
     received = 0
     try:
@@ -174,7 +179,7 @@ async def _receive_file(request: Request, tmp: Path, limit: int) -> tuple[str, i
             parser.write(chunk)
         parser.finalize()
     except _TooBig:
-        raise _too_big(limit) from None
+        raise _too_big(limit, too_big_hint) from None
     except MultipartParseError:
         raise HTTPException(
             422, detail={"message": "The upload is not valid multipart form data", "hint": "Upload the file again."}
@@ -224,7 +229,7 @@ async def upload(
     await asyncio.to_thread(folder.mkdir, parents=True, exist_ok=True)
     tmp = folder / f".upload-{uuid.uuid4().hex}.tmp"
     try:
-        name, size = await _receive_file(request, tmp, limit)
+        name, size = await receive_file(request, tmp, limit)
         data = await asyncio.to_thread(tmp.read_bytes)
         try:
             rows = await asyncio.to_thread(parse_bytes, name, data, settings)
