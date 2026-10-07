@@ -68,6 +68,7 @@ class S3Env:
             "prefix": "exports",
             "endpoint_url": self.url,
             "encryption": "off",  # local moto server speaks plain HTTP
+            "allow_private_network": True,  # moto listens on 127.0.0.1
             **over,
         }
 
@@ -109,6 +110,10 @@ class S3Driver:
 
     async def delete(self, key: str) -> None:
         del self.rows[key]
+        self._write()
+
+    async def insert_null_key(self, row: dict[str, Any]) -> None:
+        self.rows["~nokey"] = {**row, "id": None}
         self._write()
 
 
@@ -191,3 +196,87 @@ async def test_missing_bucket_hint(s3env: S3Env) -> None:
     report = await c.test()
     await c.close()
     assert not report.ok and "bucket" in report.steps[-1].hint.lower()
+
+
+# -- LIVEOPS-16: never use the server's ambient AWS credentials -------------------
+
+
+@pytest.fixture
+def ambient_aws(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIASERVERROLEXAMPLE")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "server-secret-should-never-be-used")
+    monkeypatch.setenv("AWS_SESSION_TOKEN", "server-session-token")
+
+
+@pytest.mark.parametrize("secrets", [{}, {"access_key_id": ""}, {"access_key_id": "AKIAX", "secret_access_key": ""}])
+async def test_blank_keys_never_fall_back_to_ambient(s3env: S3Env, ambient_aws: None, secrets: dict[str, str]) -> None:
+    c = S3FilesConnector(s3env.settings(), secrets)
+    report = await c.test()
+    assert not report.ok
+    assert "Enter an access key" in report.steps[0].detail
+    assert c._client is None, "no S3 client may be built without the source's own keys"
+    assert "AKIASERVERROLEXAMPLE" not in report.model_dump_json()
+    with pytest.raises(ConnectorError, match="access key"):
+        await c.discover()
+    await c.close()
+
+
+async def test_explicit_keys_ignore_ambient_session_token(s3env: S3Env, ambient_aws: None) -> None:
+    c = S3FilesConnector(s3env.settings(), dict(s3env.keys["reader"]))
+    try:
+        creds = (await c._run(c._s3))._request_signer._credentials
+        assert creds.access_key == s3env.keys["reader"]["access_key_id"]
+        assert creds.token is None
+        assert (await c.test()).ok
+    finally:
+        await c.close()
+
+
+async def test_instance_role_needs_admin_flag(s3env: S3Env, ambient_aws: None, monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.config import get_settings
+
+    c = S3FilesConnector(s3env.settings(use_instance_role=True), {})
+    report = await c.test()
+    assert not report.ok and "LIVEOPS_S3_ALLOW_INSTANCE_ROLE" in report.steps[0].hint
+    monkeypatch.setenv("LIVEOPS_S3_ALLOW_INSTANCE_ROLE", "true")
+    get_settings.cache_clear()
+    try:
+        assert c._credentials() == {}  # admin allowed it and the source opted in: default chain
+    finally:
+        monkeypatch.delenv("LIVEOPS_S3_ALLOW_INSTANCE_ROLE")
+        get_settings.cache_clear()
+
+
+# -- LIVEOPS-21: endpoint network policy -----------------------------------------
+
+
+async def test_private_endpoint_needs_opt_in(s3env: S3Env) -> None:
+    c = S3FilesConnector(s3env.settings(allow_private_network=False), dict(s3env.keys["reader"]))
+    report = await c.test()
+    await c.close()
+    assert not report.ok and "Allow private network" in report.steps[-1].hint
+
+
+async def test_metadata_endpoint_always_refused(s3env: S3Env) -> None:
+    c = S3FilesConnector(
+        s3env.settings(endpoint_url="http://169.254.169.254", allow_private_network=True), dict(s3env.keys["reader"])
+    )
+    with pytest.raises(ConnectorError, match="blocked"):
+        await c.discover()
+    await c.close()
+
+
+# -- LIVEOPS-19 via S3: bombs are refused the same way -----------------------------
+
+
+async def test_xlsx_bomb_object_refused(s3env: S3Env) -> None:
+    from tests.contract.test_files_contract import _bomb
+
+    prefix = f"bomb-{uuid.uuid4().hex[:6]}"
+    s3env.put(prefix + "/b.xlsx", _bomb(20 * 1024 * 1024))
+    c = S3FilesConnector(s3env.settings(prefix=prefix), dict(s3env.keys["reader"]))
+    try:
+        with pytest.raises(ConnectorError, match="too much data"):
+            await c.snapshot(prefix + "/b.xlsx")
+    finally:
+        await c.close()

@@ -37,6 +37,10 @@ class RestDriver:
         with self.api.lock:
             del self.api.rows[key]
 
+    async def insert_null_key(self, row: dict[str, Any]) -> None:
+        with self.api.lock:
+            self.api.rows["~nokey"] = {**row, "id": None}
+
 
 @pytest.fixture
 def api() -> Iterator[MockApi]:
@@ -58,6 +62,7 @@ def settings(api: MockApi, **over: Any) -> dict[str, Any]:
         "pagination": "page_number",
         "page_size": 2,
         "allow_http": True,  # local mock server only
+        "allow_private_network": True,  # the mock API listens on 127.0.0.1
         "timeout_s": 5,
     }
     s.update(over)
@@ -99,12 +104,12 @@ def seeded(api: MockApi) -> MockApi:
 
 @pytest.mark.parametrize("url", ["ftp://example.com/x", "file:///etc/passwd", "gopher://127.0.0.1:6379/_", "//x"])
 async def test_non_http_schemes_are_refused(url: str) -> None:
-    c = RestConnector({"base_url": url, "allow_http": True}, {})
+    c = RestConnector({"base_url": url, "allow_http": True, "allow_private_network": True}, {})
     with pytest.raises(ConnectorError) as e:
         await c.fetch_all()
     assert e.value.hint
     report = await c.test()
-    assert not report.ok and report.steps[0].name == "Check the address"
+    assert not report.ok and report.steps[-1].name == "Check the address"
     await c.close()
 
 
@@ -112,7 +117,7 @@ async def test_plain_http_needs_allow_http(api: MockApi) -> None:
     c = RestConnector(settings(api, allow_http=False), {"api_key": API_KEY})
     report = await c.test()
     assert not report.ok
-    assert "https" in report.steps[0].hint.lower()
+    assert "https" in report.steps[-1].hint.lower()
     assert api.requests == 0, "nothing may be sent over plain http unless allowed"
     await c.close()
 
@@ -220,3 +225,127 @@ def test_select_path() -> None:
     assert select_path(doc, "") is doc
     assert select_path(doc, "data.missing") is None
     assert select_path(doc, "results.5") is None
+
+
+# -- LIVEOPS-21: outbound network policy ---------------------------------------
+
+
+async def test_loopback_refused_by_default(seeded: MockApi) -> None:
+    c = RestConnector(settings(seeded, allow_private_network=False), {"api_key": API_KEY})
+    report = await c.test()
+    await c.close()
+    assert not report.ok
+    step = report.steps[-1]
+    assert "private or local network" in step.detail and "Allow private network" in step.hint
+    assert seeded.requests == 0, "no request may reach a private address without the opt-in"
+
+
+async def test_loopback_host_name_refused_after_dns(seeded: MockApi) -> None:
+    c = RestConnector(
+        settings(seeded, base_url=f"http://localhost:{seeded.port}", allow_private_network=False), {"api_key": API_KEY}
+    )
+    with pytest.raises(ConnectorError, match="private or local"):
+        await c.fetch_all()
+    await c.close()
+    assert seeded.requests == 0
+
+
+@pytest.mark.parametrize(
+    "base",
+    [
+        "http://169.254.169.254",
+        "http://[fe80::1]",
+        "http://[::ffff:169.254.169.254]",
+        "http://metadata.google.internal",
+        "http://0.0.0.0:80",
+        "http://100.100.100.200",
+    ],
+)
+async def test_metadata_and_link_local_always_refused(base: str) -> None:
+    c = RestConnector(
+        {"base_url": base, "path": "/latest/meta-data/", "allow_http": True, "allow_private_network": True}, {}
+    )
+    with pytest.raises(ConnectorError, match="blocked"):
+        await c.fetch_all()
+    await c.close()
+
+
+async def test_policy_checks_resolved_ip_on_every_request(seeded: MockApi, monkeypatch: pytest.MonkeyPatch) -> None:
+    """DNS rebinding: a name that resolves to a public IP first and loopback later is refused later."""
+    import ipaddress
+
+    from app.connectors import netguard
+
+    answers = iter([[ipaddress.ip_address("127.0.0.1")], [ipaddress.ip_address("169.254.169.254")]])
+
+    async def fake_resolve(host: str, port: int) -> list[Any]:
+        return next(answers)
+
+    monkeypatch.setattr(netguard, "resolve", fake_resolve)
+    c = RestConnector(
+        settings(seeded, base_url=f"http://api.example.test:{seeded.port}", pagination="none"), {"api_key": API_KEY}
+    )
+    try:
+        assert len(await c.fetch_all()) == 7  # 1st request: allowed private IP, pinned (Host header kept)
+        with pytest.raises(ConnectorError, match="blocked"):
+            await c.fetch_all()  # 2nd request: same name now points at the metadata service
+    finally:
+        await c.close()
+
+
+def test_check_ip_policy() -> None:
+    import ipaddress
+
+    from app.connectors.netguard import check_ip
+
+    check_ip(ipaddress.ip_address("8.8.8.8"), allow_private=False)
+    check_ip(ipaddress.ip_address("10.1.2.3"), allow_private=True)
+    for private in ("10.1.2.3", "192.168.1.1", "172.16.0.1", "127.0.0.1", "::1", "fd00::1", "100.64.0.1"):
+        with pytest.raises(ConnectorError, match="private"):
+            check_ip(ipaddress.ip_address(private), allow_private=False)
+    for blocked in ("169.254.169.254", "169.254.1.1", "fe80::1", "224.0.0.1", "0.0.0.0", "fd00:ec2::254"):
+        with pytest.raises(ConnectorError, match="blocked"):
+            check_ip(ipaddress.ip_address(blocked), allow_private=True)
+
+
+# -- LIVEOPS-20: test() never raises on malformed settings ----------------------
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"query": "[object Object]"},
+        {"query": {"a": {"nested": 1}}},
+        {"page_size": "100"},
+        {"max_pages": True},
+        {"allow_http": "yes"},
+        {"auth": "magic"},
+        {"timeout_s": -1},
+        {"base_url": 42},
+    ],
+)
+async def test_malformed_settings_fail_test_step_without_raising(api: MockApi, bad: dict[str, Any]) -> None:
+    c = RestConnector({**settings(api), **bad}, {"api_key": API_KEY})
+    report = await c.test()
+    await c.close()
+    assert not report.ok
+    step = report.steps[0]
+    assert step.name == "Check the settings" and step.hint
+    assert next(iter(bad)) in step.detail
+    assert "[object Object]" not in report.model_dump_json(), "errors must not echo the bad value"
+    with pytest.raises(ConnectorError):
+        await c.snapshot("assets")
+
+
+# -- LIVEOPS-34: complete or raise ------------------------------------------------
+
+
+async def test_snapshot_over_row_cap_raises_not_truncates(seeded: MockApi) -> None:
+    c = RestConnector(settings(seeded), {"api_key": API_KEY})
+    try:
+        assert len(await c.fetch_all(max_records=7)) == 7
+        with pytest.raises(ConnectorError, match="more than 6 rows") as e:
+            await c.fetch_all(max_records=6)
+        assert "filter" in e.value.hint
+    finally:
+        await c.close()

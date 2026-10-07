@@ -100,10 +100,10 @@ class TestWebhookContract(ConnectorContract):
         yield wh
 
     def make_connector(self, driver: WebhookDriver) -> Connector:  # type: ignore[override]
-        return WebhookConnector({"key_field": "id"}, {"signing_secret": driver.secret})
+        return WebhookConnector({"key_field": "id"}, {"signing_secret": driver.secret}, source_id=driver.source_id)
 
     def make_bad_connector(self, driver: WebhookDriver) -> Connector:  # type: ignore[override]
-        return WebhookConnector({"key_field": "id"}, {"signing_secret": "short"})
+        return WebhookConnector({"key_field": "id"}, {"signing_secret": "short"}, source_id=driver.source_id)
 
 
 # -- focused tests through the route ------------------------------------------
@@ -195,11 +195,12 @@ async def test_list_body_and_delete_reach_stream(wh: WebhookDriver) -> None:
     r = await wh.post([{"id": "B1", "status": "free"}, {"id": "B2", "status": "in_use"}])
     assert r.json() == {"accepted": 2}
     await wh.post({"id": "B1", "_deleted": True})
-    c = WebhookConnector({"key_field": "id"}, {"signing_secret": wh.secret})
+    c = WebhookConnector({"key_field": "id"}, {"signing_secret": wh.secret}, source_id=wh.source_id)
     gen = c.stream("events", ["id"]).__aiter__()
     try:
         first = await gen.__anext__()
         assert first.key == "B2" and first.op == ChangeOp.UPSERT and "_deleted" not in first.record
+        assert (await gen.__anext__()).op == ChangeOp.SNAPSHOT_END
         t0 = time.monotonic()
         await wh.post({"id": "B2", "_deleted": True})
         ch = await gen.__anext__()
@@ -214,7 +215,7 @@ async def test_state_buffer_is_bounded(client: httpx.AsyncClient) -> None:
     source_id, secret = await make_source(client, max_records=5)
     d = WebhookDriver(client, source_id, secret)
     await d.post([{"id": str(i)} for i in range(20)])
-    c = WebhookConnector({"key_field": "id", "max_records": 5}, {"signing_secret": secret})
+    c = WebhookConnector({"key_field": "id", "max_records": 5}, {"signing_secret": secret}, source_id=source_id)
     assert [r["id"] for r in await c.preview("events")] == ["15", "16", "17", "18", "19"]
 
 
@@ -242,8 +243,9 @@ async def test_slow_consumer_gets_clear_error_then_restarts_from_state(monkeypat
 
     monkeypatch.setattr(wmod, "SUBSCRIBER_QUEUE", 3)
     secret = uuid.uuid4().hex
-    c = WebhookConnector({"key_field": "id"}, {"signing_secret": secret})
+    c = WebhookConnector({"key_field": "id"}, {"signing_secret": secret}, source_id=uuid.uuid4().hex)
     gen = c.stream("events", ["id"]).__aiter__()
+    assert (await gen.__anext__()).op == ChangeOp.SNAPSHOT_END  # empty state, then the marker
     first = asyncio.ensure_future(gen.__anext__())
     await asyncio.sleep(0)  # subscribed, waiting for events
     wmod.HUB.publish(c.channel, "id", [{"id": "1"}], time.time())
@@ -255,4 +257,83 @@ async def test_slow_consumer_gets_clear_error_then_restarts_from_state(monkeypat
     restarted = c.stream("events", ["id"]).__aiter__()
     keys = {(await restarted.__anext__()).key for _ in range(10)}
     assert keys == {str(i) for i in range(10)}
+    assert (await restarted.__anext__()).op == ChangeOp.SNAPSHOT_END
     await restarted.aclose()
+
+
+# -- LIVEOPS-17: strict signature header, no padded replays --------------------
+
+
+@pg
+@pytest.mark.parametrize("pad", [b"\xa0", b"\x85", b" ", b"\t", b"\xa0\xa0"])
+async def test_padded_signature_replay_is_refused(wh: WebhookDriver, pad: bytes) -> None:
+    body = json.dumps({"id": "P1", "status": "free"}).encode()
+    headers = signed_headers(wh.secret, body)
+    url = f"/api/webhooks/{wh.source_id}"
+    assert (await wh.client.post(url, content=body, headers=headers)).status_code == 202
+    padded = {**headers, SIGNATURE_HEADER: headers[SIGNATURE_HEADER].encode() + pad}
+    r = await wh.client.post(url, content=body, headers=padded)  # type: ignore[arg-type]
+    assert r.status_code == 401, r.text
+    assert "64 lowercase hex" in r.json()["detail"]["message"]
+
+
+@pg
+async def test_padded_signature_is_refused_even_on_first_use(wh: WebhookDriver) -> None:
+    body = b'{"id":"P2"}'
+    headers = signed_headers(wh.secret, body)
+    headers[SIGNATURE_HEADER] = headers[SIGNATURE_HEADER] + " "
+    r = await wh.client.post(f"/api/webhooks/{wh.source_id}", content=body, headers=headers)
+    assert r.status_code == 401
+
+
+def test_signature_format_is_strict() -> None:
+    now = 1_800_000_000
+    good = sign("s" * 20, str(now), b"{}")
+    assert verify("s" * 20, str(now), good, b"{}", now=now) == good.removeprefix("sha256=")
+    hexpart = good.removeprefix("sha256=")
+    for bad in (
+        good.upper(),
+        "SHA256=" + hexpart,
+        "sha256=" + hexpart.upper(),
+        good + "\xa0",
+        "\x85" + good,
+        good[:-1],
+        "sha256=" + "١" * 64,  # Arabic-Indic digits are not hex
+    ):
+        with pytest.raises(SignatureError):
+            verify("s" * 20, str(now), bad, b"{}", now=now)
+    for bad_ts in (f" {now}", f"{now}\xa0", f"+{now}", "١٢", f"{now}.0"):
+        with pytest.raises(SignatureError):
+            verify("s" * 20, bad_ts, good, b"{}", now=now)
+
+
+# -- LIVEOPS-31: buffers are per source id, not per secret ----------------------
+
+
+@pg
+async def test_sources_sharing_a_secret_do_not_share_data(client: httpx.AsyncClient) -> None:
+    secret = uuid.uuid4().hex
+    ids = []
+    for name in ("wh-a", "wh-b"):
+        r = await client.post(
+            "/api/sources",
+            json={
+                "name": name,
+                "type": "webhook",
+                "settings": {"key_field": "id"},
+                "secrets": {"signing_secret": secret},
+            },
+        )
+        ids.append(r.json()["id"])
+    a = WebhookDriver(client, ids[0], secret)
+    assert (await a.post({"id": "X1", "status": "in_use"})).status_code == 202
+    prev_a = await client.get(f"/api/sources/{ids[0]}/preview", params={"dataset": "events"})
+    prev_b = await client.get(f"/api/sources/{ids[1]}/preview", params={"dataset": "events"})
+    assert [r["id"] for r in prev_a.json()] == ["X1"]
+    assert prev_b.json() == []
+
+
+async def test_unsaved_webhook_source_reports_clearly() -> None:
+    c = WebhookConnector({"key_field": "id"}, {"signing_secret": "x" * 20})
+    report = await c.test()
+    assert not report.ok and "Save the source" in report.steps[-1].hint

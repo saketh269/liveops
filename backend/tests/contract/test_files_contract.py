@@ -78,6 +78,10 @@ class CsvDriver:
         del self.rows[key]
         self._write()
 
+    async def insert_null_key(self, row: dict[str, Any]) -> None:
+        self.rows["~nokey"] = {**row, "id": ""}  # empty CSV cell -> None
+        self._write()
+
 
 class TestCsvFileContract(ConnectorContract):
     latency_budget_s = 3.0
@@ -144,9 +148,20 @@ async def test_symlinks_and_other_files_are_not_listed(data_dir: Path, tmp_path:
         await c.snapshot("../outside.csv")
 
 
-async def test_no_folder_yet_says_upload(data_dir: Path) -> None:
-    report = await CsvFileConnector({}, {}).test()
+async def test_no_file_yet_says_upload(data_dir: Path) -> None:
+    report = await CsvFileConnector({}, {}, source_id="src123").test()
     assert not report.ok and "Upload" in report.steps[0].hint
+    unsaved = await CsvFileConnector({}, {}).test()
+    assert not unsaved.ok and "Save the source" in unsaved.steps[0].hint
+
+
+async def test_folder_defaults_to_source_id(data_dir: Path) -> None:
+    (data_dir / "src123").mkdir()
+    (data_dir / "src123" / "a.csv").write_text("id\n1\n")
+    (data_dir / "other").mkdir()
+    (data_dir / "other" / "b.csv").write_text("id\n2\n")
+    names = [d.name for d in await CsvFileConnector({}, {}, source_id="src123").discover()]
+    assert names == ["a.csv"]
 
 
 def test_csv_edge_cases() -> None:
@@ -204,7 +219,7 @@ async def test_upload_then_test_and_preview(client: httpx.AsyncClient, data_dir:
     assert r.status_code == 201, r.text
     assert r.json()["rows"] == 3 and r.json()["dataset"] == "My_Beds__v2_.csv"
     assert (data_dir / sid / "My_Beds__v2_.csv").is_file()
-    assert (await client.get(f"/api/sources/{sid}")).json()["settings"]["folder"] == sid
+    assert not (await client.get(f"/api/sources/{sid}")).json()["settings"].get("folder")  # source id is the folder
     assert (await client.post(f"/api/sources/{sid}/test")).json()["ok"] is True
     rows = (await client.get(f"/api/sources/{sid}/preview", params={"dataset": "My_Beds__v2_.csv"})).json()
     assert [x["id"] for x in rows] == ["A1", "A2", "A3"]
@@ -256,3 +271,171 @@ async def test_upload_only_for_file_sources(client: httpx.AsyncClient) -> None:
     )
     r = await upload(client, r.json()["id"], "a.csv", b"id\n1\n")
     assert r.status_code == 422
+
+
+# -- LIVEOPS-18: upload limit enforced while streaming ---------------------------
+
+
+class _Body:
+    """Multipart body served in chunks; records how much the server pulled."""
+
+    def __init__(self, filename: str, total: int, chunk: int = 64 * 1024) -> None:
+        self.boundary = "liveopsboundary123"
+        self.head = (
+            f'--{self.boundary}\r\nContent-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+            "Content-Type: text/csv\r\n\r\nid\n"
+        ).encode()
+        self.tail = f"\r\n--{self.boundary}--\r\n".encode()
+        self.total, self.chunk, self.sent = total, chunk, 0
+
+    @property
+    def length(self) -> int:
+        return len(self.head) + self.total + len(self.tail)
+
+    async def stream(self) -> AsyncIterator[bytes]:
+        self.sent += len(self.head)
+        yield self.head
+        left = self.total
+        while left > 0:
+            n = min(self.chunk, left)
+            left -= n
+            self.sent += n
+            line = b"1," + b"x" * 61 + b"\n"  # 64-byte rows: ~16k rows per MB, under the row cap
+            yield line * (n // 64) + b"x" * (n % 64)
+        self.sent += len(self.tail)
+        yield self.tail
+
+
+@requires_pg
+async def test_oversized_upload_refused_by_content_length_before_reading(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch, data_dir: Path
+) -> None:
+    monkeypatch.setenv("LIVEOPS_MAX_UPLOAD_MB", "1")
+    get_settings.cache_clear()
+    sid = await new_source(client)
+    body = _Body("big.csv", 200 * 1024 * 1024)
+    r = await client.post(
+        f"/api/sources/{sid}/upload",
+        content=body.stream(),
+        headers={
+            "Content-Type": f"multipart/form-data; boundary={body.boundary}",
+            "Content-Length": str(body.length),
+        },
+    )
+    assert r.status_code == 413, r.text
+    assert body.sent <= 64 * 1024 + len(body.head), f"server pulled {body.sent} bytes before refusing"
+    assert not _found(data_dir, "big.csv") and not _found(data_dir, ".upload-*")
+
+
+@requires_pg
+async def test_oversized_chunked_upload_stops_at_the_limit(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch, data_dir: Path
+) -> None:
+    monkeypatch.setenv("LIVEOPS_MAX_UPLOAD_MB", "1")
+    get_settings.cache_clear()
+    sid = await new_source(client)
+    body = _Body("big.csv", 200 * 1024 * 1024)  # no Content-Length: chunked
+    r = await client.post(
+        f"/api/sources/{sid}/upload",
+        content=body.stream(),
+        headers={"Content-Type": f"multipart/form-data; boundary={body.boundary}"},
+    )
+    assert r.status_code == 413, r.text
+    assert body.sent < 2 * 1024 * 1024, f"server read {body.sent} bytes of a 200 MB body"
+    assert not _found(data_dir, "big.csv") and not _found(data_dir, ".upload-*")
+
+
+@requires_pg
+async def test_upload_just_under_limit_is_accepted(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch, data_dir: Path
+) -> None:
+    monkeypatch.setenv("LIVEOPS_MAX_UPLOAD_MB", "1")
+    get_settings.cache_clear()
+    sid = await new_source(client)
+    body = _Body("ok.csv", 1024 * 1024 - 100)
+    r = await client.post(
+        f"/api/sources/{sid}/upload",
+        content=body.stream(),
+        headers={"Content-Type": f"multipart/form-data; boundary={body.boundary}"},
+    )
+    assert r.status_code == 201, r.text
+
+
+@requires_pg
+async def test_upload_without_multipart_is_422(client: httpx.AsyncClient) -> None:
+    sid = await new_source(client)
+    r = await client.post(f"/api/sources/{sid}/upload", content=b"id\n1\n", headers={"Content-Type": "text/csv"})
+    assert r.status_code == 422 and "multipart" in r.json()["detail"]["message"]
+
+
+# -- LIVEOPS-19: xlsx decompression bomb -----------------------------------------
+
+
+def _bomb(size: int) -> bytes:
+    """A valid .xlsx whose sharedStrings.xml inflates to ``size`` bytes."""
+    import zipfile
+
+    base = xlsx_bytes([["id", "status"], ["B1", "free"]])
+    src = zipfile.ZipFile(io.BytesIO(base))
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+        for info in src.infolist():
+            z.writestr(info, src.read(info.filename))
+        payload = b'<?xml version="1.0"?><sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        payload += b"<si><t>" + b"a" * size + b"</t></si></sst>"
+        z.writestr("xl/sharedStrings.xml", payload)
+    return out.getvalue()
+
+
+def test_xlsx_bomb_is_refused_before_parsing() -> None:
+    import time
+    import tracemalloc
+
+    data = _bomb(50 * 1024 * 1024)
+    assert len(data) < 200 * 1024, len(data)
+    tracemalloc.start()
+    t0 = time.monotonic()
+    with pytest.raises(ConnectorError, match="too much data") as e:
+        parse_xlsx(data)
+    elapsed = time.monotonic() - t0
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    assert "CSV" in e.value.hint
+    assert elapsed < 0.5 and peak < 5 * 1024 * 1024, (elapsed, peak)
+
+
+def test_xlsx_total_size_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.connectors import files
+
+    monkeypatch.setattr(files, "XLSX_MAX_UNCOMPRESSED", 1000)
+    with pytest.raises(ConnectorError, match="too much data"):
+        parse_xlsx(xlsx_bytes([["id"], ["B1"]]))
+
+
+def test_normal_xlsx_still_reads() -> None:
+    rows = [["id", "status"]] + [[f"B{i}", "free"] for i in range(5000)]
+    assert len(parse_xlsx(xlsx_bytes(rows))) == 5000
+
+
+def test_xlsx_cell_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.connectors import files
+
+    monkeypatch.setattr(files, "XLSX_MAX_CELLS", 10)
+    with pytest.raises(ConnectorError, match="cells"):
+        parse_xlsx(xlsx_bytes([["id", "a", "b"]] + [[i, 1, 2] for i in range(10)]))
+
+
+# -- LIVEOPS-34: complete or raise ------------------------------------------------
+
+
+def test_file_parsers_raise_past_row_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.connectors import files
+
+    monkeypatch.setattr(files, "MAX_ROWS", 3)
+    with pytest.raises(ConnectorError, match="more than 3 rows"):
+        files.parse_csv(b"id\n1\n2\n3\n4\n")
+    with pytest.raises(ConnectorError, match="more than 3 rows"):
+        files.parse_xlsx(xlsx_bytes([["id"], [1], [2], [3], [4]]))
+    with pytest.raises(ConnectorError, match="more than 3 rows"):
+        files.parse_jsonl(b'{"id":1}\n{"id":2}\n{"id":3}\n{"id":4}\n')
+    assert len(files.parse_csv(b"id\n1\n2\n3\n")) == 3
