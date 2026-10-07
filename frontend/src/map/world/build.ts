@@ -92,7 +92,12 @@ export class RoomTiles {
       const contour = poly.map(([x, y]) => new THREE.Vector2(x, y));
       const tris = THREE.ShapeUtils.triangulateShape(contour, []);
       const start = pos.length / 3;
-      for (const t of tris) for (const k of t) { const v = toWorld(poly[k][0], poly[k][1]); pos.push(v.x, WORLD.tileY, v.z); }
+      for (const t of tris) {
+        const [a, b, c] = t.map((k) => toWorld(poly[k][0], poly[k][1]));
+        // Wind every triangle to face up: a downward face would be lit from below (dark tiles).
+        const up = (b.z - a.z) * (c.x - a.x) - (b.x - a.x) * (c.z - a.z) > 0;
+        for (const v of up ? [a, b, c] : [a, c, b]) pos.push(v.x, WORLD.tileY, v.z);
+      }
       this.ranges.set(z.id, [start, pos.length / 3]);
     }
     if (!pos.length) { this.mesh = null; return; }
@@ -104,7 +109,7 @@ export class RoomTiles {
     this.col = new THREE.BufferAttribute(new Float32Array((pos.length / 3) * 4), 4);
     this.col.setUsage(THREE.DynamicDrawUsage);
     geo.setAttribute("color", this.col);
-    const mat = new THREE.MeshLambertMaterial({ vertexColors: true, transparent: true, depthWrite: false, side: THREE.DoubleSide });
+    const mat = new THREE.MeshLambertMaterial({ vertexColors: true, transparent: true, depthWrite: false });
     this.mesh = new THREE.Mesh(geo, mat);
     this.mesh.name = "room-tiles";
     this.mesh.receiveShadow = true;
@@ -274,10 +279,11 @@ function chairs(bake: Baker, z: Zone, p: ScenePalette, toWorld: (x: number, y: n
 function buildSite(width: number, depth: number, entrances: readonly Entrance[], p: ScenePalette, mat: MakeMat, software: boolean): THREE.Object3D[] {
   const out: THREE.Object3D[] = [];
   const size = Math.max(width, depth) * 4 + 200;
-  // The grass is a full-screen plane: on a software renderer the clear color (same
-  // grass color, see BuiltWorld.background) shows instead, at no per-pixel cost.
+  // The grass itself is the clear color (BuiltWorld.background, `p.ground` exactly as
+  // seen, the same on every renderer). On a GPU a shadow-only plane over it catches the
+  // shadows of the building and trees; software renderers skip that full-screen plane.
   if (!software) {
-    const ground = new THREE.Mesh(new THREE.PlaneGeometry(size, size), mat({ color: p.ground, roughness: 1 }));
+    const ground = new THREE.Mesh(new THREE.PlaneGeometry(size, size), new THREE.ShadowMaterial({ color: p.groundShadow, opacity: 0.18 }));
     ground.rotation.x = -Math.PI / 2;
     ground.position.y = -WORLD.slabThickness - 0.01;
     ground.receiveShadow = true;

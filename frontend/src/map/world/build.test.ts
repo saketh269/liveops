@@ -1,5 +1,6 @@
 import type { Zone } from "../../api/types";
-import { bayKerbs, buildWorld, chairSpots } from "./build";
+import * as THREE from "three";
+import { RoomTiles, bayKerbs, buildWorld, chairSpots } from "./build";
 import { PALETTES } from "./style";
 import { pointInPolygon } from "../placement";
 
@@ -69,5 +70,25 @@ describe("buildWorld", () => {
     expect(slab.material.type).toBe("MeshLambertMaterial");
     const upper = buildWorld({ width: 10, depth: 10, zones: [], entrances: [], ground: false, palette: PALETTES.light, software: false, fonts: { data: "monospace", body: "sans-serif" } });
     expect(upper.background).toBe(PALETTES.light.sky);
+  });
+});
+
+describe("RoomTiles", () => {
+  test("every tile triangle faces up, whatever the polygon's winding (a downward face is lit from below)", () => {
+    const toWorld = (x: number, y: number) => new THREE.Vector3(x, 0, y);
+    const cw = rect(0, 0, 4, 5);
+    const tiles = new RoomTiles([
+      { id: "ccw", name: "a", kind: "room", polygon: cw },
+      { id: "cw", name: "b", kind: "room", polygon: [...cw].reverse() },
+      { id: "L", name: "c", kind: "room", polygon: [[10, 0], [14, 0], [14, 2], [12, 2], [12, 5], [10, 5]] },
+    ], toWorld);
+    const pos = tiles.mesh!.geometry.getAttribute("position");
+    const v = [new THREE.Vector3(), new THREE.Vector3(), new THREE.Vector3()];
+    expect(pos.count % 3).toBe(0);
+    for (let i = 0; i < pos.count; i += 3) {
+      v.forEach((p, k) => p.fromBufferAttribute(pos, i + k));
+      const n = new THREE.Vector3().crossVectors(v[1].clone().sub(v[0]), v[2].clone().sub(v[0]));
+      expect(n.y).toBeGreaterThan(0);
+    }
   });
 });

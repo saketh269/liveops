@@ -13,7 +13,10 @@ export type ScenePalette = {
   theme: ThemeName;
   /** Canvas clear color behind the world. */
   sky: string;
+  /** Grass around the ground floor, exactly as seen (it is the clear color, unlit). */
   ground: string;
+  /** Tint of the shadows cast on the grass. */
+  groundShadow: string;
   road: string;
   roadLine: string;
   slab: string;
@@ -57,8 +60,9 @@ export type ScenePalette = {
 const LIGHT: ScenePalette = {
   theme: "light",
   sky: "#e9eef3",
-  ground: "#c9d6cf",
-  road: "#5b6672",
+  ground: "#e2e8e3",
+  groundShadow: "#34465a",
+  road: "#c3c9cf",
   roadLine: "#f4f6f8",
   slab: "#ffffff",
   floor: "#eef2f6",
@@ -78,7 +82,7 @@ const LIGHT: ScenePalette = {
   deskTop: "#0b7a83",
   screen: "#24384c",
   chair: "#9bb3c9",
-  tree: "#6bb38a",
+  tree: "#8fc8a4",
   trunk: "#9a7b5f",
   tint: {
     free: { color: "#1f9d68", strength: 0.55 },
@@ -93,14 +97,15 @@ const LIGHT: ScenePalette = {
   hemiIntensity: 1.25,
   sunColor: "#fff1df",
   sunIntensity: 3.2,
-  exposure: 0.92,
+  exposure: 1.02,
   roughness: 0.75,
 };
 
 const DARK: ScenePalette = {
   theme: "dark",
   sky: "#0c1418",
-  ground: "#1b2b25",
+  ground: "#13201c",
+  groundShadow: "#000000",
   road: "#2b3640",
   roadLine: "#4b5a66",
   slab: "#33464f",
