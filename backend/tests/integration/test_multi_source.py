@@ -84,14 +84,14 @@ async def test_two_sources_merge_into_one_asset(
 
     ehr_db, ehr_role = source_db_factory(
         [
-            "CREATE TABLE beds (bed_id text PRIMARY KEY, unit text, status text)",
-            "INSERT INTO beds VALUES ('B01','ICU','free'), ('B02','ER','occupied')",
+            "CREATE TABLE beds (bed_id text PRIMARY KEY, unit text, status text, patient_count int)",
+            "INSERT INTO beds VALUES ('B01','ICU','free',0), ('B02','ER','occupied',1)",
         ]
     )
     hk_db, hk_role = source_db_factory(
         [
-            "CREATE TABLE cleaning (bed_id text PRIMARY KEY, cleaning_status text)",
-            "INSERT INTO cleaning VALUES ('B01','due')",
+            "CREATE TABLE cleaning (bed_id text PRIMARY KEY, cleaning_status text, cleaner text)",
+            "INSERT INTO cleaning VALUES ('B01','due','C0')",
         ]
     )
     p = pg_params()
@@ -120,6 +120,7 @@ async def test_two_sources_merge_into_one_asset(
                             "id_field": "bed_id",
                             "match_key": "bed_id",
                             "fields": {"zone": "unit", "state": "status"},
+                            "attributes": ["patient_count"],
                             "state_map": {"occupied": "in_use"},
                             "kind": "bed",
                         },
@@ -131,6 +132,7 @@ async def test_two_sources_merge_into_one_asset(
                             "id_field": "bed_id",
                             "match_key": "bed_id",
                             "fields": {"cleaning": "cleaning_status"},
+                            "attributes": ["cleaner"],
                         },
                     },
                 ):
@@ -145,7 +147,16 @@ async def test_two_sources_merge_into_one_asset(
                 )
                 b01 = s.assets["B01"]
                 assert b01["state"] == "free" and b01["zone"] == "ICU" and b01["cleaning"] == "due"
-                assert b01["_sources"] == {"state": ehr_id, "zone": ehr_id, "kind": ehr_id, "cleaning": hk_id}
+                assert b01["_sources"] == {
+                    "state": ehr_id,
+                    "zone": ehr_id,
+                    "kind": ehr_id,
+                    "cleaning": hk_id,
+                    "attributes.patient_count": ehr_id,
+                    "attributes.cleaner": hk_id,
+                }
+                # LIVEOPS-44: both sources' attributes survive, whichever polled last.
+                assert b01["attributes"] == {"patient_count": 0, "cleaner": "C0"}
                 s.wait_for(lambda s: "B02" in s.assets, "B02")
                 assert "cleaning" not in s.assets["B02"] and s.assets["B02"]["state"] == "in_use"
 

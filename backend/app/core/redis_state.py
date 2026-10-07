@@ -28,34 +28,31 @@ import asyncio
 import contextlib
 import json
 import logging
+import time
 from typing import Any
 
 import redis.asyncio as aioredis
 from redis.exceptions import RedisError
 
 from app.core.eventlog import DEFAULT_MAXLEN, EventEntry, RedisEventLog
-from app.core.events import Asset, AssetEvent, AssetOp, FieldValue, StreamMessage
+from app.core.events import Asset, AssetEvent, AssetOp, FieldValue, StreamMessage, expand_attributes, fold_attributes
 from app.core.state import StateStore, event_messages
 
 log = logging.getLogger("liveops.state.redis")
 
-# KEYS: 1 asset hash, 2 site index, 3 event stream, 4 channel
-# ARGV: 1 op, 2 site_id, 3 asset_id, 4 source_id, 5 mapping_id, 6 received_ts,
-#       7 log maxlen, then pairs of (field name, value JSON) for upserts.
-# Returns the published payload (JSON text) or false when nothing visible changed.
-_APPLY_LUA = r"""
-local akey, ikey, lkey, chan = KEYS[1], KEYS[2], KEYS[3], KEYS[4]
-local op, site, asset, src, mapping, ts_s = ARGV[1], ARGV[2], ARGV[3], ARGV[4], ARGV[5], ARGV[6]
-local ts = tonumber(ts_s)
+# Shared by the apply and reconcile scripts. Values stay opaque JSON text.
+_LUA_LIB = r"""
 local enc = cjson.encode
-local changes = {}
-local removed = false
 
-if op == 'remove' then
+-- Drop the fields one mapping set on one asset. Returns the list of change
+-- strings ('"name":[old,null]') and whether the asset is now empty, or nil
+-- when the mapping contributed nothing.
+local function remove_mapping(akey, mapping)
   local all = redis.call('HGETALL', akey)
-  if #all == 0 then return false end
+  if #all == 0 then return nil end
   local h = {}
   for i = 1, #all, 2 do h[all[i]] = all[i + 1] end
+  local changes = {}
   for k, v in pairs(h) do
     if string.sub(k, 1, 2) == 'm:' and v == mapping then
       local name = string.sub(k, 3)
@@ -63,66 +60,115 @@ if op == 'remove' then
       redis.call('HDEL', akey, 'f:' .. name, 's:' .. name, 'm:' .. name, 't:' .. name)
     end
   end
-  if #changes == 0 then return false end
-  if redis.call('HLEN', akey) == 0 then
-    redis.call('DEL', akey)
+  if #changes == 0 then return nil end
+  local empty = redis.call('HLEN', akey) == 0
+  if empty then redis.call('DEL', akey) end
+  return changes, empty
+end
+
+-- After a visible change: update the site index, append to the event log,
+-- PUBLISH the message for every process, and return it.
+local function emit(akey, ikey, lkey, chan, site, asset, op, src, mapping, ts_s, maxlen, changes, removed)
+  local asset_json, kind
+  if removed then
+    kind = 'remove'
     redis.call('ZREM', ikey, asset)
-    removed = true
-  end
-else
-  local changed = false
-  for i = 7 + 1, #ARGV, 2 do
-    local name, val = ARGV[i], ARGV[i + 1]
-    local cur = redis.call('HMGET', akey, 'f:' .. name, 's:' .. name, 't:' .. name)
-    if not (cur[3] and tonumber(cur[3]) > ts) then
-      if (not cur[1]) or cur[1] ~= val then
-        table.insert(changes, enc(name) .. ':[' .. (cur[1] or 'null') .. ',' .. val .. ']')
+    asset_json = '{"asset_id":' .. enc(asset) .. '}'
+  else
+    kind = 'upsert'
+    redis.call('ZADD', ikey, tonumber(ts_s), asset)
+    local all = redis.call('HGETALL', akey)
+    local vals, srcs = {}, {}
+    for i = 1, #all, 2 do
+      local p, name = string.sub(all[i], 1, 2), string.sub(all[i], 3)
+      if p == 'f:' then
+        table.insert(vals, enc(name) .. ':' .. all[i + 1])
+      elseif p == 's:' then
+        table.insert(srcs, enc(name) .. ':' .. enc(all[i + 1]))
       end
-      if (not cur[1]) or cur[1] ~= val or cur[2] ~= src then changed = true end
-      redis.call('HSET', akey, 'f:' .. name, val, 's:' .. name, src, 'm:' .. name, mapping, 't:' .. name, ts_s)
     end
+    local body = '"site_id":' .. enc(site) .. ',"asset_id":' .. enc(asset) .. ',"updated_ts":' .. ts_s
+    if #vals > 0 then body = body .. ',' .. table.concat(vals, ',') end
+    asset_json = '{' .. body .. ',"_sources":{' .. table.concat(srcs, ',') .. '}}'
   end
-  if not changed then return false end
-end
-
-local asset_json
-local kind
-if removed then
-  kind = 'remove'
-  asset_json = '{"asset_id":' .. enc(asset) .. '}'
-else
-  kind = 'upsert'
-  redis.call('ZADD', ikey, ts, asset)
-  local all = redis.call('HGETALL', akey)
-  local vals, srcs = {}, {}
-  for i = 1, #all, 2 do
-    local p, name = string.sub(all[i], 1, 2), string.sub(all[i], 3)
-    if p == 'f:' then
-      table.insert(vals, enc(name) .. ':' .. all[i + 1])
-    elseif p == 's:' then
-      table.insert(srcs, enc(name) .. ':' .. enc(all[i + 1]))
-    end
+  local entry = 'null'
+  if #changes > 0 then
+    local t = redis.call('TIME')
+    local now = string.format('%d.%06d', tonumber(t[1]), tonumber(t[2]))
+    entry = '{"ts":' .. now .. ',"site_id":' .. enc(site) .. ',"asset_id":' .. enc(asset)
+      .. ',"op":' .. enc(op) .. ',"removed":' .. tostring(removed)
+      .. ',"source_id":' .. enc(src) .. ',"mapping_id":' .. enc(mapping)
+      .. ',"changes":{' .. table.concat(changes, ',') .. '}}'
+    redis.call('XADD', lkey, 'MAXLEN', '~', maxlen, '*', 'e', entry)
   end
-  local body = '"site_id":' .. enc(site) .. ',"asset_id":' .. enc(asset) .. ',"updated_ts":' .. ts_s
-  if #vals > 0 then body = body .. ',' .. table.concat(vals, ',') end
-  asset_json = '{' .. body .. ',"_sources":{' .. table.concat(srcs, ',') .. '}}'
+  local payload = '{"kind":"' .. kind .. '","asset":' .. asset_json .. ',"event":' .. entry .. '}'
+  redis.call('PUBLISH', chan, payload)
+  return payload
 end
-
-local entry = 'null'
-if #changes > 0 then
-  local t = redis.call('TIME')
-  local now = string.format('%d.%06d', tonumber(t[1]), tonumber(t[2]))
-  entry = '{"ts":' .. now .. ',"site_id":' .. enc(site) .. ',"asset_id":' .. enc(asset)
-    .. ',"op":' .. enc(op) .. ',"removed":' .. tostring(removed)
-    .. ',"source_id":' .. enc(src) .. ',"mapping_id":' .. enc(mapping)
-    .. ',"changes":{' .. table.concat(changes, ',') .. '}}'
-  redis.call('XADD', lkey, 'MAXLEN', '~', ARGV[7], '*', 'e', entry)
-end
-
-local payload = '{"kind":"' .. kind .. '","asset":' .. asset_json .. ',"event":' .. entry .. '}'
-redis.call('PUBLISH', chan, payload)
-return payload
 """
+
+# KEYS: 1 asset hash, 2 site index, 3 event stream, 4 channel
+# ARGV: 1 op, 2 site_id, 3 asset_id, 4 source_id, 5 mapping_id, 6 received_ts,
+#       7 log maxlen, then pairs of (field name, value JSON) for upserts.
+# Returns the published payload (JSON text) or false when nothing visible changed.
+_APPLY_LUA = (
+    _LUA_LIB
+    + r"""
+local akey, ikey, lkey, chan = KEYS[1], KEYS[2], KEYS[3], KEYS[4]
+local op, site, asset, src, mapping, ts_s, maxlen = ARGV[1], ARGV[2], ARGV[3], ARGV[4], ARGV[5], ARGV[6], ARGV[7]
+local ts = tonumber(ts_s)
+
+if op == 'remove' then
+  local changes, removed = remove_mapping(akey, mapping)
+  if not changes then return false end
+  return emit(akey, ikey, lkey, chan, site, asset, op, src, mapping, ts_s, maxlen, changes, removed)
+end
+
+local changes = {}
+local changed = false
+for i = 8, #ARGV, 2 do
+  local name, val = ARGV[i], ARGV[i + 1]
+  local cur = redis.call('HMGET', akey, 'f:' .. name, 's:' .. name, 't:' .. name)
+  if not (cur[3] and tonumber(cur[3]) > ts) then
+    if (not cur[1]) or cur[1] ~= val then
+      table.insert(changes, enc(name) .. ':[' .. (cur[1] or 'null') .. ',' .. val .. ']')
+    end
+    if (not cur[1]) or cur[1] ~= val or cur[2] ~= src then changed = true end
+    redis.call('HSET', akey, 'f:' .. name, val, 's:' .. name, src, 'm:' .. name, mapping, 't:' .. name, ts_s)
+  end
+end
+if not changed then return false end
+return emit(akey, ikey, lkey, chan, site, asset, op, src, mapping, ts_s, maxlen, changes, false)
+"""
+)
+
+# Drop one mapping's fields from every asset of a site not in the keep list,
+# in one call (LIVEOPS-40). Asset keys are built from ARGV[1]; they share the
+# site's hash tag, so they live in the same cluster slot as KEYS.
+# KEYS: 1 site index, 2 event stream, 3 channel
+# ARGV: 1 asset key prefix, 2 site_id, 3 mapping_id, 4 ts, 5 log maxlen, 6.. asset ids to keep
+# Returns how many assets were touched.
+_RECONCILE_LUA = (
+    _LUA_LIB
+    + r"""
+local ikey, lkey, chan = KEYS[1], KEYS[2], KEYS[3]
+local prefix, site, mapping, ts_s, maxlen = ARGV[1], ARGV[2], ARGV[3], ARGV[4], ARGV[5]
+local keep = {}
+for i = 6, #ARGV do keep[ARGV[i]] = true end
+local touched = 0
+for _, asset in ipairs(redis.call('ZRANGE', ikey, 0, -1)) do
+  if not keep[asset] then
+    local akey = prefix .. asset
+    local changes, removed = remove_mapping(akey, mapping)
+    if changes then
+      emit(akey, ikey, lkey, chan, site, asset, 'remove', '', mapping, ts_s, maxlen, changes, removed)
+      touched = touched + 1
+    end
+  end
+end
+return touched
+"""
+)
 
 
 # One consistent read of a whole site, returned as a single JSON document
@@ -159,7 +205,10 @@ def _dumps(value: Any) -> str:
 
 
 def _messages(site_id: str, payload: dict[str, Any]) -> list[StreamMessage]:
-    first = StreamMessage(type=payload["kind"], site_id=site_id, assets=[payload["asset"]])
+    asset = payload["asset"]
+    if payload["kind"] == "upsert":
+        asset = fold_attributes(asset)
+    first = StreamMessage(type=payload["kind"], site_id=site_id, assets=[asset])
     return [first, *event_messages(site_id, payload["event"])]
 
 
@@ -180,6 +229,7 @@ class RedisStateStore(StateStore):
         self._maxlen = eventlog_maxlen
         self._apply_script = redis.register_script(_APPLY_LUA)
         self._snapshot_script = redis.register_script(_SNAPSHOT_LUA)
+        self._reconcile_script = redis.register_script(_RECONCILE_LUA)
         self._log = RedisEventLog(redis, self._log_key)
         # pub/sub, owned by one reader task per process
         self._listening: dict[str, asyncio.Event] = {}  # site -> confirmed subscribed
@@ -225,7 +275,10 @@ class RedisStateStore(StateStore):
         if event.op == AssetOp.UPSERT:
             if not event.fields:
                 return None
-            for name, value in event.fields.items():
+            fields = expand_attributes(event.fields)
+            if not fields:
+                return None
+            for name, value in fields.items():
                 args += [name, _dumps(value)]
         keys = [self._asset_key(s, a), self._index_key(s), self._log_key(s), self._channel(s)]
         raw = await self._apply_script(keys=keys, args=args)
@@ -246,19 +299,20 @@ class RedisStateStore(StateStore):
         return out
 
     async def clear_mapping(self, site_id: str, mapping_id: str) -> None:
-        # The script is a no-op for assets this mapping contributed nothing to.
-        for asset in await self.site_assets(site_id):
-            if any(v.mapping_id == mapping_id for v in asset.fields.values()):
-                await self.apply(
-                    AssetEvent(
-                        site_id=site_id,
-                        asset_id=asset.asset_id,
-                        op=AssetOp.REMOVE,
-                        source_id="",
-                        mapping_id=mapping_id,
-                        dataset="",
-                    )
-                )
+        await self.reconcile(site_id, mapping_id, set())
+
+    async def reconcile(self, site_id: str, mapping_id: str, keep: set[str]) -> int:
+        keys = [self._index_key(site_id), self._log_key(site_id), self._channel(site_id)]
+        args = [f"{self._site(site_id)}:a:", site_id, mapping_id, repr(time.time()), str(self._maxlen), *keep]
+        return int(await self._reconcile_script(keys=keys, args=args))
+
+    @property
+    def redis(self) -> aioredis.Redis:
+        return self._redis
+
+    @property
+    def prefix(self) -> str:
+        return self._prefix
 
     async def events(self, site_id: str, since: float | None = None, limit: int = 100) -> list[EventEntry]:
         return await self._log.query(site_id, since, limit)

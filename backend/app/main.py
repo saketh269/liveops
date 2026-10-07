@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -16,7 +17,7 @@ from app import __version__
 from app.api import mappings, sites, sources, stream, system, uploads, webhooks
 from app.api.deps import mapping_spec
 from app.config import get_settings
-from app.core.runner import RunnerManager
+from app.core.runner import MappingSpec, RunnerManager
 from app.core.state import InMemoryStateStore, StateStore
 from app.db import Mapping, Source, new_session
 from app.secrets import SecretsError
@@ -34,12 +35,37 @@ def make_store() -> StateStore:
     return InMemoryStateStore()
 
 
+async def load_mapping_spec(mapping_id: str) -> MappingSpec | None:
+    """Current spec of an active mapping from the portal DB (None if gone or paused)."""
+
+    def _load() -> MappingSpec | None:
+        with new_session() as s:
+            m = s.get(Mapping, mapping_id)
+            src = s.get(Source, m.source_id) if m is not None else None
+            if m is None or src is None or not m.active:
+                return None
+            return mapping_spec(m, src)
+
+    return await asyncio.to_thread(_load)
+
+
+def make_runner(store: StateStore) -> RunnerManager:
+    """With Redis, processes share mappings through leases (one owner each, LIVEOPS-36)."""
+    from app.core.redis_state import RedisStateStore
+
+    if isinstance(store, RedisStateStore):
+        from app.core.cluster import ClusterRunnerManager
+
+        return ClusterRunnerManager.for_store(store, spec_loader=load_mapping_spec)
+    return RunnerManager(store)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
     logging.basicConfig(level=settings.log_level, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     app.state.store = make_store()
-    app.state.runner = RunnerManager(app.state.store)
+    app.state.runner = make_runner(app.state.store)
     if settings.start_runners:
         with new_session() as s:
             for m in s.scalars(select(Mapping).where(Mapping.active.is_(True))):
@@ -47,7 +73,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 if src is None:
                     continue
                 try:
-                    await app.state.runner.start(mapping_spec(m, src))
+                    await app.state.runner.adopt(mapping_spec(m, src))
                 except SecretsError as e:
                     # One unreadable source must not stop the app (LIVEOPS-41).
                     app.state.runner.mark_error(m.id, src.id, str(e), SECRETS_HINT)
