@@ -1,0 +1,23 @@
+# Hospital simulator (TEST TOOL, ADR 0006). Not part of the product compose file.
+# Points at the sources database you already run (container liveops-sources-db-1,
+# published on host port 5433). From tools/hospital-sim:
+#   docker compose -f docker-compose.sim.yml up --build -d
+#   docker compose -f docker-compose.sim.yml logs -f
+#   docker compose -f docker-compose.sim.yml down
+name: liveops-hospital-sim
+services:
+  hospital-sim:
+    build: .
+    environment:
+      SOURCES_DSN: ${SOURCES_DSN:-postgresql://postgres:liveops@host.docker.internal:5433/sources}
+      SIM_PACE: ${SIM_PACE:-1}
+      SIM_SEED: ${SIM_SEED:-1}
+      SIM_UNITS: ${SIM_UNITS:-ER:8,ICU:6,General:16,Pediatrics:6}
+      SIM_NURSES: ${SIM_NURSES:-}
+      SIM_DOCTORS: ${SIM_DOCTORS:-}
+      SIM_CLEANERS: ${SIM_CLEANERS:-}
+      SIM_AMBULANCES: ${SIM_AMBULANCES:-}
+      SIM_SURGE_EVERY: ${SIM_SURGE_EVERY:-}
+      SIM_RETENTION_MINUTES: ${SIM_RETENTION_MINUTES:-}
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    restart: unless-stopped
