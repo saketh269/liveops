@@ -1,6 +1,14 @@
 // Deterministic placement of assets on the floor plan.
 // Layout coordinates: x across the floor (0..width), y into the floor (0..depth).
+//
+// Anchors (ADR 0006/0007, LIVEOPS-102): a record whose `anchor` names another
+// placed record on the site is drawn relative to it. A patient anchored to a bed
+// lies in it (pose "lying") when its state is in_use; other people anchored to a
+// bed stand at the bedside, facing it, fanned out. People whose zone is a bed id,
+// or a room holding exactly one bed, are treated as anchored to that bed. An
+// anchor that names nothing placed falls back to normal zone placement.
 import type { Asset, SiteLayout, Zone } from "../api/types";
+import { figureOf, isPerson } from "./figures";
 
 export const DEFAULT_WIDTH = 100;
 export const DEFAULT_DEPTH = 60;
@@ -12,9 +20,20 @@ export const UNASSIGNED_SPACING = 2;
 export type Pt = [number, number];
 export type Rect = { x: number; y: number; w: number; h: number };
 
+/** How a figure rests: people lie only in a bed (ADR 0007). */
+export type Pose = "standing" | "lying";
+
 export type Placement = {
   x: number;
   y: number;
+  /** Resting direction (radians, atan2(dy, dx) in layout coordinates); undefined = the model's default. */
+  heading?: number;
+  /** "lying" for a patient in a bed; everything else stands. */
+  pose: Pose;
+  /** Asset this one is drawn relative to (its bed), or null. */
+  anchorId: string | null;
+  /** Where a walker steps to just before taking this place (the bedside of a bed it lies in). */
+  approach?: Pt;
   /** Zone id the asset is drawn in; null for the Unassigned strip or explicit positions outside zones. */
   zoneId: string | null;
   /** Stack level (0 = on the floor). Only above 0 when a zone overflows. */
@@ -145,18 +164,25 @@ export function placeAssets(layout: SiteLayout | null | undefined, assets: Itera
   const { width, depth } = floorSize(layout);
   const positions = new Map<string, Placement>();
   const byZone = new Map<string, string[]>();
+  const beds = new Set<string>();
   const loose: string[] = [];
   const overflow: string[] = [];
 
-  for (const a of assets) {
+  const list = [...assets];
+  const anchorOf = anchorResolver(zones, list);
+  const anchored: Asset[] = [];
+
+  for (const a of list) {
+    if (anchorOf(a)) { anchored.push(a); continue; }
     const zone = resolveZone(zones, a.zone);
     const xy = explicitPosition(a);
     if (xy) {
-      positions.set(a.asset_id, { x: xy[0], y: xy[1], zoneId: zone?.id ?? null, level: 0, size: 1, unassigned: false });
+      positions.set(a.asset_id, { x: xy[0], y: xy[1], zoneId: zone?.id ?? null, level: 0, size: 1, unassigned: false, pose: "standing", anchorId: null });
     } else if (zone) {
-      const list = byZone.get(zone.id) ?? [];
-      list.push(a.asset_id);
-      byZone.set(zone.id, list);
+      const ids = byZone.get(zone.id) ?? [];
+      ids.push(a.asset_id);
+      byZone.set(zone.id, ids);
+      if (figureOf(a) === "bed") beds.add(a.asset_id);
     } else {
       loose.push(a.asset_id);
     }
@@ -170,9 +196,15 @@ export function placeAssets(layout: SiteLayout | null | undefined, assets: Itera
     const slots: Pt[] = points.length ? points : [polygonCentroid(z.polygon)];
     if (slots.length < ids.length) overflow.push(z.id);
     const size = clampSize(spacing || MIN_SPACING);
+    if (ids.length === 1 && beds.has(ids[0])) {
+      // A bed alone in its room: in the middle, pushed back from the door, foot towards the door.
+      const { at, heading } = bedSpot(z);
+      positions.set(ids[0], { x: at[0], y: at[1], heading, zoneId: z.id, level: 0, size: clampSize(Math.sqrt(polygonArea(z.polygon))), unassigned: false, pose: "standing", anchorId: null });
+      continue;
+    }
     ids.forEach((id, i) => {
       const [x, y] = slots[i % slots.length];
-      positions.set(id, { x, y, zoneId: z.id, level: Math.floor(i / slots.length), size, unassigned: false });
+      positions.set(id, { x, y, zoneId: z.id, level: Math.floor(i / slots.length), size, unassigned: false, pose: "standing", anchorId: null });
     });
   }
 
@@ -186,17 +218,177 @@ export function placeAssets(layout: SiteLayout | null | undefined, assets: Itera
     loose.forEach((id, i) => {
       const c = i % cols;
       const r = Math.floor(i / cols);
-      positions.set(id, { x: c * s + s / 2, y: unassigned!.y + r * s + s / 2, zoneId: null, level: 0, size: clampSize(s), unassigned: true });
+      positions.set(id, { x: c * s + s / 2, y: unassigned!.y + r * s + s / 2, zoneId: null, level: 0, size: clampSize(s), unassigned: true, pose: "standing", anchorId: null });
     });
   }
 
+  placeAnchored(zones, anchored, anchorOf, positions, list);
+
   return { positions, unassigned, overflow };
+}
+
+// ---- anchors ----
+
+/** Bed footprint in units of the bed's `size` (figureGeometry: 1 long, 0.6 wide). */
+const BED_HALF_WIDTH = 0.3;
+const BED_HALF_LENGTH = 0.5;
+/** Room a person standing at a bedside takes, in units of the bed's size. */
+const BEDSIDE_CLEARANCE = 0.34;
+/** Spacing along the bed between people fanned out on one side. */
+const BEDSIDE_STEP = 0.36;
+
+const lower = (v: unknown) => (typeof v === "string" ? v.trim().toLowerCase() : "");
+
+/** A patient lies in a bed when its state is in_use, or when no state is mapped (ADR 0007). */
+export function liesInBed(a: Asset): boolean {
+  const s = a.state;
+  return s === undefined || s === null || s === "" || lower(s) === "in_use";
+}
+
+/** The `anchor` value as an asset id, or null. */
+export function anchorField(a: Asset): string | null {
+  const v = a.anchor;
+  if (v === undefined || v === null || typeof v === "object" || typeof v === "boolean") return null;
+  const t = String(v).trim();
+  return t && t !== a.asset_id ? t : null;
+}
+
+/**
+ * Returns, per asset, the id of the asset it is drawn at, or null. Only assets
+ * with a known position of their own (an explicit x/y or a zone) and no anchor
+ * of their own can be anchored to, so chains and cycles fall back to zones.
+ */
+export function anchorResolver(zones: readonly Zone[], assets: readonly Asset[]): (a: Asset) => string | null {
+  const byId = new Map<string, Asset>();
+  for (const a of assets) byId.set(a.asset_id, a);
+  const zoneOf = new Map<Asset, Zone | undefined>();
+  const zoneFor = (a: Asset) => {
+    if (!zoneOf.has(a)) zoneOf.set(a, resolveZone(zones, a.zone));
+    return zoneOf.get(a);
+  };
+  // Beds per zone (beds placed by zone only; an explicit x/y bed is matched by id).
+  const bedsIn = new Map<string, string[]>();
+  for (const a of assets) {
+    if (figureOf(a) !== "bed" || explicitPosition(a)) continue;
+    const z = zoneFor(a);
+    if (!z) continue;
+    const l = bedsIn.get(z.id) ?? [];
+    l.push(a.asset_id);
+    bedsIn.set(z.id, l);
+  }
+  const raw = (a: Asset): string | null => {
+    const named = anchorField(a);
+    if (named && byId.has(named)) return named;
+    if (named || !isPerson(figureOf(a))) return null; // a missing anchor falls back to the zone
+    const zv = a.zone === undefined || a.zone === null ? "" : String(a.zone);
+    const byZoneId = zv && zv !== a.asset_id ? byId.get(zv) : undefined;
+    if (byZoneId && figureOf(byZoneId) === "bed") return zv;
+    const z = zoneFor(a);
+    const inZone = z ? bedsIn.get(z.id) : undefined;
+    if (!z || inZone?.length !== 1) return null;
+    // A patient in a zone with exactly one bed is in that bed; staff only when the zone is that bed's room.
+    return figureOf(a) === "patient" || z.kind === "room" ? inZone[0] : null;
+  };
+  const memo = new Map<string, string | null>();
+  return (a: Asset) => {
+    const hit = memo.get(a.asset_id);
+    if (hit !== undefined) return hit;
+    let out = raw(a);
+    if (out) {
+      const t = byId.get(out)!;
+      if (raw(t) || (!explicitPosition(t) && !zoneFor(t))) out = null; // the target has no position of its own
+    }
+    memo.set(a.asset_id, out);
+    return out;
+  };
+}
+
+/** Where a bed rests in a room it has to itself: centred, pushed back from the door, foot towards the door. */
+export function bedSpot(z: Zone): { at: Pt; heading: number } {
+  const c = polygonCentroid(z.polygon);
+  const doors = (z.doors ?? []).filter((d) => Array.isArray(d) && Number.isFinite(d[0]) && Number.isFinite(d[1]));
+  if (!doors.length) {
+    const b = polygonBounds(z.polygon);
+    return { at: c, heading: b.h > b.w ? Math.PI / 2 : 0 };
+  }
+  let door = doors[0];
+  for (const d of doors) if (Math.hypot(d[0] - c[0], d[1] - c[1]) < Math.hypot(door[0] - c[0], door[1] - c[1])) door = d;
+  const vx = door[0] - c[0], vy = door[1] - c[1];
+  const len = Math.hypot(vx, vy);
+  if (len < 1e-6) return { at: c, heading: 0 };
+  const back = Math.min(len * 0.2, 1);
+  const at: Pt = [c[0] - (vx / len) * back, c[1] - (vy / len) * back];
+  return { at: pointInPolygon(at[0], at[1], z.polygon) ? at : c, heading: Math.atan2(vy, vx) };
+}
+
+/**
+ * Bedside spot `k` around an anchor at `t`: alternating sides of the bed, then
+ * further along it. Spots outside the anchor's zone are pulled in or moved to
+ * the other side, so nobody stands in a wall.
+ */
+export function bedsideSpot(t: Placement, k: number, isBed: boolean, zone: Zone | undefined): Pt {
+  const h = t.heading ?? 0;
+  const ux = Math.cos(h), uy = Math.sin(h);
+  const nx = -uy, ny = ux;
+  const S = t.size;
+  const half = (isBed ? BED_HALF_WIDTH : 0.5) * S;
+  const j = Math.floor(k / 2);
+  const along = (j % 2 === 1 ? 1 : -1) * Math.ceil(j / 2) * BEDSIDE_STEP * S;
+  const alongC = isBed ? Math.max(-BED_HALF_LENGTH * S * 1.4, Math.min(BED_HALF_LENGTH * S * 1.4, along)) : along;
+  const first = k % 2 === 0 ? 1 : -1;
+  const at = (side: number, d: number): Pt => [t.x + nx * side * d + ux * alongC, t.y + ny * side * d + uy * alongC];
+  const d0 = half + BEDSIDE_CLEARANCE * S;
+  if (!zone) return at(first, d0);
+  for (const side of [first, -first]) {
+    for (let d = d0; d >= half * 0.6; d -= 0.1 * S) {
+      const p = at(side, d);
+      if (pointInPolygon(p[0], p[1], zone.polygon)) return p;
+    }
+  }
+  return at(first, d0);
+}
+
+function placeAnchored(zones: readonly Zone[], anchored: Asset[], anchorOf: (a: Asset) => string | null, positions: Map<string, Placement>, all: readonly Asset[]) {
+  const kinds = new Map(all.map((a) => [a.asset_id, figureOf(a)]));
+  const groups = new Map<string, Asset[]>();
+  for (const a of anchored) {
+    const t = anchorOf(a)!;
+    const l = groups.get(t) ?? [];
+    l.push(a);
+    groups.set(t, l);
+  }
+  const zoneById = new Map(zones.map((z) => [z.id, z]));
+  for (const tid of [...groups.keys()].sort(compareIds)) {
+    const t = positions.get(tid);
+    const members = groups.get(tid)!.sort((x, y) => compareIds(x.asset_id, y.asset_id));
+    if (!t) continue; // cannot happen: the resolver only names placed assets
+    const isBed = kinds.get(tid) === "bed";
+    const zone = t.zoneId ? zoneById.get(t.zoneId) : undefined;
+    const heading = t.heading ?? 0;
+    const sleeper = isBed ? members.find((m) => figureOf(m) === "patient" && liesInBed(m)) : undefined;
+    if (sleeper) {
+      positions.set(sleeper.asset_id, {
+        x: t.x, y: t.y, heading, zoneId: t.zoneId, level: 0, size: t.size, unassigned: t.unassigned,
+        pose: "lying", anchorId: tid, approach: bedsideSpot(t, 0, true, zone),
+      });
+    }
+    let k = 0;
+    for (const m of members) {
+      if (m === sleeper) continue;
+      const [x, y] = bedsideSpot(t, k++, isBed, zone);
+      positions.set(m.asset_id, {
+        x, y, heading: Math.atan2(t.y - y, t.x - x), zoneId: t.zoneId, level: 0, size: t.size, unassigned: t.unassigned,
+        pose: "standing", anchorId: tid,
+      });
+    }
+  }
 }
 
 /** Key that changes only when something affecting placement changes (order-sensitive; a reorder just recomputes). */
 export function placementKey(layout: SiteLayout | null | undefined, assets: Iterable<Asset>): string {
   const parts: string[] = [];
-  for (const a of assets) parts.push(`${a.asset_id}\u0001${a.zone ?? ""}\u0001${a.x ?? ""}\u0001${a.y ?? ""}\u0001${a.kind ?? ""}`);
+  // anchor, role and whether a patient lies in bed change anchored placement and pose; other state changes don't.
+  for (const a of assets) parts.push(`${a.asset_id}\u0001${a.zone ?? ""}\u0001${a.x ?? ""}\u0001${a.y ?? ""}\u0001${a.kind ?? ""}\u0001${anchorField(a) ?? ""}\u0001${a.role ?? ""}\u0001${figureOf(a) === "patient" && liesInBed(a) ? 1 : 0}`);
   return `${JSON.stringify(layout ?? null)}\u0002${parts.join("\u0002")}`;
 }
 
