@@ -110,3 +110,13 @@ table.data td.num { text-align: right; font-family: var(--f-mono); }
 .kv-row select { font: inherit; color: var(--fg); background: var(--panel-2); border: 1px solid var(--line);
   border-radius: 6px; padding: 7px 10px; min-width: 0; }
 .field .kv-label { font-weight: 500; font-size: 0.85rem; }
+
+/* Row filter editor */
+.filter-row { display: grid; gap: 6px; align-items: center;
+  grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr) minmax(0, 1.2fr) auto; }
+.filter-row select, .filter-row input { font: inherit; color: var(--fg); background: var(--panel-2);
+  border: 1px solid var(--line); border-radius: 6px; padding: 7px 10px; min-width: 0; }
+.filter-row [aria-invalid="true"] { border-color: var(--bad); }
+.filter-row .filter-err { grid-column: 1 / -1; font-size: 0.78rem; color: var(--bad); }
+.err { color: var(--bad); font-size: 0.78rem; }
+@media (max-width: 520px) { .filter-row { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); } }

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import logging
 import time
 from typing import Any
 
@@ -11,11 +13,22 @@ from app import secrets as secrets_mod
 from app.api.deps import mapping_spec, runner
 from app.api.schemas import SourceIn, SourceOut, SourceUpdate
 from app.connectors import build, get_class, specs
-from app.connectors.base import ConnectorError, ConnectorSpec, Dataset, Record, TestReport, TestStep
+from app.connectors.base import Connector, ConnectorError, ConnectorSpec, Dataset, Record, TestReport, TestStep
+from app.core.mapping import MappingConfig
 from app.core.runner import RunnerManager
-from app.db import Mapping, Source, get_session
+from app.core.suggest import ExistingMapping, Suggestion, preview_priority, suggest
+from app.db import Mapping, Site, Source, get_session
 
 router = APIRouter(prefix="/api", tags=["sources"])
+log = logging.getLogger("liveops.api.sources")
+
+# Suggestions read a small sample of each table, within a time budget, so a
+# source with hundreds of tables or a slow one still answers quickly.
+SUGGEST_DISCOVER_TIMEOUT_S = 15.0
+SUGGEST_PREVIEW_ROWS = 50
+SUGGEST_MAX_PREVIEWS = 25
+SUGGEST_PREVIEW_TIMEOUT_S = 5.0
+SUGGEST_BUDGET_S = 20.0
 
 
 # Settings that identify *where* a source lives. Changing one requires the
@@ -233,3 +246,64 @@ async def preview(
         raise HTTPException(502, detail={"message": str(e).splitlines()[0][:300]}) from e
     finally:
         await conn.close()
+
+
+async def _samples(conn: Connector, datasets: list[Dataset]) -> dict[str, list[Record]]:
+    out: dict[str, list[Record]] = {}
+    deadline = time.monotonic() + SUGGEST_BUDGET_S
+    for d in sorted(datasets, key=preview_priority)[:SUGGEST_MAX_PREVIEWS]:
+        left = deadline - time.monotonic()
+        if left <= 0.2:
+            break
+        try:
+            out[d.name] = await asyncio.wait_for(
+                conn.preview(d.name, SUGGEST_PREVIEW_ROWS), min(SUGGEST_PREVIEW_TIMEOUT_S, left)
+            )
+        except TimeoutError:
+            log.info("suggestions: preview of %s timed out; suggesting from its columns only", d.name)
+        except Exception as e:  # noqa: BLE001 - one unreadable table must not stop the others
+            log.info("suggestions: preview of %s failed: %s", d.name, type(e).__name__)
+    return out
+
+
+@router.get("/sources/{source_id}/suggestions", response_model=list[Suggestion])
+async def suggestions(
+    source_id: str, site_id: str | None = None, session: Session = Depends(get_session)
+) -> list[Suggestion]:
+    """Suggested mappings from this source for a site (ADR 0006)."""
+    s = _get(session, source_id)
+    existing: list[ExistingMapping] = []
+    if site_id:
+        if session.get(Site, site_id) is None:
+            raise HTTPException(404, detail={"message": "Site not found"})
+        for m in session.scalars(select(Mapping).where(Mapping.site_id == site_id)):
+            cfg = MappingConfig.model_validate(m.config)
+            existing.append(
+                ExistingMapping(
+                    mapping_id=m.id,
+                    source_id=m.source_id,
+                    dataset=m.dataset,
+                    key_field=cfg.key_field,
+                    kind=cfg.kind,
+                    attached=cfg.key_field != cfg.id_field,
+                )
+            )
+    conn = build(s.type, s.settings or {}, secrets_mod.decrypt(s.secrets_enc), source_id=s.id)
+    try:
+        datasets = await asyncio.wait_for(conn.discover(), SUGGEST_DISCOVER_TIMEOUT_S)
+        samples = await _samples(conn, datasets)
+    except TimeoutError as e:
+        raise HTTPException(
+            504,
+            detail={
+                "message": "The source took too long to list its tables",
+                "hint": "Run Test connection on the source, or narrow the schemas it lists.",
+            },
+        ) from e
+    except ConnectorError as e:
+        raise HTTPException(400, detail={"message": str(e), "hint": e.hint}) from e
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(502, detail={"message": str(e).splitlines()[0][:300]}) from e
+    finally:
+        await conn.close()
+    return suggest(datasets, samples, source_id=s.id, existing=existing)

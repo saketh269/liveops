@@ -13,8 +13,14 @@ A mapping config (stored as JSON on the Mapping row) looks like::
       },
       "state_map": {"occupied": "in_use"},   # optional value translation
       "attributes": ["patient_count"],       # extra columns passed through
-      "kind": "bed"                           # optional constant asset kind
+      "kind": "bed",                          # optional constant asset kind
+      "filter": [{"column": "discharged_at", "op": "is_null"}]
+                                              # optional: only rows matching every
+                                              #   condition are shown (ADR 0006)
     }
+
+A record that doesn't match the filter is not on the map for this mapping; a
+record that stops matching is removed, exactly like a delete.
 """
 
 from __future__ import annotations
@@ -25,6 +31,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from app.connectors.base import Change, ChangeOp
 from app.core.events import AssetEvent, AssetOp
+from app.core.rowfilter import RowFilter, filter_problems, matches
 
 RESERVED_FIELDS = {"zone", "state", "label", "kind", "x", "y"}
 
@@ -36,6 +43,7 @@ class MappingConfig(BaseModel):
     state_map: dict[str, str] = Field(default_factory=dict)
     attributes: list[str] = Field(default_factory=list)
     kind: str | None = None
+    filter: list[RowFilter] = Field(default_factory=list)
 
     @field_validator("fields")
     @classmethod
@@ -48,6 +56,10 @@ class MappingConfig(BaseModel):
 
     def required_columns(self) -> set[str]:
         return {self.id_field, self.key_field, *self.fields.values(), *self.attributes}
+
+    def accepts(self, record: dict[str, Any]) -> bool:
+        """True when the record passes the row filter (always, without one)."""
+        return matches(record, self.filter)
 
 
 class MappingProblem(ValueError):
@@ -79,6 +91,17 @@ def apply_mapping(
     key = rec.get(config.key_field)
     if key is None or key == "":
         raise MappingProblem(f"record has no value in ID column {config.key_field!r}")
+    if not config.accepts(rec):
+        # Filtered out: this mapping no longer shows the record (ADR 0006).
+        return AssetEvent(
+            site_id=site_id,
+            asset_id=str(key),
+            op=AssetOp.REMOVE,
+            source_id=source_id,
+            mapping_id=mapping_id,
+            dataset=change.dataset,
+            source_ts=change.source_ts,
+        )
     out: dict[str, Any] = {}
     for asset_field, column in config.fields.items():
         if column in rec:
@@ -102,7 +125,12 @@ def apply_mapping(
     )
 
 
-def validate_against_columns(config: MappingConfig, columns: set[str]) -> list[str]:
-    """Return human-readable problems (empty list = fine)."""
+def validate_against_columns(config: MappingConfig, columns: set[str] | dict[str, str]) -> list[str]:
+    """Return human-readable problems (empty list = fine).
+
+    ``columns`` is the dataset's column names, or ``{name: source type}`` to
+    also check that filter values fit the column types."""
     missing = sorted(c for c in config.required_columns() if c not in columns)
-    return [f"Column {c!r} isn't in this table" for c in missing]
+    problems = [f"Column {c!r} isn't in this table" for c in missing]
+    types = columns if isinstance(columns, dict) else dict.fromkeys(columns, "")
+    return problems + filter_problems(config.filter, types)

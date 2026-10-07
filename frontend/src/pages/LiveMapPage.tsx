@@ -148,7 +148,10 @@ function SiteMap({ siteId }: { siteId: string }) {
         <div className="lm-grid">
           <div className="lm-main">
             {ui.snapshotReceived && ui.assets.size === 0 && (
-              <div className="notice info">No assets on this site yet. <Link to="/mapping">Map a source</Link> to this site to see its records here.</div>
+              <div className="notice info">
+                No assets on this site yet. <Link to={`/sites/${encodeURIComponent(site.id)}/setup`}>Set up from a source</Link> to
+                get suggestions, or <Link to={`/mapping/new?site=${encodeURIComponent(site.id)}`}>map a table by hand</Link>.
+              </div>
             )}
             <SetupHints site={site} assets={ui.assets} ready={ui.snapshotReceived} onSite={setSite} onEditLayout={() => setEdit(true)} />
             <div className="lm-stage">

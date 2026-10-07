@@ -89,6 +89,21 @@ export type RowFilter = {
   value?: unknown;
 };
 
+// GET /api/sources/{id}/suggestions?site_id= (docs/adr/0006-hospital-map.md)
+export type AttachTarget = {
+  dataset: string; // another suggestion in the list, or the dataset of mapping_id
+  mapping_id: string | null; // an existing mapping on the site
+  match_key: string;
+};
+export type Suggestion = {
+  dataset: string;
+  config: MappingConfig | null; // null: not suggested (reason says why)
+  filter?: RowFilter[] | null; // same as config.filter
+  reason: string;
+  confidence: number; // 0..1
+  attach_to?: AttachTarget | null;
+};
+
 export type Mapping = {
   id: string;
   site_id: string;

@@ -18,6 +18,7 @@ from typing import Any
 from app.connectors import build
 from app.connectors.base import ChangeOp, Connector, ConnectorError
 from app.core.mapping import MappingConfig, MappingProblem, apply_mapping
+from app.core.rowfilter import predicate
 from app.core.state import StateStore
 
 log = logging.getLogger("liveops.runner")
@@ -150,6 +151,7 @@ class RunnerManager:
             connector: Connector | None = None
             try:
                 connector = build(spec.source_type, spec.settings, spec.secrets, source_id=spec.source_id)
+                connector.row_filter = predicate(spec.config.filter)
                 h.status = "starting"
                 seen: set[str] = set()
                 snapshot_done = False
@@ -172,7 +174,14 @@ class RunnerManager:
                         h.status = "running"
                         backoff = 1.0
                         continue
+                    if not snapshot_done and change.op == ChangeOp.UPSERT and not spec.config.accepts(change.record):
+                        # Filtered out of the initial state: simply not shown. Not
+                        # applying a remove here keeps a matching row with the same
+                        # key that came earlier; reconcile drops anything stale.
+                        continue
                     try:
+                        # After the snapshot, a row that stops matching the filter
+                        # becomes a remove (apply_mapping), exactly like a delete.
                         event = apply_mapping(
                             change,
                             spec.config,
