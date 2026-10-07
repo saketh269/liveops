@@ -60,6 +60,8 @@ function Summary({ config, attached }: { config: MappingConfig; attached: boolea
   if (f.label) parts.push(["Label", f.label]);
   if (f.role) parts.push(["Role", f.role]);
   if (config.kind) parts.push(["Kind", config.kind]);
+  else if (f.kind) parts.push(["Kind", `from ${f.kind}`]);
+  if (f.anchor) parts.push(["Drawn next to", f.anchor]);
   if ((config.attributes ?? []).length) parts.push(["Details", (config.attributes ?? []).join(", ")]);
   return (
     <dl className="meta">
@@ -189,8 +191,16 @@ function SuggestionCard({ item, sourceId, columns, targetNote, onChange, showErr
                 <ColumnPick id={`${key}-label`} label="Label" none="Not mapped" value={config.fields.label ?? ""} columns={columns} onChange={(v) => setField("label", v)} />
                 <div className="field">
                   <label htmlFor={`${key}-kind`}>Kind</label>
-                  <input id={`${key}-kind`} value={config.kind ?? ""} autoComplete="off" placeholder="e.g. bed"
-                    onChange={(e) => onChange({ config: { ...config, kind: e.target.value || null } })} />
+                  <input id={`${key}-kind`} value={config.kind ?? ""} autoComplete="off"
+                    placeholder={config.fields.kind ? `from ${config.fields.kind}` : "e.g. bed"}
+                    aria-describedby={config.fields.kind ? `${key}-kind-help` : undefined}
+                    onChange={(e) => {
+                      // A fixed kind replaces the kind read from a column (they can't both be set).
+                      const fields = { ...config.fields };
+                      if (e.target.value) delete fields.kind;
+                      onChange({ config: { ...config, fields, kind: e.target.value || null } });
+                    }} />
+                  {config.fields.kind && <span className="help" id={`${key}-kind-help`}>Read from the {config.fields.kind} column. Type a kind to use one fixed kind instead.</span>}
                 </div>
               </>
             )}

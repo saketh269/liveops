@@ -7,18 +7,25 @@ No source-specific SQL, so it works for databases, files and APIs alike.
 What it proposes, per dataset:
 
 - **Things on the map**: rows that have a location (a unit, ward, zone, room,
-  ``dest_*`` column...) and an identifier. Proposes zone, state (with a
-  ``state_map`` built from the sample values), label, role and a kind guessed
-  from the table and column names.
-- **Details for another mapping** (``attach_to``): rows that refer to a thing by
-  its id (``bed_id``) but have no location of their own, such as visits,
-  cleaning tasks or rounds. They merge into that thing through ``match_key``.
-- **Current rows only** (``filter``): history tables (an end time such as
-  ``discharged_at``/``done_at``, a status such as ``done``, or an ``on_shift``
-  flag) get a filter that keeps only current rows.
-- **Skipped**, with a reason: one-row-per-area totals, queues and event logs
-  without a location (counts, not things), tables without an identifier, and
-  tables already mapped on the site. Skipped suggestions have ``config=None``.
+  ``dest_*`` column...) and an identifier. Proposes zone, state (a ``state_map``
+  only for sample values with a clear meaning; the rest are named in the reason),
+  label, role, and a kind guessed from the names or read from a column whose
+  values are kinds (``person_type`` = patient | staff). People that point at a
+  thing (a patient's ``bed_id``) get ``anchor``.
+- **Details for another mapping** (``attach_to``): rows that refer to a thing
+  through ``match_key``. A reference is confirmed by values, not names: at least
+  half of the column's sampled values must be key values of the other table
+  (a shared specific name such as ``bed_id`` counts only when one side has no
+  sample; a bare ``id`` never does). Tasks and history about a thing (an end time
+  such as ``done_at``, a finished status) and tables of the same things joined
+  by their own key (a roster of the tracked staff) attach even when they have a
+  location, so nothing is drawn twice. References through a person column
+  (``patient_ref``, ``staff_id``) prefer a table of people.
+- **Current rows only** (``filter``): history tables get a filter that keeps
+  only current rows (``discharged_at`` empty, status not done, ``on_shift``).
+- **Skipped**, with a reason: one-row-per-area totals, queues and logs (counts,
+  not things), tables without an identifier or a location, and tables already
+  mapped on the site. Skipped suggestions have ``config=None``.
 """
 
 from __future__ import annotations
@@ -32,7 +39,7 @@ from pydantic import BaseModel
 
 from app.connectors.base import Dataset, Record
 from app.core.mapping import MappingConfig
-from app.core.rowfilter import RowFilter, describe, type_family
+from app.core.rowfilter import RowFilter, describe, matches, type_family
 
 
 class AttachTarget(BaseModel):
@@ -93,8 +100,15 @@ _END_TIME = re.compile(
 _ACTIVE_FLAG = re.compile(
     r"^(is_)?(active|current|on_shift|onshift|on_duty|present|enabled|in_service|on_site|checked_in)$", re.I
 )
-_EVENTISH = re.compile(r"(queue|log|event|history|audit|message|notification|journal|arrival|request)", re.I)
-_TOTALS = re.compile(r"(census|count|total|summary|capacity|stats?|aggregate|kpi|metric)", re.I)
+# Whole words of a table name (``triage_queue``, ``unit_census``), never parts of words (``encounters``).
+_EVENTISH = {"queue", "log", "event", "history", "audit", "message", "notification", "journal", "arrival", "request"}
+_TOTALS = {"census", "count", "total", "summary", "capacity", "stat", "aggregate", "kpi", "metric"}
+
+
+def _counts_name(name: str) -> bool:
+    words = {_singular(t) for t in _tokens(name.split("/")[-1])}
+    return bool(words & (_EVENTISH | _TOTALS))
+
 
 CLOSED_VALUES = {
     "done", "closed", "complete", "completed", "finished", "resolved", "cancelled", "canceled", "discharged",
@@ -103,7 +117,20 @@ CLOSED_VALUES = {
 
 STATE_VOCAB: dict[str, str] = {
     **dict.fromkeys(
-        ["free", "available", "vacant", "idle", "ready", "empty", "clean", "unoccupied", "standby", "at_station"],
+        [
+            "free",
+            "available",
+            "vacant",
+            "idle",
+            "ready",
+            "empty",
+            "clean",
+            "unoccupied",
+            "standby",
+            "station",
+            "at_station",
+            "on_station",
+        ],
         "free",
     ),
     **dict.fromkeys(
@@ -119,12 +146,16 @@ STATE_VOCAB: dict[str, str] = {
             "responding",
             "transporting",
             "on_scene",
-            "arrived",
             "assigned",
             "engaged",
             "active",
             "in_progress",
             "outbound",
+            "in_bed",
+            "seeing_patient",
+            "with_patient",
+            "rounds",
+            "on_rounds",
         ],
         "in_use",
     ),  # fmt: skip
@@ -190,15 +221,15 @@ def _norm_value(v: Any) -> str:
     return re.sub(r"[\s\-]+", "_", str(v).strip().lower())
 
 
-def propose_state_map(values: Sequence[Any]) -> tuple[dict[str, str], int]:
-    """``{raw: map state}`` for sample values we recognise (identity entries
-    left out), and how many distinct values were not recognised."""
+def propose_state_map(values: Sequence[Any]) -> tuple[dict[str, str], list[str]]:
+    """``{raw: map state}`` for sample values with a clear meaning (identity
+    entries left out), and the distinct values left for the user to choose."""
     out: dict[str, str] = {}
-    unknown = 0
+    unknown: list[str] = []
     for raw in dict.fromkeys(str(v) for v in values if v is not None and str(v).strip() != ""):
         to = STATE_VOCAB.get(_norm_value(raw))
         if to is None:
-            unknown += 1
+            unknown.append(raw)
         elif to != raw:
             out[raw] = to
     return out, unknown
@@ -212,6 +243,20 @@ def _a(word: str) -> str:
 # Per-dataset analysis
 # --------------------------------------------------------------------------
 
+# Column names that may hold an identifier (and so may refer to another table).
+_IDLIKE = re.compile(r"(^|_)(id|ref|key|code|no|number|num|tag|uuid|guid|mrn)$", re.I)
+# Names too generic to be a reference by name alone (``id`` is in every table).
+_GENERIC = {"id", "key", "code", "no", "number", "num", "ref", "uuid", "guid", "tag"}
+# A column naming a person: references through it prefer a table of people.
+_PERSONISH = re.compile(r"(patient|person|people|staff|employee|member|user|resident|worker|nurse|doctor)", re.I)
+_KINDCOL_NAME = re.compile(r"(^|_)(type|kind|category|class|group)$", re.I)
+PERSON_KINDS = {"patient", "staff", "person"}
+# Values that name a kind of thing (``person_type`` = patient | staff).
+KIND_WORDS: dict[str, str] = {w: kind for kind, words in KINDS for w in (*words, kind)}
+KIND_WORDS.update({"person": "person", "people": "person", "visitor": "person", "guest": "person"})
+
+MIN_OVERLAP = 0.5  # share of a column's sampled values that must be keys of the other table
+
 
 @dataclass
 class _Info:
@@ -223,16 +268,42 @@ class _Info:
     zone_rank: int
     state: str | None
     label: str | None
+    kind_col: str | None = None
     filters: list[RowFilter] = field(default_factory=list)
     filter_note: str = ""
+    history: bool = False  # an end time or a finished status: rows are tasks/visits, not standing things
+    identity: list[str] = field(default_factory=list)  # columns whose values identify a row
 
     @property
     def name(self) -> str:
         return self.ds.name
 
+    @property
+    def current_rows(self) -> list[Record]:
+        """Sample rows the filter keeps (all rows if it keeps none: still useful for overlap)."""
+        if not self.filters:
+            return self.rows
+        kept = [r for r in self.rows if matches(r, self.filters)]
+        return kept or self.rows
+
+    @property
+    def kind(self) -> str | None:
+        return guess_kind(self.name, [self.id_col] if self.id_col else [])
+
+    @property
+    def person_like(self) -> bool:
+        if self.kind_col:
+            kinds = {KIND_WORDS.get(_norm_value(v)) for v in _values(self.rows, self.kind_col) if v is not None}
+            return bool(kinds) and kinds <= {*PERSON_KINDS, "staff"}
+        return self.kind in PERSON_KINDS
+
 
 def _values(rows: list[Record], col: str) -> list[Any]:
     return [r.get(col) for r in rows if isinstance(r, dict)]
+
+
+def _keyset(rows: list[Record], col: str) -> set[str]:
+    return {str(v) for v in _values(rows, col) if v is not None and str(v).strip() != ""}
 
 
 def _first(cols: Sequence[str], *patterns: re.Pattern[str], skip: Sequence[str | None] = ()) -> str | None:
@@ -257,6 +328,11 @@ def _zone(cols: Sequence[str], skip: Sequence[str | None]) -> tuple[str | None, 
     return None, -1
 
 
+def _unique(rows: list[Record], col: str) -> bool:
+    vals = [v for v in _values(rows, col) if v not in (None, "")]
+    return bool(vals) and len(vals) >= 0.9 * len(rows) and len(set(map(str, vals))) == len(vals)
+
+
 def _id_column(ds: Dataset, rows: list[Record]) -> str | None:
     if len(ds.primary_key) == 1:
         return ds.primary_key[0]
@@ -267,9 +343,26 @@ def _id_column(ds: Dataset, rows: list[Record]) -> str | None:
     candidates = [c for c in cols if c.lower() == "id"] + [c for c in cols if base and c.lower() == f"{base}_id"]
     candidates += [c for c in cols if re.search(r"(_id|_no|_number|_code|_ref)$", c, re.I) and c not in candidates]
     for c in candidates:
-        vals = _values(rows, c)
-        if not rows or (all(v not in (None, "") for v in vals) and len(set(map(str, vals))) == len(vals)):
+        if not rows or _unique(rows, c):
             return c
+    return None
+
+
+def _kind_column(info: _Info, cols: Sequence[str]) -> str | None:
+    """A column whose values are kinds of things (patient, staff, vehicle...)."""
+    skip = {info.id_col, info.zone, info.state, info.label}
+    ordered = sorted(cols, key=lambda c: not _KINDCOL_NAME.search(c))
+    for c in ordered:
+        if c in skip or _ROLE.search(c) or type_family(info.types[c]) not in ("text", None):
+            continue
+        vals = [_norm_value(v) for v in _values(info.rows, c) if v not in (None, "")]
+        distinct = set(vals)
+        if not vals or len(distinct) > 8:
+            continue
+        if sum(v in KIND_WORDS for v in vals) >= 0.8 * len(vals) and len({KIND_WORDS.get(v) for v in distinct}) >= 1:
+            # A single repeated value is a constant kind, not a kind column, unless the name says so.
+            if len(distinct) > 1 or _KINDCOL_NAME.search(c):
+                return c
     return None
 
 
@@ -282,6 +375,7 @@ def _current_filter(info: _Info) -> None:
         if _END_TIME.search(c) and nullable[c] and fam in ("time", None):
             info.filters = [RowFilter(column=c, op="is_null")]
             info.filter_note = "older rows are history"
+            info.history = True
             return
     if info.state:
         seen = {str(v) for v in _values(info.rows, info.state) if v is not None}
@@ -293,6 +387,7 @@ def _current_filter(info: _Info) -> None:
                 else RowFilter(column=info.state, op="not_in", value=closed)
             ]
             info.filter_note = "finished rows are history"
+            info.history = True
             return
     for c in cols:
         vals = [v for v in _values(info.rows, c) if v is not None]
@@ -311,7 +406,90 @@ def _analyse(ds: Dataset, rows: list[Record]) -> _Info:
     label = _first(cols, _LABEL_EXACT, _LABEL_LIKE, skip=[id_col, zone, state])
     info = _Info(ds, rows, {c.name: c.type for c in ds.columns}, id_col, zone, zone_rank, state, label)
     _current_filter(info)
+    info.kind_col = _kind_column(info, cols)
+    current = info.current_rows
+    info.identity = [
+        c
+        for c in cols
+        if (c in ds.primary_key and len(ds.primary_key) == 1) or (_IDLIKE.search(c) and current and _unique(current, c))
+    ]
+    if id_col and id_col not in info.identity:
+        info.identity.insert(0, id_col)
     return info
+
+
+# --------------------------------------------------------------------------
+# References between tables, confirmed by sample values
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class _Target:
+    """A thing on the map that other rows can add details to."""
+
+    dataset: str
+    keys: dict[str, set[str] | None]  # identifying column -> sampled values (None: no sample)
+    kind: str | None
+    person_like: bool = False
+    mapping_id: str | None = None  # an existing mapping on the site
+    info: _Info | None = None
+    match_col: str | None = None  # the identifying column others join on (becomes the asset id)
+
+
+@dataclass
+class _Edge:
+    col: str  # column in the referring table
+    target: _Target
+    key: str  # identifying column of the target
+    overlap: float  # share of sampled values found among the target's keys (1.0 for a name match)
+    by_name: bool = False
+
+    def rank(self, specific: set[str]) -> tuple[bool, bool, float, bool]:
+        return (
+            bool(_PERSONISH.search(self.col)) and self.target.person_like,
+            self.col.lower() == self.key.lower(),
+            self.overlap,
+            self.target.dataset in specific,
+        )
+
+
+def _ref_columns(info: _Info) -> list[str]:
+    out = []
+    for c in (c.name for c in info.ds.columns):
+        if c.lower() in _GENERIC or c in (info.zone, info.state, info.label, info.kind_col):
+            continue
+        fam = type_family(info.types[c])
+        if fam in ("time", "bool") or _HOUSEKEEPING.search(c):
+            continue
+        if fam == "number" and not _IDLIKE.search(c):
+            continue  # small numbers (acuity, counts) overlap with any integer key by chance
+        out.append(c)
+    return out
+
+
+def _edges(info: _Info, targets: Sequence[_Target]) -> list[_Edge]:
+    out: list[_Edge] = []
+    rows = info.current_rows
+    for c in _ref_columns(info):
+        vals = _keyset(rows, c) if rows else set()
+        for t in targets:
+            if t.dataset == info.name:
+                continue
+            for k, keys in t.keys.items():
+                if vals and keys:
+                    hit = len(vals & keys)
+                    share = hit / len(vals)
+                    if share >= MIN_OVERLAP and hit >= min(2, len(vals)):
+                        out.append(_Edge(c, t, k, share))
+                elif c.lower() == k.lower() and c.lower() not in _GENERIC and _IDLIKE.search(c):
+                    # No sample on one side: a specific shared name (bed_id = bed_id) is the only hint.
+                    out.append(_Edge(c, t, k, 1.0, by_name=True))
+    return out
+
+
+def _target(info: _Info) -> _Target:
+    keys = {c: (_keyset(info.rows, c) if info.rows else None) for c in info.identity}
+    return _Target(info.name, keys, info.kind, info.person_like, info=info)
 
 
 # --------------------------------------------------------------------------
@@ -333,45 +511,64 @@ def _attributes(info: _Info, used: set[str], limit: int) -> list[str]:
     return out[:limit]
 
 
-def _thing(info: _Info) -> Suggestion:
-    assert info.id_col and info.zone
+def _unmapped_note(unknown: list[str]) -> str:
+    shown = ", ".join(unknown[:6]) + (f" and {len(unknown) - 6} more" if len(unknown) > 6 else "")
+    one = len(unknown) == 1
+    which = "value" if one else "values"
+    return f" Status {which} without a color yet: {shown}; choose {'it' if one else 'them'} in the mapping."
+
+
+def _thing(info: _Info, id_col: str, anchor: _Edge | None) -> Suggestion:
+    assert info.zone
     cols = [c.name for c in info.ds.columns]
-    kind = guess_kind(info.name, [info.id_col])
+    kind = None if info.kind_col else info.kind
     fields: dict[str, str] = {"zone": info.zone}
+    if info.kind_col:
+        fields["kind"] = info.kind_col
     state_map: dict[str, str] = {}
     confidence = 0.45 + (0.2 if info.zone_rank == 0 else 0.1)
-    unknown = 0
+    unknown: list[str] = []
     if info.state:
         fields["state"] = info.state
         state_map, unknown = propose_state_map(_values(info.rows, info.state))
-        confidence += 0.15 if unknown == 0 else 0.05
-    if info.label:
-        fields["label"] = info.label
+        confidence += 0.15 if not unknown else 0.05
+    label = info.label or (id_col if info.kind_col else None)
+    if label:
+        fields["label"] = label
         confidence += 0.05
-    if kind in ("staff", "patient"):
-        role = _first(cols, _ROLE, skip=list(fields.values()) + [info.id_col])
+    if info.person_like or kind in ("staff", "patient"):
+        role = _first(cols, _ROLE, skip=[*fields.values(), id_col])
         if role:
             fields["role"] = role
-    if kind:
+    if anchor is not None:
+        fields["anchor"] = anchor.col
+    if kind or info.kind_col:
         confidence += 0.1
-    used = {info.id_col, *fields.values()}
+    used = {id_col, info.id_col or id_col, *fields.values()}
     config = MappingConfig(
-        id_field=info.id_col,
+        id_field=id_col,
         fields=fields,
         state_map=state_map,
         attributes=_attributes(info, used, 4),
         kind=kind,
         filter=info.filters,
     )
-    what = NOUNS.get(kind or "", kind or "record")
-    reason = f"Each row is {_a(what)} with a place on the map ({info.zone})"
+    if info.kind_col:
+        kinds = sorted({str(v) for v in _values(info.rows, info.kind_col) if v not in (None, "")})
+        what = f"{'person' if info.person_like else 'thing'} ({' or '.join(kinds)}, from {info.kind_col})"
+        reason = f"Each row is {_a(what)} with a place on the map ({info.zone})"
+    else:
+        what = NOUNS.get(kind or "", kind or "record")
+        reason = f"Each row is {_a(what)} with a place on the map ({info.zone})"
     if info.state:
         reason += f" and a status ({info.state})"
-        if unknown:
-            reason += "; 1 status value needs a color" if unknown == 1 else f"; {unknown} status values need a color"
     reason += "."
+    if anchor is not None:
+        reason += f" Drawn next to its {anchor.target.kind or 'record'} ({anchor.col})."
     if info.filters:
         reason += f" {describe(info.filters)} ({info.filter_note})."
+    if unknown:
+        reason += _unmapped_note(unknown)
     return Suggestion(
         dataset=info.name,
         config=config,
@@ -381,43 +578,43 @@ def _thing(info: _Info) -> Suggestion:
     )
 
 
-@dataclass
-class _Target:
-    dataset: str
-    key: str  # the thing's id column, which becomes the match key
-    kind: str | None
-    mapping_id: str | None = None
-
-
-def _reference(info: _Info, targets: list[_Target]) -> tuple[str, _Target] | None:
-    """A column of this dataset that holds the id of a thing on the map."""
-    cols = [c.name for c in info.ds.columns if c.name != info.zone]
-    for t in targets:
-        if t.dataset == info.name:
-            continue
-        names = {t.key.lower()}
-        if t.key.lower() == "id":
-            names.add(f"{_singular(table_base(t.dataset).split('_')[-1])}_id")
-        for c in cols:
-            if c.lower() in names:
-                return c, t
-    return None
-
-
-def _attach(info: _Info, ref: str, target: _Target) -> Suggestion:
+def _attach(info: _Info, edge: _Edge) -> Suggestion:
+    target = edge.target
+    ref = edge.col
     id_col = info.id_col or ref
     config = MappingConfig(
         id_field=id_col,
         match_key=ref,
-        attributes=_attributes(info, {id_col, ref}, 6),
+        attributes=_attributes(info, {id_col, ref, info.zone or ""}, 6),
         filter=info.filters,
     )
-    things = PLURALS.get(target.kind or "", f"{target.kind}s" if target.kind else "records")
-    reason = f"Rows refer to {things} in {target.dataset} by {ref}, so they add details to those {things}"
-    reason += " instead of new things on the map."
+    if target.person_like:
+        things = "people"
+    else:
+        things = PLURALS.get(target.kind or "", f"{target.kind}s" if target.kind else "records")
+    how = (
+        f"{ref} matches {target.dataset}.{edge.key}"
+        if edge.by_name
+        else f"{round(edge.overlap * 100)}% of sampled {ref} values are {target.dataset}.{edge.key} values"
+    )
+    if ref == info.id_col and not info.history:
+        reason = (
+            f"Describes the same {things} as {target.dataset} ({how}), "
+            "so it adds details to them instead of drawing them twice."
+        )
+    elif info.history:
+        reason = (
+            f"Tasks or history about {things} in {target.dataset} ({how}), "
+            f"so they add details to those {things} instead of separate figures."
+        )
+    else:
+        reason = (
+            f"Rows refer to {things} in {target.dataset} ({how}), "
+            f"so they add details to those {things} instead of new things on the map."
+        )
     if info.filters:
         reason += f" {describe(info.filters)} ({info.filter_note})."
-    confidence = 0.6 + (0.15 if info.filters else 0.05) + (0.1 if target.mapping_id or target.kind else 0.0)
+    confidence = 0.55 + (0.15 if info.filters else 0.05) + (0.15 if not edge.by_name else 0.05) * edge.overlap
     return Suggestion(
         dataset=info.name,
         config=config,
@@ -429,13 +626,12 @@ def _attach(info: _Info, ref: str, target: _Target) -> Suggestion:
 
 
 def _skip_reason(info: _Info) -> str:
-    base = table_base(info.name)
     if info.zone and info.ds.primary_key == [info.zone]:
         return (
             f"One row per {info.zone} with totals: counts for an area, not things on the map. Use live counts instead."
         )
-    if _EVENTISH.search(base) or _TOTALS.search(base):
-        return "A queue or log with no location: counts, not things on the map. Use live counts instead."
+    if _counts_name(info.name):
+        return "A queue or log: counts, not things on the map. Use live counts instead."
     return "No column says where each record is, so it can't be placed on the map. Map it by hand if one does."
 
 
@@ -452,6 +648,16 @@ def preview_priority(ds: Dataset) -> int:
     )
 
 
+def _best(edges: list[_Edge], specific: set[str]) -> _Edge | None:
+    return max(edges, key=lambda e: e.rank(specific)) if edges else None
+
+
+def _merges(info: _Info, edge: _Edge) -> bool:
+    """Should a table that could be drawn on its own add details to ``edge.target`` instead?
+    Yes for tasks/history about it, and for rows that are the same things (joined by the table's own key)."""
+    return info.history or edge.col == info.id_col
+
+
 def suggest(
     datasets: Sequence[Dataset],
     samples: dict[str, list[Record]],
@@ -460,31 +666,96 @@ def suggest(
     existing: Sequence[ExistingMapping] = (),
 ) -> list[Suggestion]:
     """Suggestions for every dataset, best first; skipped datasets last."""
-    infos = [_analyse(ds, samples.get(ds.name, [])) for ds in datasets]
+    infos = {ds.name: _analyse(ds, samples.get(ds.name, [])) for ds in datasets}
     mapped_here = {m.dataset for m in existing if m.source_id == source_id}
 
-    things: dict[str, Suggestion] = {}
-    for info in infos:
-        if info.name in mapped_here or not info.zone or not info.id_col:
-            continue
-        if info.ds.primary_key == [info.zone]:
-            continue  # one row per area: totals, not things
-        things[info.name] = _thing(info)
+    def counts_only(i: _Info) -> bool:
+        return (bool(i.zone) and i.ds.primary_key == [i.zone]) or _counts_name(i.name)
 
-    # Anything already on the site can be attached to, whichever source feeds it.
-    targets = [_Target(m.dataset, m.key_field, m.kind, m.mapping_id) for m in existing if not m.attached]
-    targets += [_Target(name, s.config.id_field, s.config.kind) for name, s in things.items() if s.config is not None]
+    # Tables that could be drawn on their own.
+    candidates = {n: i for n, i in infos.items() if n not in mapped_here and i.zone and i.id_col and not counts_only(i)}
+    # Anything already on the site can be added to, whichever source feeds it.
+    existing_targets: list[_Target] = []
+    for m in existing:
+        if m.attached:
+            continue
+        same = infos.get(m.dataset) if m.source_id == source_id else None
+        keys = {m.key_field: (_keyset(same.rows, m.key_field) if same and same.rows else None)}
+        person = same.person_like if same else m.kind in PERSON_KINDS
+        existing_targets.append(
+            _Target(m.dataset, keys, m.kind, person, mapping_id=m.mapping_id, match_col=m.key_field)
+        )
+    targets = {n: _target(i) for n, i in candidates.items()}
+
+    # 1. Candidates that are tasks/history about another thing, or the same things as another
+    #    table, add details to it instead of being drawn twice.
+    merged: dict[str, _Edge] = {}
+    changed = True
+    while changed:
+        changed = False
+        # Only standing things take details: tasks and visits are never the thing others add to.
+        live = [t for n, t in targets.items() if n not in merged and not candidates[n].history] + existing_targets
+        for n, info in candidates.items():
+            if n in merged:
+                continue
+            options = [e for e in _edges(info, live) if _merges(info, e)]
+            for e in options:
+                back = e.target.info
+                # Two tables of the same things: the one with fewer rows adds to the bigger one.
+                if back is not None and e.col == info.id_col and back.name not in merged:
+                    if any(b.target.dataset == n and b.key == back.id_col for b in _edges(back, [targets[n]])):
+                        if len(_keyset(back.rows, e.key)) < len(_keyset(info.rows, e.col)):
+                            options = [o for o in options if o is not e]
+            if options:
+                merged[n] = _best(options, set()) or options[0]
+                changed = True
+    things = {n: t for n, t in targets.items() if n not in merged}
+    final_targets = list(things.values()) + existing_targets
+
+    # 2. Which of a thing's identifying columns others join on: it becomes the asset id.
+    all_edges: dict[str, list[_Edge]] = {}
+    for n, info in infos.items():
+        if n in things or n in mapped_here or counts_only(info):
+            continue
+        all_edges[n] = _edges(info, final_targets)
+    for t in things.values():
+        votes: dict[str, int] = {}
+        for edges in all_edges.values():
+            for e in edges:
+                if e.target is t:
+                    votes[e.key] = votes.get(e.key, 0) + 1
+        t.match_col = max(votes, key=lambda k: (votes[k], k == (t.info.id_col if t.info else ""))) if votes else None
+        if t.match_col is None and t.info is not None:
+            t.match_col = t.info.id_col
+
+    # Things that point at another thing (a person's bed) are more specific than it.
+    thing_edges = {n: _edges(things[n].info, final_targets) for n in things if things[n].info is not None}  # type: ignore[arg-type]
+    specific = {n for n, es in thing_edges.items() if es}
 
     out: list[Suggestion] = []
     skipped: list[Suggestion] = []
-    for info in infos:
-        if info.name in mapped_here:
+    for n, info in infos.items():
+        if n in mapped_here:
             skipped.append(_skip(info.ds, "Already mapped on this site."))
-        elif info.name in things:
-            out.append(things[info.name])
-        elif (ref := _reference(info, targets)) is not None:
-            out.append(_attach(info, *ref))
-        elif info.zone and not info.id_col and info.ds.primary_key != [info.zone]:
+            continue
+        if n in things:
+            t = things[n]
+            anchor = None
+            if info.person_like:
+                anchor = _best(
+                    [e for e in thing_edges.get(n, []) if not e.target.person_like and e.key == e.target.match_col],
+                    specific,
+                )
+            out.append(_thing(info, t.match_col or info.id_col or "", anchor))
+            continue
+        if counts_only(info):
+            skipped.append(_skip(info.ds, _skip_reason(info)))
+            continue
+        edges = [e for e in all_edges.get(n, []) if e.key == e.target.match_col]
+        edge = _best(edges, specific)
+        if edge is not None:
+            out.append(_attach(info, edge))
+        elif info.zone and not info.id_col:
             skipped.append(_skip(info.ds, "No column identifies each record. Map it by hand and choose an ID column."))
         else:
             skipped.append(_skip(info.ds, _skip_reason(info)))
