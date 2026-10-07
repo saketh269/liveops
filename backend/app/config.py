@@ -16,6 +16,8 @@ class Settings(BaseSettings):
     cors_origins: list[str] = ["http://localhost:5173"]
     start_runners: bool = True  # tests switch this off
     log_level: str = "INFO"
+    data_dir: str = "./data"  # uploaded files for csv_file sources (one sub-folder per source)
+    max_upload_mb: int = 50
 
 
 @lru_cache

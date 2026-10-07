@@ -1,0 +1,566 @@
+"""File connectors, poll mode.
+
+``csv_file``: CSV and Excel (.xlsx) files kept on the Live Ops server under
+``LIVEOPS_DATA_DIR/<folder>``. Files arrive through
+``POST /api/sources/{id}/upload`` (``app/api/uploads.py``), which sets the
+folder to the source id on first upload; an admin can also point ``folder`` at
+an existing sub-folder of the data directory. One dataset per file. A file is
+re-read only when its size or modification time changes.
+
+``s3_files``: objects in an S3-compatible bucket (AWS S3, MinIO, Ceph, ...)
+under a prefix. CSV, XLSX and JSON-lines objects; one dataset per object.
+An object is downloaded again only when its ETag changes. boto3 is blocking,
+so every call runs in a worker thread, off the event loop.
+
+Safety:
+- Folder names and dataset names are checked against what ``discover()``
+  lists; nothing outside the data directory can be read (no ``..``, no
+  absolute paths, symlinks are skipped).
+- Byte caps on every file/object and row caps on every snapshot.
+- S3 is read-only (List/Head/Get only); HTTPS is required unless Encryption
+  is Off (local testing only).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import csv
+import io
+import json
+import os
+import re
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from app.config import get_settings
+from app.connectors.base import (
+    Category,
+    ConnectorError,
+    ConnectorSpec,
+    Dataset,
+    Mode,
+    PollingConnector,
+    Record,
+    TestReport,
+    TestStep,
+    normalize_record,
+)
+from app.connectors.registry import register
+from app.connectors.rest import infer_columns, primary_key_guess
+
+MAX_ROWS = 50_000
+MAX_FILE_BYTES = 100 * 1024 * 1024
+MAX_FILES = 500
+LOCAL_EXTENSIONS = (".csv", ".xlsx")
+S3_EXTENSIONS = (".csv", ".xlsx", ".jsonl", ".ndjson")
+SAFE_PART = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+
+# --------------------------------------------------------------------------
+# Parsing (pure, blocking: call from a worker thread)
+# --------------------------------------------------------------------------
+
+
+def _header(names: list[Any]) -> list[str]:
+    out: list[str] = []
+    for i, n in enumerate(names):
+        name = str(n).strip() if n is not None else ""
+        if not name or name in out:
+            name = f"column_{i + 1}"
+        out.append(name)
+    return out
+
+
+def _cap(rows: list[Record], what: str) -> list[Record]:
+    if len(rows) > MAX_ROWS:
+        raise ConnectorError(
+            f"{what} has more than {MAX_ROWS:,} rows", hint="Split it into smaller files, one per area or site."
+        )
+    return rows
+
+
+def parse_csv(data: bytes, delimiter: str = ",", encoding: str = "utf-8-sig", what: str = "The file") -> list[Record]:
+    try:
+        text = data.decode(encoding)
+    except (UnicodeDecodeError, LookupError):
+        raise ConnectorError(
+            f"{what} isn't valid {encoding} text", hint="Save it as CSV UTF-8, or set the right encoding."
+        ) from None
+    reader = csv.reader(io.StringIO(text, newline=""), delimiter=(delimiter or ",")[0])
+    try:
+        head = next(reader, None)
+        if head is None:
+            return []
+        cols = _header(head)
+        rows: list[Record] = []
+        for line in reader:
+            if not any(cell.strip() for cell in line):
+                continue
+            rec: Record = {c: (line[i] if i < len(line) and line[i] != "" else None) for i, c in enumerate(cols)}
+            rows.append(rec)
+            if len(rows) > MAX_ROWS:
+                break
+    except csv.Error as e:
+        raise ConnectorError(f"{what} isn't a readable CSV: {e}", hint="Check the delimiter and quoting.") from None
+    return _cap(rows, what)
+
+
+def parse_xlsx(data: bytes, sheet: str | None = None, what: str = "The workbook") -> list[Record]:
+    import zipfile
+
+    from openpyxl import load_workbook
+
+    try:
+        wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+    except (zipfile.BadZipFile, KeyError, ValueError, OSError):
+        raise ConnectorError(
+            f"{what} isn't a readable .xlsx file", hint="Save it from Excel as 'Excel Workbook (.xlsx)'."
+        ) from None
+    try:
+        if sheet:
+            if sheet not in wb.sheetnames:
+                raise ConnectorError(
+                    f"{what} has no sheet named {sheet!r}", hint=f"Sheets in it: {', '.join(wb.sheetnames)[:200]}"
+                )
+            ws = wb[sheet]
+        else:
+            ws = wb.worksheets[0]
+        it = ws.iter_rows(values_only=True)
+        head = next(it, None)
+        if head is None:
+            return []
+        cols = _header(list(head))
+        rows: list[Record] = []
+        for line in it:
+            if all(v is None or (isinstance(v, str) and not v.strip()) for v in line):
+                continue
+            rows.append(normalize_record({c: (line[i] if i < len(line) else None) for i, c in enumerate(cols)}))
+            if len(rows) > MAX_ROWS:
+                break
+        return _cap(rows, what)
+    finally:
+        wb.close()
+
+
+def parse_jsonl(data: bytes, what: str = "The file") -> list[Record]:
+    rows: list[Record] = []
+    for n, line in enumerate(data.decode("utf-8-sig", errors="replace").splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            raise ConnectorError(
+                f"{what} line {n} isn't valid JSON", hint="JSON-lines files need one JSON object per line."
+            ) from None
+        if isinstance(obj, dict):
+            rows.append(normalize_record(obj))
+        if len(rows) > MAX_ROWS:
+            break
+    return _cap(rows, what)
+
+
+def parse_bytes(name: str, data: bytes, settings: dict[str, Any]) -> list[Record]:
+    ext = os.path.splitext(name)[1].lower()
+    what = f"File {name!r}"
+    if ext == ".csv":
+        return parse_csv(data, settings.get("delimiter") or ",", settings.get("encoding") or "utf-8-sig", what)
+    if ext == ".xlsx":
+        return parse_xlsx(data, settings.get("sheet") or None, what)
+    if ext in (".jsonl", ".ndjson"):
+        return parse_jsonl(data, what)
+    raise ConnectorError(f"{what} has an unsupported type", hint="Use .csv, .xlsx or .jsonl.")
+
+
+def _dataset(name: str, rows: list[Record]) -> Dataset:
+    cols = infer_columns(rows)
+    return Dataset(name=name, columns=cols, primary_key=primary_key_guess(cols))
+
+
+def _too_big(name: str, limit: int = MAX_FILE_BYTES) -> ConnectorError:
+    return ConnectorError(
+        f"File {name!r} is larger than {limit // (1024 * 1024)} MB", hint="Split it into smaller files."
+    )
+
+
+# --------------------------------------------------------------------------
+# Local files (uploaded)
+# --------------------------------------------------------------------------
+
+
+def data_dir() -> Path:
+    return Path(get_settings().data_dir).resolve()
+
+
+def safe_folder(folder: str) -> Path:
+    """Resolve a folder setting to a directory inside the data dir, or refuse."""
+    parts = [p for p in str(folder).replace("\\", "/").split("/") if p]
+    if not parts or str(folder).startswith(("/", "\\")) or not all(SAFE_PART.match(p) for p in parts):
+        raise ConnectorError(
+            f"Folder {folder!r} isn't allowed",
+            hint="Use a simple folder name inside the Live Ops data directory (letters, digits, . _ -), "
+            "with no '..' or leading '/'.",
+        )
+    root = data_dir()
+    path = root.joinpath(*parts).resolve()
+    if not path.is_relative_to(root):
+        raise ConnectorError(f"Folder {folder!r} is outside the data directory", hint="Pick a folder inside it.")
+    return path
+
+
+@dataclass
+class _Cached:
+    sig: tuple[Any, ...]
+    rows: list[Record]
+
+
+@register
+class CsvFileConnector(PollingConnector):
+    spec = ConnectorSpec(
+        type="csv_file",
+        display_name="CSV / Excel file",
+        category=Category.FILE,
+        modes=[Mode.POLL],
+        description="Upload CSV or Excel (.xlsx) files. Upload a new version to update the map.",
+        maturity="beta",
+        settings_schema={
+            "type": "object",
+            "properties": {
+                "folder": {
+                    "type": "string",
+                    "title": "Folder on the server",
+                    "description": "Set automatically on the first upload. Admins can point it at a folder "
+                    "inside LIVEOPS_DATA_DIR.",
+                },
+                "delimiter": {"type": "string", "title": "CSV delimiter", "default": ",", "maxLength": 1},
+                "encoding": {"type": "string", "title": "CSV encoding", "default": "utf-8-sig"},
+                "sheet": {"type": "string", "title": "Excel sheet (default: first sheet)"},
+            },
+        },
+    )
+
+    def __init__(self, settings: dict[str, Any], secrets: dict[str, Any]) -> None:
+        super().__init__(settings, secrets)
+        self._cache: dict[str, _Cached] = {}
+
+    def folder(self) -> Path:
+        f = self.settings.get("folder")
+        if not f:
+            raise ConnectorError("No file has been uploaded yet", hint="Upload a .csv or .xlsx file to this source.")
+        return safe_folder(str(f))
+
+    def _list(self) -> list[Path]:
+        root = self.folder()
+        if not root.is_dir():
+            raise ConnectorError(
+                f"Folder {self.settings.get('folder')!r} doesn't exist on the server",
+                hint="Upload a file to this source, or check the folder name.",
+            )
+        out = []
+        for p in sorted(root.iterdir()):
+            if p.name.startswith(".") or p.is_symlink() or not p.is_file():
+                continue
+            if p.suffix.lower() in LOCAL_EXTENSIONS:
+                out.append(p)
+            if len(out) >= MAX_FILES:
+                break
+        return out
+
+    def _path(self, dataset: str) -> Path:
+        for p in self._list():
+            if p.name == dataset:
+                return p
+        raise ConnectorError(
+            f"File {dataset!r} isn't in this source", hint="Pick one of the files listed, or upload it first."
+        )
+
+    def _read(self, path: Path) -> list[Record]:
+        st = path.stat()
+        sig = (st.st_ino, st.st_mtime_ns, st.st_size)
+        cached = self._cache.get(path.name)
+        if cached is not None and cached.sig == sig:
+            return cached.rows
+        if st.st_size > MAX_FILE_BYTES:
+            raise _too_big(path.name)
+        with path.open("rb") as fh:
+            data = fh.read(MAX_FILE_BYTES + 1)
+        rows = parse_bytes(path.name, data, self.settings)
+        self._cache[path.name] = _Cached(sig, rows)
+        return rows
+
+    async def test(self) -> TestReport:
+        started = time.monotonic()
+        steps: list[TestStep] = []
+        try:
+            files = await asyncio.to_thread(self._list)
+            steps.append(TestStep(name="Data folder", ok=True, detail=str(self.settings.get("folder"))))
+        except ConnectorError as e:
+            steps.append(TestStep(name="Data folder", ok=False, detail=str(e), hint=e.hint))
+            return TestReport.from_steps(steps, started)
+        steps.append(
+            TestStep(
+                name="Files",
+                ok=bool(files),
+                detail=f"{len(files)} .csv/.xlsx files",
+                hint="" if files else "Upload a .csv or .xlsx file to this source.",
+            )
+        )
+        for p in files[:5]:
+            try:
+                rows = await asyncio.to_thread(self._read, p)
+                steps.append(TestStep(name=f"Read {p.name}", ok=True, detail=f"{len(rows)} rows"))
+            except ConnectorError as e:
+                steps.append(TestStep(name=f"Read {p.name}", ok=False, detail=str(e), hint=e.hint))
+        return TestReport.from_steps(steps, started)
+
+    async def discover(self) -> list[Dataset]:
+        def run() -> list[Dataset]:
+            return [_dataset(p.name, self._read(p)) for p in self._list()]
+
+        return await asyncio.to_thread(run)
+
+    async def snapshot(self, dataset: str) -> list[Record]:
+        return await asyncio.to_thread(lambda: self._read(self._path(dataset)))
+
+
+# --------------------------------------------------------------------------
+# S3-compatible object storage
+# --------------------------------------------------------------------------
+
+
+@register
+class S3FilesConnector(PollingConnector):
+    spec = ConnectorSpec(
+        type="s3_files",
+        display_name="S3 / object storage files",
+        category=Category.FILE,
+        modes=[Mode.POLL],
+        description="Reads CSV, Excel and JSON-lines files from an S3-compatible bucket (AWS S3, MinIO, ...).",
+        maturity="needs_real_test",
+        settings_schema={
+            "type": "object",
+            "required": ["bucket"],
+            "properties": {
+                "bucket": {"type": "string", "title": "Bucket"},
+                "prefix": {"type": "string", "title": "Folder / prefix", "default": "", "examples": ["exports/"]},
+                "region": {"type": "string", "title": "Region", "default": "us-east-1"},
+                "endpoint_url": {
+                    "type": "string",
+                    "title": "Endpoint URL (not AWS)",
+                    "description": "For MinIO and other S3-compatible stores, e.g. https://minio.example.com:9000. "
+                    "Leave empty for AWS.",
+                },
+                "encryption": {
+                    "type": "string",
+                    "title": "Encryption",
+                    "enum": ["required", "verify", "off"],
+                    "default": "required",
+                    "description": "HTTPS with certificate checks. Use 'off' (plain HTTP) only for local testing.",
+                },
+                "delimiter": {"type": "string", "title": "CSV delimiter", "default": ",", "maxLength": 1},
+                "encoding": {"type": "string", "title": "CSV encoding", "default": "utf-8-sig"},
+                "sheet": {"type": "string", "title": "Excel sheet (default: first sheet)"},
+            },
+        },
+        secrets_schema={
+            "type": "object",
+            "properties": {
+                "access_key_id": {"type": "string", "title": "Access key ID"},
+                "secret_access_key": {"type": "string", "title": "Secret access key", "format": "password"},
+                "session_token": {"type": "string", "title": "Session token (optional)", "format": "password"},
+            },
+        },
+    )
+
+    def __init__(self, settings: dict[str, Any], secrets: dict[str, Any]) -> None:
+        super().__init__(settings, secrets)
+        self._client: Any = None
+        self._cache: dict[str, _Cached] = {}
+        self._keys: set[str] | None = None
+
+    @property
+    def bucket(self) -> str:
+        return str(self.settings.get("bucket") or "")
+
+    @property
+    def prefix(self) -> str:
+        return str(self.settings.get("prefix") or "")
+
+    def _s3(self) -> Any:
+        if self._client is not None:
+            return self._client
+        import boto3
+        from botocore.config import Config
+
+        endpoint = (self.settings.get("endpoint_url") or "").strip() or None
+        enc = self.settings.get("encryption") or "required"
+        if endpoint:
+            scheme = endpoint.split("://", 1)[0].lower() if "://" in endpoint else ""
+            if scheme not in ("http", "https"):
+                raise ConnectorError(
+                    f"Endpoint URL must start with https:// (got {endpoint!r})",
+                    hint="Use the full address, e.g. https://minio.example.com:9000.",
+                )
+            if scheme == "http" and enc != "off":
+                raise ConnectorError(
+                    "The endpoint uses plain http://, which isn't encrypted",
+                    hint="Use https://, or set Encryption to Off for local testing only.",
+                )
+        cfg = Config(
+            connect_timeout=5,
+            read_timeout=30,
+            retries={"max_attempts": 2, "mode": "standard"},
+            s3={"addressing_style": "path" if endpoint else "auto"},
+            user_agent_extra="liveops",
+        )
+        self._client = boto3.session.Session().client(
+            "s3",
+            endpoint_url=endpoint,
+            region_name=self.settings.get("region") or "us-east-1",
+            aws_access_key_id=self.secrets.get("access_key_id") or None,
+            aws_secret_access_key=self.secrets.get("secret_access_key") or None,
+            aws_session_token=self.secrets.get("session_token") or None,
+            config=cfg,
+            verify=enc != "off",
+        )
+        return self._client
+
+    async def close(self) -> None:
+        client, self._client = self._client, None
+        if client is not None:
+            await asyncio.to_thread(client.close)
+
+    async def _run(self, fn: Any, *args: Any) -> Any:
+        try:
+            return await asyncio.to_thread(fn, *args)
+        except ConnectorError:
+            raise
+        except Exception as e:  # noqa: BLE001 - translated into a plain-English error
+            raise _s3_error(e, self.bucket) from None
+
+    def _list_keys(self) -> list[tuple[str, int]]:
+        out: list[tuple[str, int]] = []
+        paginator = self._s3().get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=self.bucket, Prefix=self.prefix, PaginationConfig={"PageSize": 1000}):
+            for obj in page.get("Contents", []):
+                key = obj["Key"]
+                if key.lower().endswith(S3_EXTENSIONS):
+                    out.append((key, int(obj.get("Size", 0))))
+                if len(out) >= MAX_FILES:
+                    return out
+        return out
+
+    def _read(self, key: str) -> list[Record]:
+        s3 = self._s3()
+        head = s3.head_object(Bucket=self.bucket, Key=key)
+        sig = (head.get("ETag"), head.get("ContentLength"))
+        cached = self._cache.get(key)
+        if cached is not None and cached.sig == sig:
+            return cached.rows
+        if int(head.get("ContentLength") or 0) > MAX_FILE_BYTES:
+            raise _too_big(key)
+        # IfMatch: fail instead of mixing two versions if the object changes between head and get.
+        extra = {"IfMatch": head["ETag"]} if head.get("ETag") else {}
+        obj = s3.get_object(Bucket=self.bucket, Key=key, **extra)
+        body = obj["Body"]
+        try:
+            data = body.read(MAX_FILE_BYTES + 1)
+        finally:
+            body.close()
+        if len(data) > MAX_FILE_BYTES:
+            raise _too_big(key)
+        rows = parse_bytes(key, data, self.settings)
+        self._cache[key] = _Cached((obj.get("ETag") or head.get("ETag"), len(data)), rows)
+        return rows
+
+    async def _resolve(self, dataset: str) -> str:
+        if self._keys is None or dataset not in self._keys:
+            self._keys = {k for k, _ in await self._run(self._list_keys)}
+        if dataset not in self._keys:
+            raise ConnectorError(
+                f"Object {dataset!r} isn't a readable file under this prefix",
+                hint="Pick one of the files listed. Supported: .csv, .xlsx, .jsonl.",
+            )
+        return dataset
+
+    async def test(self) -> TestReport:
+        started = time.monotonic()
+        steps: list[TestStep] = []
+        try:
+            await self._run(self._s3)
+            enc = self.settings.get("encryption") or "required"
+            steps.append(
+                TestStep(
+                    name="Encryption",
+                    ok=True,
+                    detail="HTTPS" if enc != "off" else "plain HTTP allowed (local testing only)",
+                )
+            )
+        except ConnectorError as e:
+            steps.append(TestStep(name="Encryption", ok=False, detail=str(e), hint=e.hint))
+            return TestReport.from_steps(steps, started)
+        try:
+            keys = await self._run(self._list_keys)
+            steps.append(TestStep(name="Sign in and list the bucket", ok=True, detail=f"bucket {self.bucket!r}"))
+        except ConnectorError as e:
+            steps.append(TestStep(name="Sign in and list the bucket", ok=False, detail=str(e), hint=e.hint))
+            return TestReport.from_steps(steps, started)
+        steps.append(
+            TestStep(
+                name="Files",
+                ok=bool(keys),
+                detail=f"{len(keys)} .csv/.xlsx/.jsonl files under {self.prefix or 'the bucket root'!r}",
+                hint="" if keys else "Check the prefix, and that files end in .csv, .xlsx or .jsonl.",
+            )
+        )
+        if keys:
+            try:
+                rows = await self._run(self._read, keys[0][0])
+                steps.append(TestStep(name="Read a file", ok=True, detail=f"{keys[0][0]}: {len(rows)} rows"))
+            except ConnectorError as e:
+                steps.append(TestStep(name="Read a file", ok=False, detail=str(e), hint=e.hint))
+        return TestReport.from_steps(steps, started)
+
+    async def discover(self) -> list[Dataset]:
+        keys = await self._run(self._list_keys)
+        self._keys = {k for k, _ in keys}
+        out = []
+        for k, _ in keys:
+            out.append(_dataset(k, await self._run(self._read, k)))
+        return out
+
+    async def snapshot(self, dataset: str) -> list[Record]:
+        key = await self._resolve(dataset)
+        return await self._run(self._read, key)
+
+
+def _s3_error(e: Exception, bucket: str) -> ConnectorError:
+    from botocore.exceptions import ClientError, EndpointConnectionError, NoCredentialsError
+
+    if isinstance(e, ClientError):
+        code = str(e.response.get("Error", {}).get("Code", ""))
+        if code in ("InvalidAccessKeyId", "SignatureDoesNotMatch", "InvalidToken", "ExpiredToken", "403"):
+            return ConnectorError(
+                f"The storage service refused the access key ({code})",
+                hint="Check the access key ID and secret access key.",
+            )
+        if code in ("AccessDenied", "AllAccessDisabled"):
+            return ConnectorError(
+                f"The access key may not read bucket {bucket!r} (AccessDenied)",
+                hint="Give the key s3:ListBucket on the bucket and s3:GetObject on the prefix.",
+            )
+        if code in ("NoSuchBucket", "404", "NotFound"):
+            return ConnectorError(f"Bucket or file not found in {bucket!r} ({code})", hint="Check the bucket name.")
+        if code == "PreconditionFailed":
+            return ConnectorError("The file changed while it was being read", hint="It will be read again next poll.")
+        return ConnectorError(f"The storage service answered {code or 'an error'}", hint="Check bucket and prefix.")
+    if isinstance(e, NoCredentialsError):
+        return ConnectorError("No access key is set", hint="Enter the access key ID and secret access key.")
+    if isinstance(e, EndpointConnectionError):
+        return ConnectorError(
+            "Couldn't reach the storage endpoint",
+            hint="Check the endpoint URL and region, and that a firewall allows the connection.",
+        )
+    return ConnectorError(f"Storage error: {type(e).__name__}", hint="Check the endpoint URL and network.")

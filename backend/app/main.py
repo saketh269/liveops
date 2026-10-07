@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import select
 
 from app import __version__
-from app.api import mappings, sites, sources, stream, system
+from app.api import mappings, sites, sources, stream, system, uploads, webhooks
 from app.api.deps import mapping_spec
 from app.config import get_settings
 from app.core.runner import RunnerManager
@@ -56,6 +56,8 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
     for r in (system.router, sources.router, sites.router, mappings.router, stream.router):
+        app.include_router(r)
+    for r in (webhooks.router, uploads.router):
         app.include_router(r)
     return app
 
