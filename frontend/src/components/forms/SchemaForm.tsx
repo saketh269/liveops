@@ -37,6 +37,7 @@ const ENUM_LABELS: Record<string, Record<string, string>> = {
   encryption: {
     required: "Required (recommended)",
     verify: "Required and verify the server certificate",
+    required_legacy_auth: "Required (allow older password methods)",
     off: "Off (local testing only)",
   },
 };

@@ -27,6 +27,11 @@ def _warnings(src_type: str, settings: dict[str, Any]) -> list[str]:
     w = []
     if settings.get("encryption") == "off":
         w.append("Encryption is off. Use this only for local testing; company databases should use Required.")
+    if settings.get("encryption") == "required_legacy_auth":
+        w.append(
+            "Older password methods are allowed: someone impersonating the server could learn the password. "
+            "Switch the database user to SCRAM and choose Required."
+        )
     if settings.get("allow_http"):
         w.append("Plain HTTP is allowed, so data and keys travel unencrypted. Use this only for local testing.")
     if settings.get("allow_private_network") is True:

@@ -317,3 +317,86 @@ class TestPostgresCdcContract(ConnectorContract):
             await c.close()
         enc = next(s for s in report.steps if s.name == "Encryption")
         assert enc.ok and "NOT verified" in enc.detail
+
+    # -- release-blocker round (LIVEOPS-61, 62, 63, 75) ----------------------
+
+    async def test_over_the_cap_emits_nothing_before_the_error(
+        self, driver: PgCdcDriver, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """LIVEOPS-61: 2,503 rows, cap 1,500 (more than one fetch batch): 0 UPSERTs, then the error."""
+        import app.connectors.postgres_cdc as mod
+
+        await driver._exec("INSERT INTO assets (id, status) SELECT 'g' || g, 'ok' FROM generate_series(1, 2500) g", ())
+        monkeypatch.setattr(mod, "MAX_ROWS", 1500)
+        c = PostgresCdcConnector(driver.cdc_settings(), {"password": "reader_pw"})
+        gen = c.stream(driver.dataset, ["id"]).__aiter__()
+        emitted = 0
+        try:
+            with pytest.raises(ConnectorError) as e:
+                while True:
+                    await asyncio.wait_for(gen.__anext__(), 10)
+                    emitted += 1
+        finally:
+            await gen.aclose()
+            await c.close()
+        assert emitted == 0
+        assert "more than 1,500 rows" in str(e.value) and "poll" not in str(e.value)
+        assert "CDC" not in e.value.hint and "smaller table" in e.value.hint
+        assert mod.MAX_SNAPSHOT_ROWS == 50_000
+
+    async def test_keyless_row_getting_a_key_keeps_its_toast_value(self, driver: PgCdcDriver) -> None:
+        """LIVEOPS-62: incompressible 128 KB value is sent as 'unchanged TOAST' later."""
+        big_sql = "(SELECT string_agg(md5(g::text), '') FROM generate_series(1, 4000) g)"
+        await driver._exec(f"INSERT INTO assets (id, status, zone) VALUES (NULL, 'free', {big_sql})", ())
+        c = PostgresCdcConnector(driver.cdc_settings(), {"password": "reader_pw"})
+        gen = c.stream(driver.dataset, ["id"]).__aiter__()
+        try:
+            await self._initial(gen)
+            assert c.skipped_records == 1
+            await driver._exec(f"INSERT INTO assets (id, status, zone) VALUES (NULL, 'busy', {big_sql})", ())
+            await driver._exec("UPDATE assets SET id = 'K1' WHERE id IS NULL AND status = 'free'", ())
+            await driver._exec("UPDATE assets SET id = 'K2' WHERE id IS NULL AND status = 'busy'", ())
+            k1 = await asyncio.wait_for(gen.__anext__(), 5)
+            k2 = await asyncio.wait_for(gen.__anext__(), 5)
+            for ch, key in ((k1, "K1"), (k2, "K2")):
+                assert ch.key == key and isinstance(ch.record.get("zone"), str), sorted(ch.record)
+                assert len(ch.record["zone"]) == 128_000  # type: ignore[arg-type]
+        finally:
+            await gen.aclose()
+            await c.close()
+
+    async def test_killed_regular_session_gives_error_with_hint(self, driver: PgCdcDriver) -> None:
+        """LIVEOPS-63: the 5 s table check on a terminated session -> ConnectorError with a hint."""
+        c = PostgresCdcConnector(driver.cdc_settings(), {"password": "reader_pw"})
+        gen = c.stream(driver.dataset, ["id"]).__aiter__()
+        try:
+            await self._initial(gen)
+            async with await psycopg.AsyncConnection.connect(**driver.admin, autocommit=True) as a:
+                await a.execute(
+                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity"
+                    " WHERE usename = %s AND backend_type = 'client backend'",
+                    (driver.role,),
+                )
+            with pytest.raises(ConnectorError) as e:
+                await asyncio.wait_for(gen.__anext__(), 10)
+            assert e.value.hint and "reconnect" in e.value.hint
+        finally:
+            await gen.aclose()
+            await c.close()
+        assert c.last_slot_name not in await driver.slots()
+
+    async def test_publication_hint_quotes_schema_names(self, driver: PgCdcDriver) -> None:
+        """LIVEOPS-75: a schema setting can't inject SQL into the 'ask an admin to run' text."""
+        from app.connectors.postgres_cdc import _quote_ident
+
+        evil = 'public.t; ALTER ROLE mallory SUPERUSER; --"x'
+        c = PostgresCdcConnector(
+            {**driver.cdc_settings(), "publication": "nopub", "schemas": [evil]}, {"password": "reader_pw"}
+        )
+        try:
+            report = await c.test()
+        finally:
+            await c.close()
+        pub = next(s for s in report.steps if s.name == "Publication")
+        assert _quote_ident(evil) + ".your_table" in pub.hint
+        assert '"public.t; ALTER ROLE mallory SUPERUSER; --""x"' in pub.hint

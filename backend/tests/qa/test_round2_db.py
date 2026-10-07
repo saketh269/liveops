@@ -283,14 +283,8 @@ def test_null_keys_counted(backend: Backend, src: Src) -> None:
     "kind",
     [
         "postgres",
-        pytest.param(
-            "postgres_cdc",
-            marks=pytest.mark.xfail(strict=True, reason="LIVEOPS-61: postgres_cdc cap is 100k, 50,001 rows accepted"),
-        ),
-        pytest.param(
-            "mysql_cdc",
-            marks=pytest.mark.xfail(strict=True, reason="LIVEOPS-88: CDC over the cap says 'poll', hints 'use CDC'"),
-        ),
+        "postgres_cdc",  # LIVEOPS-61 fixed
+        "mysql_cdc",  # LIVEOPS-88 fixed
         "mysql_poll",
     ],
 )
