@@ -48,6 +48,7 @@ from psycopg.pq import Format
 from psycopg.rows import dict_row
 
 from app.connectors.base import (
+    MAX_SNAPSHOT_ROWS,
     Category,
     Change,
     ChangeOp,
@@ -65,13 +66,13 @@ from app.connectors.base import (
     record_key,
     snapshot_end,
 )
+from app.connectors.pg_tls import ENCRYPTION_DESCRIPTION, ENCRYPTION_ENUM, SSL_CA_SETTING, encryption_detail, tls_params
 from app.connectors.postgres import _connection_hint
 from app.connectors.registry import register
 
 log = logging.getLogger("liveops.connectors.postgres_cdc")
 
-SSL_MODES = {"required": "require", "verify": "verify-full", "off": "disable"}
-MAX_ROWS = 100_000  # initial-state cap; the key cache below is bounded by it
+MAX_ROWS = MAX_SNAPSHOT_ROWS  # initial-state cap (same as every connector); the key cache is bounded by it
 QUEUE_SIZE = 10_000  # replication messages buffered before the reader waits
 PG_EPOCH = dt.datetime(2000, 1, 1, tzinfo=dt.UTC).timestamp()
 TABLE_CHECK_S = 5.0  # how often a streaming table is checked for DROP / RENAME (LIVEOPS-43)
@@ -106,10 +107,11 @@ class PostgresCdcConnector(Connector):
                 "encryption": {
                     "type": "string",
                     "title": "Encryption",
-                    "enum": ["required", "verify", "off"],
+                    "enum": ENCRYPTION_ENUM,
                     "default": "required",
-                    "description": "Use 'off' only for local testing.",
+                    "description": ENCRYPTION_DESCRIPTION,
                 },
+                "ssl_ca": SSL_CA_SETTING,
                 "schemas": {
                     "type": "array",
                     "items": {"type": "string"},
@@ -145,9 +147,7 @@ class PostgresCdcConnector(Connector):
             "dbname": s["database"],
             "user": s["user"],
             "password": self.secrets.get("password", ""),
-            "sslmode": SSL_MODES.get(s.get("encryption", "required"), "require"),
-            # verify: check the certificate chain against the system CAs and the host name (verify-full)
-            **({"sslrootcert": "system"} if s.get("encryption") == "verify" else {}),
+            **tls_params(s),  # SCRAM + channel binding; verify-full against an explicit CA file
             "connect_timeout": 10,
             "application_name": "liveops",
             "options": "-c default_transaction_read_only=on -c statement_timeout=15000",
@@ -155,9 +155,15 @@ class PostgresCdcConnector(Connector):
 
     async def _connect(self) -> psycopg.AsyncConnection[dict[str, Any]]:
         if self._conn is None or self._conn.closed:
-            self._conn = await psycopg.AsyncConnection.connect(
-                **self._conninfo(), autocommit=True, row_factory=dict_row
-            )
+            try:
+                self._conn = await psycopg.AsyncConnection.connect(
+                    **self._conninfo(), autocommit=True, row_factory=dict_row
+                )
+            except psycopg.OperationalError as e:
+                msg = _first_line(e, "connection failed")
+                raise ConnectorError(
+                    msg, hint=_connection_hint(msg, self.settings.get("encryption", "required"))
+                ) from e
         return self._conn
 
     async def close(self) -> None:
@@ -182,10 +188,8 @@ class PostgresCdcConnector(Connector):
                     detail=f"{self.settings['host']}:{self.settings.get('port', 5432)}",
                 )
             )
-        except psycopg.OperationalError as e:
-            msg = _first_line(e, "connection failed")
-            hint = _connection_hint(msg, self.settings.get("encryption", "required"))
-            steps.append(TestStep(name="Reach the server", ok=False, detail=msg, hint=hint))
+        except ConnectorError as e:
+            steps.append(TestStep(name="Reach the server", ok=False, detail=str(e), hint=e.hint))
             return TestReport.from_steps(steps, started)
 
         try:
@@ -208,14 +212,7 @@ class PostgresCdcConnector(Connector):
                 TestStep(
                     name="Encryption",
                     ok=enc or want == "off",
-                    detail=(
-                        "not encrypted"
-                        if not enc
-                        else "encrypted (TLS), server certificate verified"
-                        if want == "verify"
-                        else "encrypted (TLS), server certificate NOT verified (use Verify for servers outside "
-                        "your network)"
-                    ),
+                    detail=encryption_detail(enc, want),
                     hint="" if enc or want == "off" else "Turn on TLS on the server.",
                 )
             )
@@ -273,7 +270,9 @@ class PostgresCdcConnector(Connector):
     async def _publication_step(self) -> TestStep:
         pub = self.settings.get("publication") or ""
         schemas = self.settings.get("schemas") or ["public"]
-        example = f"CREATE PUBLICATION {_quote_ident(pub or 'liveops')} FOR TABLE {schemas[0]}.your_table;"
+        example = (
+            f"CREATE PUBLICATION {_quote_ident(pub or 'liveops')} FOR TABLE {_quote_ident(schemas[0])}.your_table;"
+        )
         if not pub:
             return TestStep(
                 name="Publication",
@@ -400,6 +399,24 @@ class PostgresCdcConnector(Connector):
     async def stream(
         self, dataset: str, key_fields: list[str], options: dict[str, Any] | None = None
     ) -> AsyncIterator[Change]:
+        try:
+            async for change in self._stream(dataset, key_fields):
+                yield change
+        except psycopg.Error as e:
+            # The regular session died (DBA kill, failover, idle timeout): say so with a
+            # hint, and drop it so the runner's retry reconnects (LIVEOPS-63).
+            if self._conn is not None:
+                with contextlib.suppress(Exception):
+                    await self._conn.close()
+                self._conn = None
+            msg = _first_line(e, type(e).__name__)
+            raise ConnectorError(
+                msg,
+                hint=_connection_hint(msg, self.settings.get("encryption", "required"))
+                or "The connection to the database dropped; Live Ops reconnects and reloads the table.",
+            ) from e
+
+    async def _stream(self, dataset: str, key_fields: list[str]) -> AsyncIterator[Change]:
         schema, table = await self._resolve(dataset)
         ds = (self._datasets or {})[dataset]
         pub = self.settings.get("publication") or ""
@@ -467,26 +484,33 @@ class PostgresCdcConnector(Connector):
         """Read the table once, at exactly the slot's start point."""
         self.snapshot_queries += 1
         ts = time.time()
-        count = 0
+        cap = MAX_ROWS
+        rows: list[dict[str, Any]] = []
         await conn.execute("BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY")
         try:
             await conn.execute(sql.SQL("SET TRANSACTION SNAPSHOT {}").format(sql.Literal(snapshot_name)))
             async with conn.cursor(name=f"liveops_snap_{uuid.uuid4().hex[:8]}") as cur:
-                await cur.execute(sql.SQL("SELECT * FROM {}.{}").format(sql.Identifier(schema), sql.Identifier(table)))
-                while rows := await cur.fetchmany(1000):
-                    count += len(rows)
-                    if count > MAX_ROWS:
-                        raise ConnectorError(
-                            f"Table {schema}.{table} has more than {MAX_ROWS:,} rows",
-                            hint=f"Live Ops shows up to {MAX_ROWS:,} records per table. Map a smaller table "
-                            "(a publication can't carry a view).",
-                        )
-                    for row in rows:
-                        change = decoder.remember(row, ts)
-                        if change is not None:
-                            yield change
+                await cur.execute(
+                    sql.SQL("SELECT * FROM {}.{} LIMIT {}").format(
+                        sql.Identifier(schema), sql.Identifier(table), sql.Literal(cap + 1)
+                    )
+                )
+                while batch := await cur.fetchmany(1000):
+                    rows.extend(batch)
         finally:
             await conn.execute("COMMIT")
+        # Decide before emitting anything: a partial initial state would put an arbitrary
+        # subset on the map (LIVEOPS-61).
+        if len(rows) > cap:
+            raise ConnectorError(
+                f"Table {schema}.{table} has more than {cap:,} rows",
+                hint=f"Live Ops shows up to {cap:,} records per table. Map a smaller table "
+                "(live changes need a table; a publication can't carry a view).",
+            )
+        for row in rows:
+            change = decoder.remember(row, ts)
+            if change is not None:
+                yield change
 
     async def _table_oid(self, schema: str, table: str) -> int | None:
         conn = await self._connect()
@@ -645,6 +669,9 @@ class _Decoder:
     relations: dict[int, _Relation] = field(default_factory=dict)
     cache: dict[str, Record] = field(default_factory=dict)  # key -> last record (for TOAST and identity)
     by_identity: dict[tuple[Any, ...], str] = field(default_factory=dict)
+    # Rows without a mapping-key value, by replica identity: their unchanged TOAST
+    # values are needed when they later get a key (LIVEOPS-62).
+    keyless: dict[tuple[Any, ...], Record] = field(default_factory=dict)
     commit_ts: float | None = None
     skipped: int = 0
 
@@ -654,6 +681,7 @@ class _Decoder:
             key = record_key(rec, self.key_fields)
         except KeyError:
             self.skipped += 1
+            self._store_keyless(rec)
             return None
         self._store(key, rec)
         return Change(op=ChangeOp.UPSERT, dataset=self.dataset, key=key, record=rec, source_ts=ts)
@@ -662,6 +690,16 @@ class _Decoder:
         self.cache[key] = rec
         if self.primary_key and all(f in rec for f in self.primary_key):
             self.by_identity[tuple(rec[f] for f in self.primary_key)] = key
+
+    def _ident(self, rec: Record) -> tuple[Any, ...] | None:
+        if self.primary_key and all(rec.get(f) is not None for f in self.primary_key):
+            return tuple(rec[f] for f in self.primary_key)
+        return None
+
+    def _store_keyless(self, rec: Record) -> None:
+        ident = self._ident(rec)
+        if ident is not None:
+            self.keyless[ident] = rec
 
     def _forget(self, key: str) -> None:
         rec = self.cache.pop(key, None)
@@ -736,8 +774,10 @@ class _Decoder:
         if kind == b"D":
             key = self._key_of(old or {})
             if key is None:
-                self.skipped += 1
-                return []
+                gone = self._ident(old or {})
+                if gone is not None:
+                    self.keyless.pop(gone, None)
+                return []  # a keyless row went away: it was never on the map (already counted)
             self._forget(key)
             return [Change(op=ChangeOp.DELETE, dataset=self.dataset, key=key, record={}, source_ts=ts)]
         assert tag == b"N", f"unexpected pgoutput tuple tag {tag!r}"
@@ -749,25 +789,33 @@ class _Decoder:
             # the record's previous mapping key, which may differ (LIVEOPS-28).
             old_key = self._identity_key(new)
             prior = self.cache.get(old_key) if old_key else None
+        if prior is None and kind == b"U":
+            row_ident = self._ident(old or new)
+            prior = self.keyless.pop(row_ident, None) if row_ident is not None else None
+        new_key: str | None
         try:
-            key = record_key(new, self.key_fields)
+            new_key = record_key(new, self.key_fields)
         except KeyError:
-            self.skipped += 1
-            if old_key is None:
-                return []
-            self._forget(old_key)  # the row lost its key value: it leaves the map
-            return [Change(op=ChangeOp.DELETE, dataset=self.dataset, key=old_key, record={}, source_ts=ts)]
-        prior = prior if prior is not None else self.cache.get(key)
+            new_key = None
+        if prior is None and new_key is not None:
+            prior = self.cache.get(new_key)
         if prior is not None:  # unchanged TOAST values: keep the last known value
             for name, _oid, _ in rel.columns:
                 if name not in new and name in prior:
                     new[name] = prior[name]
+        if new_key is None:
+            self.skipped += 1
+            self._store_keyless(new)
+            if old_key is None:
+                return []
+            self._forget(old_key)  # the row lost its key value: it leaves the map
+            return [Change(op=ChangeOp.DELETE, dataset=self.dataset, key=old_key, record={}, source_ts=ts)]
         out: list[Change] = []
-        if old_key is not None and old_key != key:
+        if old_key is not None and old_key != new_key:
             self._forget(old_key)
             out.append(Change(op=ChangeOp.DELETE, dataset=self.dataset, key=old_key, record={}, source_ts=ts))
-        self._store(key, new)
-        out.append(Change(op=ChangeOp.UPSERT, dataset=self.dataset, key=key, record=new, source_ts=ts))
+        self._store(new_key, new)
+        out.append(Change(op=ChangeOp.UPSERT, dataset=self.dataset, key=new_key, record=new, source_ts=ts))
         return out
 
     def _key_of(self, partial: Record) -> str | None:

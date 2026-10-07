@@ -32,9 +32,16 @@ from app.connectors.base import (
     check_row_cap,
     normalize_record,
 )
+from app.connectors.pg_tls import (
+    ENCRYPTION_DESCRIPTION,
+    ENCRYPTION_ENUM,
+    SSL_CA_SETTING,
+    encryption_detail,
+    tls_hint,
+    tls_params,
+)
 from app.connectors.registry import register
 
-SSL_MODES = {"required": "require", "verify": "verify-full", "off": "disable"}
 MAX_ROWS = MAX_SNAPSHOT_ROWS  # poll-mode cap; larger tables raise instead of truncating
 
 
@@ -58,14 +65,11 @@ class PostgresConnector(PollingConnector):
                 "encryption": {
                     "type": "string",
                     "title": "Encryption",
-                    "enum": ["required", "verify", "off"],
+                    "enum": ENCRYPTION_ENUM,
                     "default": "required",
-                    "description": (
-                        "Required: traffic is encrypted. Verify: also checks the server's certificate "
-                        "against trusted authorities (use for servers outside your network). "
-                        "Off: local testing only."
-                    ),
+                    "description": ENCRYPTION_DESCRIPTION,
                 },
+                "ssl_ca": SSL_CA_SETTING,
                 "schemas": {
                     "type": "array",
                     "items": {"type": "string"},
@@ -97,8 +101,7 @@ class PostgresConnector(PollingConnector):
             "dbname": s["database"],
             "user": s["user"],
             "password": self.secrets.get("password", ""),
-            "sslmode": SSL_MODES.get(s.get("encryption", "required"), "require"),
-            **({"sslrootcert": "system"} if s.get("encryption") == "verify" else {}),
+            **tls_params(s),
             "connect_timeout": 10,
             "application_name": "liveops",
             "options": "-c default_transaction_read_only=on -c statement_timeout=15000",
@@ -152,7 +155,7 @@ class PostgresConnector(PollingConnector):
                 TestStep(
                     name="Encryption",
                     ok=enc or want == "off",
-                    detail="encrypted (TLS)" if enc else "not encrypted",
+                    detail=encryption_detail(enc, want),
                     hint="" if enc or want == "off" else "Turn on TLS on the server.",
                 )
             )
@@ -249,6 +252,8 @@ class PostgresConnector(PollingConnector):
 
 def _connection_hint(message: str, encryption: str) -> str:
     m = message.lower()
+    if tls := tls_hint(message):
+        return tls
     if "ssl" in m and ("not support" in m or "refused" in m) and encryption != "off":
         return (
             "The server doesn't accept encrypted connections. "

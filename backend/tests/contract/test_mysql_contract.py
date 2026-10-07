@@ -587,3 +587,20 @@ class TestMySQLPollContract(ConnectorContract):
         finally:
             await c.close()
         assert not report.ok and report.steps[0].name == "Reach the server" and report.steps[0].hint
+
+
+@requires_mysql
+async def test_grant_hint_quotes_the_database_name() -> None:
+    """LIVEOPS-75: a backtick in the database setting can't break out of the GRANT hint."""
+    d = MySQLDriver(grant_replication=False)
+    await d.setup()
+    evil = "app`.* TO 'app'@'%'; GRANT ALL ON *.* TO 'mallory'@'%' WITH GRANT OPTION; -- "
+    c = MySQLConnector({**d.settings(mode="poll"), "database": evil}, {"password": READER_PW})
+    try:
+        report = await c.test()
+    finally:
+        await c.close()
+        await d.teardown()
+    step = next(s for s in report.steps if s.name == "List tables")
+    quoted = "`app``.* TO 'app'@'%'; GRANT ALL ON *.* TO 'mallory'@'%' WITH GRANT OPTION; -- `"
+    assert f"GRANT SELECT ON {quoted}.*" in step.hint

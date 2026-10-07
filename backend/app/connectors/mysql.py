@@ -301,7 +301,7 @@ class MySQLConnector(PollingConnector):
                     detail=f"{len(ds)} tables or views readable in {self.settings['database']}",
                     hint=""
                     if ds
-                    else f"Grant SELECT: GRANT SELECT ON `{self.settings['database']}`.* TO '<user>'@'%';",
+                    else f"Grant SELECT: GRANT SELECT ON {_quote(self.settings['database'])}.* TO '<user>'@'%';",
                 )
             )
         except ConnectorError as e:
@@ -442,7 +442,7 @@ class MySQLConnector(PollingConnector):
 
         self.snapshot_queries += 1
         log_file, log_pos, rows = await self._call(snap)
-        check_row_cap(len(rows), dataset, MAX_ROWS)
+        _cdc_row_cap(len(rows), dataset)  # CDC wording, not "too many to poll" (LIVEOPS-88)
         ts = time.time()
         snapshot_skipped = 0
         for row in rows:
@@ -692,6 +692,15 @@ def _changes(
 # --------------------------------------------------------------------------
 # Small helpers
 # --------------------------------------------------------------------------
+
+
+def _cdc_row_cap(count: int, dataset: str) -> None:
+    if count > MAX_ROWS:
+        raise ConnectorError(
+            f"{dataset} has more than {MAX_ROWS:,} rows",
+            hint=f"Live Ops shows up to {MAX_ROWS:,} records per table. Map a smaller table, or switch "
+            "'How to read changes' to poll and map a view that filters to the rows you need.",
+        )
 
 
 def _quote(identifier: str) -> str:
