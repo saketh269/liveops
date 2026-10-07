@@ -165,6 +165,25 @@ describe("figure layer", () => {
     }
   });
 
+  test("a dirty (cleaning-state) bed shows a soiled sheet; other beds keep the clean one", () => {
+    document.documentElement.style.setProperty("--state-cleaning", "#c98a1a");
+    document.documentElement.style.setProperty("--state-free", "#1d8a4e");
+    try {
+      const l = new FigureLayer(world);
+      const dirty = new THREE.Color().setStyle("#c98a1a"), free = new THREE.Color().setStyle("#1d8a4e");
+      l.rebuild([entry("a", "bed", 0, {}, false, dirty), entry("b", "bed", 3, {}, false, free)], sphere);
+      const col = mesh(l, "figures:bed")!.geometry.getAttribute("color").array as Float32Array;
+      const t = figureTemplate("bed"), v = t.verts, at = t.paint.indexOf(PAINTS.indexOf("sheet"));
+      const rgb = (slot: number) => Array.from(col.subarray((slot * v + at) * 3, (slot * v + at) * 3 + 3));
+      expect(rgb(0)).not.toEqual(rgb(1));
+      l.setColor("a", free);
+      expect(rgb(0)).toEqual(rgb(1));
+    } finally {
+      document.documentElement.style.removeProperty("--state-cleaning");
+      document.documentElement.style.removeProperty("--state-free");
+    }
+  });
+
   test("palette overrides repaint role colors; state parts keep the state color", () => {
     const l = new FigureLayer(world);
     l.rebuild([entry("n", "nurse", 0)], sphere);

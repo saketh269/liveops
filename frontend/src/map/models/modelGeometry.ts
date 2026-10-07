@@ -17,7 +17,7 @@ export const PAINTS: readonly Paint[] = [
   "scrubs", "scrubsPants", "nurseCap", "coat", "doctorPants", "stethoscope",
   "evs", "evsPants", "evsCart", "evsBucket", "transporter", "transporterPants", "wheelchair", "wheelchairSeat",
   "medic", "medicPants", "reflective", "blazer", "blazerPants", "shirt", "staff", "staffPants", "gown", "gownPants",
-  "bedFrame", "mattress", "sheet", "pillow", "blanket", "monitor", "monitorScreen",
+  "bedFrame", "mattress", "sheet", "sheetDirty", "pillow", "blanket", "monitor", "monitorScreen",
   "vanBody", "vanStripe", "glass", "tire", "lightRed", "lightBlue", "vehicleBody",
   "equipment", "equipmentScreen", "other",
 ];

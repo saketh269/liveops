@@ -33,6 +33,8 @@ type WorldPose = { wx: number; wy: number; wz: number; heading: number; scale: n
 const MAX_RANGES = 48;
 /** States whose ambulance light bar flashes. */
 const FLASHING: readonly StateKey[] = ["in-use", "alert"];
+/** States whose bed sheet is drawn soiled (raw "dirty" maps to cleaning). */
+const SOILED: readonly StateKey[] = ["cleaning"];
 /** Walkers bob this much (footprint units) per stride. */
 const BOB = 0.02;
 
@@ -40,9 +42,11 @@ const BOB = 0.02;
 type Paints = { rgb: Float32Array; skin: THREE.Color[] };
 const SKIN = PAINTS.indexOf("skin");
 const STATE = PAINTS.indexOf("state");
+const SHEET = PAINTS.indexOf("sheet");
+const SHEET_DIRTY = PAINTS.indexOf("sheetDirty");
 
-/** Per-figure color inputs: state color, skin choice, light bar on. */
-type Look = { color: THREE.Color; variant: number; active: boolean };
+/** Per-figure color inputs: state color, skin choice, light bar on, sheet soiled. */
+type Look = { color: THREE.Color; variant: number; active: boolean; soiled: boolean };
 
 /** One merged mesh holding `capacity` copies of a template. */
 class Batch {
@@ -144,7 +148,8 @@ class Batch {
     const o = slot * t.verts;
     const skin = paints.skin[look.variant % paints.skin.length];
     for (let v = 0; v < t.verts; v++) {
-      const sh = t.shade[v], pi = t.paint[v], q = (o + v) * 3;
+      const sh = t.shade[v], q = (o + v) * 3;
+      const pi = look.soiled && t.paint[v] === SHEET ? SHEET_DIRTY : t.paint[v];
       if (pi === STATE) { a[q] = look.color.r * sh; a[q + 1] = look.color.g * sh; a[q + 2] = look.color.b * sh; }
       else if (pi === SKIN) { a[q] = skin.r * sh; a[q + 1] = skin.g * sh; a[q + 2] = skin.b * sh; }
       else { a[q] = paints.rgb[pi * 3] * sh; a[q + 1] = paints.rgb[pi * 3 + 1] * sh; a[q + 2] = paints.rgb[pi * 3 + 2] * sh; }
@@ -295,6 +300,7 @@ export class FigureLayer {
   private materials: Materials = { rest: figureMaterial(this.uniforms, false), walk: figureMaterial(this.uniforms, true) };
   private paints: Paints = { rgb: new Float32Array(PAINTS.length * 3), skin: [] };
   private flashColors: THREE.Color[] = [];
+  private soiledColors: THREE.Color[] = [];
   private paletteDirty = false;
   private reducedMotion = false;
   private disposers: (() => void)[] = [];
@@ -328,9 +334,14 @@ export class FigureLayer {
     });
     this.paints.skin = (p.skin.length ? p.skin : ["#d9a57f"]).map((s) => { try { return new THREE.Color().setStyle(s); } catch { return new THREE.Color(0xd9a57f); } });
     this.flashColors = [];
+    this.soiledColors = [];
     if (typeof document !== "undefined") {
       const sc = readStateColors();
-      for (const k of FLASHING) if (sc[k]) { try { this.flashColors.push(new THREE.Color().setStyle(sc[k])); } catch { /* unparsable token */ } }
+      const add = (keys: readonly StateKey[], out: THREE.Color[]) => {
+        for (const k of keys) if (sc[k]) { try { out.push(new THREE.Color().setStyle(sc[k])); } catch { /* unparsable token */ } }
+      };
+      add(FLASHING, this.flashColors);
+      add(SOILED, this.soiledColors);
     }
   }
 
@@ -340,6 +351,11 @@ export class FigureLayer {
    */
   private isActive(color: THREE.Color) {
     return this.flashColors.some((c) => c.equals(color));
+  }
+
+  /** A bed waiting for cleaning (dirty / cleaning) shows a soiled sheet, like the prototype. */
+  private isSoiled(color: THREE.Color) {
+    return this.soiledColors.some((c) => c.equals(color));
   }
 
   /**
@@ -440,8 +456,8 @@ export class FigureLayer {
     if (!g) return;
     let look = this.looks.get(id);
     if (look && look.color.equals(color)) return;
-    if (look) { look.color.copy(color); look.active = this.isActive(color); }
-    else { look = { color: color.clone(), variant: idHash(id), active: this.isActive(color) }; this.looks.set(id, look); }
+    if (look) { look.color.copy(color); look.active = this.isActive(color); look.soiled = this.isSoiled(color); }
+    else { look = { color: color.clone(), variant: idHash(id), active: this.isActive(color), soiled: this.isSoiled(color) }; this.looks.set(id, look); }
     this.paint(g, id, look);
   }
 
@@ -468,6 +484,7 @@ export class FigureLayer {
         const look = this.looks.get(id);
         if (!look) continue;
         look.active = this.isActive(look.color);
+        look.soiled = this.isSoiled(look.color);
         this.paint(g, id, look);
       }
     }

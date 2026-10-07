@@ -20,7 +20,7 @@ export type ModelPalette = {
   staff: string; staffPants: string;
   gown: string; gownPants: string;
   // bed
-  bedFrame: string; mattress: string; sheet: string; pillow: string; blanket: string; monitor: string; monitorScreen: string;
+  bedFrame: string; mattress: string; sheet: string; sheetDirty: string; pillow: string; blanket: string; monitor: string; monitorScreen: string;
   // vehicles
   vanBody: string; vanStripe: string; glass: string; tire: string; lightRed: string; lightBlue: string;
   vehicleBody: string;
@@ -42,7 +42,7 @@ export const MODEL_PALETTE_LIGHT: ModelPalette = {
   blazer: "#2b3646", blazerPants: "#222a35", shirt: "#f3f5f8",
   staff: "#7d93ad", staffPants: "#3a4757",
   gown: "#a9c6e8", gownPants: "#a9c6e8",
-  bedFrame: "#b8c4d1", mattress: "#ffffff", sheet: "#dbe7f5", pillow: "#ffffff", blanket: "#a9c6e8", monitor: "#24384c", monitorScreen: "#3fd0c9",
+  bedFrame: "#b8c4d1", mattress: "#ffffff", sheet: "#dbe7f5", sheetDirty: "#e9dcc2", pillow: "#ffffff", blanket: "#a9c6e8", monitor: "#24384c", monitorScreen: "#3fd0c9",
   vanBody: "#ffffff", vanStripe: "#d7463f", glass: "#2b3f55", tire: "#222a33", lightRed: "#ff3b3b", lightBlue: "#3b7bff",
   vehicleBody: "#c9d3dd",
   equipment: "#9fb3c6", equipmentScreen: "#24384c", other: "#9fb3c6",
@@ -57,7 +57,7 @@ export const MODEL_PALETTE_DARK: ModelPalette = {
   coat: "#dfe5ec", nurseCap: "#e6ebf0", shirt: "#dfe5ec",
   blazer: "#46566c", blazerPants: "#3a4658", medicPants: "#46505f", evsPants: "#5d6e82", transporterPants: "#47586f",
   staffPants: "#56657a", doctorPants: "#4c6a98", stethoscope: "#8fa5bd",
-  bedFrame: "#8f9dad", mattress: "#e3e8ee", sheet: "#c3d3e6", pillow: "#e3e8ee",
+  bedFrame: "#8f9dad", mattress: "#e3e8ee", sheet: "#c3d3e6", sheetDirty: "#c9b994", pillow: "#e3e8ee",
   monitor: "#56687d", vanBody: "#e3e8ee", glass: "#4a6380", tire: "#4b5562", wheelchair: "#6a7584",
   equipmentScreen: "#56687d",
 };
