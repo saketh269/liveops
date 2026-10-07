@@ -241,8 +241,8 @@ class CsvFileConnector(PollingConnector):
         },
     )
 
-    def __init__(self, settings: dict[str, Any], secrets: dict[str, Any]) -> None:
-        super().__init__(settings, secrets)
+    def __init__(self, settings: dict[str, Any], secrets: dict[str, Any], *, source_id: str | None = None) -> None:
+        super().__init__(settings, secrets, source_id=source_id)
         self._cache: dict[str, _Cached] = {}
 
     def folder(self) -> Path:
@@ -374,8 +374,8 @@ class S3FilesConnector(PollingConnector):
         },
     )
 
-    def __init__(self, settings: dict[str, Any], secrets: dict[str, Any]) -> None:
-        super().__init__(settings, secrets)
+    def __init__(self, settings: dict[str, Any], secrets: dict[str, Any], *, source_id: str | None = None) -> None:
+        super().__init__(settings, secrets, source_id=source_id)
         self._client: Any = None
         self._cache: dict[str, _Cached] = {}
         self._keys: set[str] | None = None

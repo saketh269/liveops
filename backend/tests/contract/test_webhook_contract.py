@@ -63,7 +63,7 @@ def app(temp_database: str) -> Iterator[FastAPI]:
 
 @pytest.fixture
 async def client(app: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://liveops.test") as c:
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://testserver") as c:
         yield c
 
 

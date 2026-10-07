@@ -24,6 +24,9 @@ docker compose up --build
 
 Open http://localhost:8080.
 
+> **Local use only in v0.1.** There is no sign-in yet, so the portal only
+> listens on your own computer. Don't expose it on a network until sign-in ships.
+
 ## Update to a new version
 
 ```bash

@@ -75,16 +75,31 @@ export function openSiteStream(siteId: string, onMessage: (m: StreamMessage) => 
   let ws: WebSocket | null = null;
   let stopped = false;
   let delay = 1000;
+  let retry: ReturnType<typeof setTimeout> | null = null;
   const connect = () => {
+    retry = null;
+    if (stopped) return;
     const proto = location.protocol === "https:" ? "wss" : "ws";
-    ws = new WebSocket(`${proto}://${location.host}/ws/sites/${siteId}`);
-    ws.onopen = () => { delay = 1000; onStatus?.("open"); };
-    ws.onmessage = (e) => onMessage(JSON.parse(e.data) as StreamMessage);
-    ws.onclose = () => {
+    const sock = new WebSocket(`${proto}://${location.host}/ws/sites/${siteId}`);
+    ws = sock;
+    sock.onopen = () => { delay = 1000; onStatus?.("open"); };
+    sock.onmessage = (e) => {
+      const msg = JSON.parse(e.data) as StreamMessage;
+      if (msg.type === "ping") return; // keepalive only; not a data update
+      onMessage(msg);
+    };
+    sock.onclose = () => {
+      if (ws !== sock) return;
       onStatus?.("closed");
-      if (!stopped) setTimeout(connect, (delay = Math.min(delay * 2, 15000)));
+      if (!stopped) retry = setTimeout(connect, (delay = Math.min(delay * 2, 15000)));
     };
   };
   connect();
-  return () => { stopped = true; ws?.close(); };
+  // Closing while a reconnect is pending must cancel it, or a socket leaks (LIVEOPS-30).
+  return () => {
+    stopped = true;
+    if (retry !== null) clearTimeout(retry);
+    ws?.close();
+    ws = null;
+  };
 }

@@ -112,6 +112,11 @@ class Dataset(BaseModel):
 class ChangeOp(StrEnum):
     UPSERT = "upsert"
     DELETE = "delete"
+    # Marker, exactly once per stream() call: "everything before me was the
+    # full current state". The runner then removes assets this mapping set
+    # earlier that were not in that state (e.g. deleted while we were down).
+    # ``key`` is "" and ``record`` is {}. See ADR 0004.
+    SNAPSHOT_END = "snapshot_end"
 
 
 class Change(BaseModel):
@@ -204,9 +209,15 @@ class Connector(abc.ABC):
 
     spec: ClassVar[ConnectorSpec]
 
-    def __init__(self, settings: dict[str, Any], secrets: dict[str, Any]) -> None:
+    def __init__(self, settings: dict[str, Any], secrets: dict[str, Any], *, source_id: str | None = None) -> None:
         self.settings = settings
         self.secrets = secrets
+        # The portal's id for this source (None in tests / before saving). Lets
+        # push connectors (webhook) and file connectors find their own data.
+        self.source_id = source_id
+        # Records dropped because they had no value in the key column(s). The
+        # runner shows this count on the Health page instead of failing.
+        self.skipped_records = 0
 
     # -- required ---------------------------------------------------------
 
@@ -229,7 +240,10 @@ class Connector(abc.ABC):
         """Yield changes forever, starting with the current state as UPSERTs.
 
         The first batch must describe the full current state so a fresh
-        subscriber can build the map, then only differences follow.
+        subscriber can build the map, followed by exactly one
+        ``ChangeOp.SNAPSHOT_END`` marker (use ``snapshot_end(dataset)``), then
+        only differences. Records without a key value are skipped and counted
+        in ``self.skipped_records``; they must never stop the stream.
         """
 
     # -- optional ---------------------------------------------------------
@@ -251,7 +265,12 @@ class PollingConnector(Connector):
     """Helper for poll-mode connectors: implement ``snapshot`` and get
     ``stream`` (snapshot diffing) for free.
 
-    The poll interval comes from ``options["poll_interval_s"]`` (default 3 s).
+    The poll interval comes from ``options["poll_interval_s"]`` (default 3 s,
+    never below ``MIN_POLL_INTERVAL_S``).
+
+    ``snapshot`` must return the *whole* dataset or raise ``ConnectorError``.
+    Never return a silently truncated snapshot: missing rows would be read as
+    deletes. Use ``check_row_cap()``.
     """
 
     @abc.abstractmethod
@@ -264,22 +283,54 @@ class PollingConnector(Connector):
     async def stream(
         self, dataset: str, key_fields: list[str], options: dict[str, Any] | None = None
     ) -> AsyncIterator[Change]:
-        interval = float((options or {}).get("poll_interval_s", 3.0))
+        interval = max(MIN_POLL_INTERVAL_S, float((options or {}).get("poll_interval_s", 3.0)))
         previous: dict[str, Record] | None = None
         while True:
             rows = await self.snapshot(dataset)
-            current = {record_key(r, key_fields): r for r in rows}
+            current, skipped = key_records(rows, key_fields)
+            self.skipped_records = skipped  # per poll: how many rows lack a key right now
             for change in diff_snapshots(dataset, previous, current):
                 yield change
             previous = current
             await asyncio.sleep(interval)
 
 
+MIN_POLL_INTERVAL_S = 0.5
+MAX_SNAPSHOT_ROWS = 50_000
+
+
+def check_row_cap(count: int, dataset: str, cap: int = MAX_SNAPSHOT_ROWS) -> None:
+    """Raise when a poll snapshot would be truncated. Fetch ``cap + 1`` rows and
+    pass how many came back."""
+    if count > cap:
+        raise ConnectorError(
+            f"{dataset} has more than {cap:,} rows, which is too many to poll",
+            hint="Map a view that filters to the rows you need, or use a live-changes (CDC) source type.",
+        )
+
+
+def key_records(rows: list[Record], key_fields: list[str]) -> tuple[dict[str, Record], int]:
+    """Key rows by ``key_fields``; rows with a missing/NULL key are skipped and counted."""
+    out: dict[str, Record] = {}
+    skipped = 0
+    for r in rows:
+        try:
+            out[record_key(r, key_fields)] = r
+        except KeyError:
+            skipped += 1
+    return out, skipped
+
+
+def snapshot_end(dataset: str) -> Change:
+    return Change(op=ChangeOp.SNAPSHOT_END, dataset=dataset, key="", record={})
+
+
 def diff_snapshots(dataset: str, previous: dict[str, Record] | None, current: dict[str, Record]) -> list[Change]:
     """Compare two keyed snapshots. ``previous=None`` emits everything."""
     out: list[Change] = []
     if previous is None:
-        return [Change(op=ChangeOp.UPSERT, dataset=dataset, key=k, record=r) for k, r in current.items()]
+        initial = [Change(op=ChangeOp.UPSERT, dataset=dataset, key=k, record=r) for k, r in current.items()]
+        return [*initial, snapshot_end(dataset)]
     for k, r in current.items():
         if previous.get(k) != r:
             out.append(Change(op=ChangeOp.UPSERT, dataset=dataset, key=k, record=r))

@@ -18,6 +18,7 @@ from psycopg import sql
 from psycopg.rows import dict_row
 
 from app.connectors.base import (
+    MAX_SNAPSHOT_ROWS,
     Category,
     Column,
     ConnectorError,
@@ -28,12 +29,13 @@ from app.connectors.base import (
     Record,
     TestReport,
     TestStep,
+    check_row_cap,
     normalize_record,
 )
 from app.connectors.registry import register
 
 SSL_MODES = {"required": "require", "verify": "verify-full", "off": "disable"}
-MAX_ROWS = 50_000  # poll-mode safety cap per dataset
+MAX_ROWS = MAX_SNAPSHOT_ROWS  # poll-mode cap; larger tables raise instead of truncating
 
 
 @register
@@ -58,7 +60,11 @@ class PostgresConnector(PollingConnector):
                     "title": "Encryption",
                     "enum": ["required", "verify", "off"],
                     "default": "required",
-                    "description": "Use 'off' only for local testing.",
+                    "description": (
+                        "Required: traffic is encrypted. Verify: also checks the server's certificate "
+                        "against trusted authorities (use for servers outside your network). "
+                        "Off: local testing only."
+                    ),
                 },
                 "schemas": {
                     "type": "array",
@@ -75,10 +81,11 @@ class PostgresConnector(PollingConnector):
         },
     )
 
-    def __init__(self, settings: dict[str, Any], secrets: dict[str, Any]) -> None:
-        super().__init__(settings, secrets)
+    def __init__(self, settings: dict[str, Any], secrets: dict[str, Any], *, source_id: str | None = None) -> None:
+        super().__init__(settings, secrets, source_id=source_id)
         self._conn: psycopg.AsyncConnection[dict[str, Any]] | None = None
         self._datasets: dict[str, Dataset] | None = None
+        self._names: dict[str, tuple[str, str]] = {}
 
     # -- connection -------------------------------------------------------
 
@@ -91,6 +98,7 @@ class PostgresConnector(PollingConnector):
             "user": s["user"],
             "password": self.secrets.get("password", ""),
             "sslmode": SSL_MODES.get(s.get("encryption", "required"), "require"),
+            **({"sslrootcert": "system"} if s.get("encryption") == "verify" else {}),
             "connect_timeout": 10,
             "application_name": "liveops",
             "options": "-c default_transaction_read_only=on -c statement_timeout=15000",
@@ -98,9 +106,15 @@ class PostgresConnector(PollingConnector):
 
     async def _connect(self) -> psycopg.AsyncConnection[dict[str, Any]]:
         if self._conn is None or self._conn.closed:
-            self._conn = await psycopg.AsyncConnection.connect(
-                **self._conninfo(), autocommit=True, row_factory=dict_row
-            )
+            try:
+                self._conn = await psycopg.AsyncConnection.connect(
+                    **self._conninfo(), autocommit=True, row_factory=dict_row
+                )
+            except psycopg.OperationalError as e:
+                msg = str(e).strip().splitlines()[0] if str(e).strip() else "connection failed"
+                raise ConnectorError(
+                    msg, hint=_connection_hint(msg, self.settings.get("encryption", "required"))
+                ) from e
         return self._conn
 
     async def close(self) -> None:
@@ -122,10 +136,8 @@ class PostgresConnector(PollingConnector):
                     detail=f"{self.settings['host']}:{self.settings.get('port', 5432)}",
                 )
             )
-        except psycopg.OperationalError as e:
-            msg = str(e).strip().splitlines()[0] if str(e).strip() else "connection failed"
-            hint = _connection_hint(msg, self.settings.get("encryption", "required"))
-            steps.append(TestStep(name="Reach the server", ok=False, detail=msg, hint=hint))
+        except ConnectorError as e:
+            steps.append(TestStep(name="Reach the server", ok=False, detail=str(e), hint=e.hint))
             return TestReport.from_steps(steps, started)
 
         async with conn.cursor() as cur:
@@ -199,17 +211,26 @@ class PostgresConnector(PollingConnector):
             d = out.setdefault(name, Dataset(name=name, columns=[], primary_key=pk_map.get(name, [])))
             d.columns.append(Column(name=c["column_name"], type=c["data_type"], nullable=c["is_nullable"] == "YES"))
         self._datasets = out
+        # Remember the real (schema, table) so names containing "." resolve correctly.
+        self._names = {f"{c['table_schema']}.{c['table_name']}": (c["table_schema"], c["table_name"]) for c in cols}
         return list(out.values())
 
     async def snapshot(self, dataset: str) -> list[Record]:
         schema, table = await self._resolve(dataset)
         conn = await self._connect()
         query = sql.SQL("SELECT * FROM {}.{} LIMIT {}").format(
-            sql.Identifier(schema), sql.Identifier(table), sql.Literal(MAX_ROWS)
+            sql.Identifier(schema), sql.Identifier(table), sql.Literal(MAX_ROWS + 1)
         )
-        async with conn.cursor() as cur:
-            await cur.execute(query)
-            rows = await cur.fetchall()
+        try:
+            async with conn.cursor() as cur:
+                await cur.execute(query)
+                rows = await cur.fetchall()
+        except psycopg.OperationalError as e:
+            await self.close()  # reconnect next time
+            raise ConnectorError(
+                str(e).strip().splitlines()[0], hint="The connection to the database dropped; retrying."
+            ) from e
+        check_row_cap(len(rows), dataset, MAX_ROWS)
         return [normalize_record(r) for r in rows]
 
     # -- helpers ----------------------------------------------------------
@@ -223,8 +244,7 @@ class PostgresConnector(PollingConnector):
                 f"Table {dataset!r} isn't readable with this user",
                 hint="Check the table name and that the user has SELECT on it.",
             )
-        schema, _, table = dataset.partition(".")
-        return schema, table
+        return self._names[dataset]
 
 
 def _connection_hint(message: str, encryption: str) -> str:

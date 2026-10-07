@@ -50,3 +50,24 @@ def temp_database() -> Iterator[str]:
 @pytest.fixture
 async def anyio_backend() -> AsyncIterator[str]:
     yield "asyncio"
+
+
+@pytest.fixture
+def portal_db(temp_database: str) -> Iterator[str]:
+    from alembic import command
+    from alembic.config import Config
+
+    p = pg_params()
+    host, port = p.get("host", "localhost"), p.get("port", 5432)
+    url = f"postgresql+psycopg://{p['user']}:{p.get('password', '')}@{host}:{port}/{temp_database}"
+    os.environ["LIVEOPS_DATABASE_URL"] = url
+    from app.config import get_settings
+    from app.db import reset_engine
+
+    get_settings.cache_clear()
+    reset_engine()
+    cfg = Config(os.path.join(os.path.dirname(__file__), "..", "alembic.ini"))
+    cfg.set_main_option("script_location", os.path.join(os.path.dirname(__file__), "..", "migrations"))
+    command.upgrade(cfg, "head")
+    yield url
+    reset_engine()

@@ -18,6 +18,11 @@ from app.db import Mapping, Source, get_session
 router = APIRouter(prefix="/api", tags=["sources"])
 
 
+# Settings that identify *where* a source lives. Changing one requires the
+# secrets to be entered again (LIVEOPS-24).
+ENDPOINT_FIELDS = ("host", "port", "base_url", "url", "token_url", "endpoint_url", "bucket", "region")
+
+
 def _warnings(src_type: str, settings: dict[str, Any]) -> list[str]:
     w = []
     if settings.get("encryption") == "off":
@@ -94,9 +99,26 @@ async def update_source(
 ) -> SourceOut:
     s = _get(session, source_id)
     secrets = secrets_mod.decrypt(s.secrets_enc)
-    if body.secrets:
-        secrets.update({k: v for k, v in body.secrets.items() if v not in (None, "")})
     settings = body.settings if body.settings is not None else (s.settings or {})
+    new_secrets = body.secrets or {}
+    # Saved credentials must not follow the source to a different server.
+    moved = [k for k in ENDPOINT_FIELDS if k in settings and settings.get(k) != (s.settings or {}).get(k)]
+    if moved and secrets and not any(v not in (None, "") for v in new_secrets.values()):
+        raise HTTPException(
+            422,
+            detail={
+                "message": f"Re-enter the password or token when changing {', '.join(moved)}",
+                "hint": "Saved credentials are only sent to the server they were entered for.",
+                "fields": sorted(secrets),
+            },
+        )
+    for k, v in new_secrets.items():
+        if v is None:
+            secrets.pop(k, None)  # explicit null clears a secret
+        elif v != "":
+            secrets[k] = v  # "" or omitted keeps the saved value
+    if moved:
+        secrets = {k: v for k, v in secrets.items() if k in new_secrets}
     _validate(s.type, settings, secrets)
     if body.name is not None:
         s.name = body.name
@@ -126,7 +148,7 @@ async def test_source(source_id: str, session: Session = Depends(get_session)) -
     s = _get(session, source_id)
     started = time.monotonic()
     try:
-        conn = build(s.type, s.settings or {}, secrets_mod.decrypt(s.secrets_enc))
+        conn = build(s.type, s.settings or {}, secrets_mod.decrypt(s.secrets_enc), source_id=s.id)
     except ConnectorError as e:
         return TestReport.from_steps([TestStep(name="Set up", ok=False, detail=str(e), hint=e.hint)], started)
     try:
@@ -140,7 +162,7 @@ async def test_source(source_id: str, session: Session = Depends(get_session)) -
 @router.get("/sources/{source_id}/datasets", response_model=list[Dataset])
 async def list_datasets(source_id: str, session: Session = Depends(get_session)) -> list[Dataset]:
     s = _get(session, source_id)
-    conn = build(s.type, s.settings or {}, secrets_mod.decrypt(s.secrets_enc))
+    conn = build(s.type, s.settings or {}, secrets_mod.decrypt(s.secrets_enc), source_id=s.id)
     try:
         return await conn.discover()
     except ConnectorError as e:
@@ -156,7 +178,7 @@ async def preview(
     source_id: str, dataset: str, limit: int = 20, session: Session = Depends(get_session)
 ) -> list[Record]:
     s = _get(session, source_id)
-    conn = build(s.type, s.settings or {}, secrets_mod.decrypt(s.secrets_enc))
+    conn = build(s.type, s.settings or {}, secrets_mod.decrypt(s.secrets_enc), source_id=s.id)
     try:
         return await conn.preview(dataset, max(1, min(limit, 200)))
     except ConnectorError as e:

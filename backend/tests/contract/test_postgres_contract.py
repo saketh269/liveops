@@ -14,6 +14,9 @@ from tests.contract.kit import SEED_ROWS, ConnectorContract
 
 
 class PgDriver:
+    # CDC needs a primary key (replica identity); the poll test uses a nullable key column.
+    key_ddl = "PRIMARY KEY"
+
     def __init__(self, dbname: str) -> None:
         self.dbname = dbname
         self.dataset = "public.assets"
@@ -24,7 +27,7 @@ class PgDriver:
     async def setup(self) -> None:
         async with await psycopg.AsyncConnection.connect(**self.admin, autocommit=True) as c:
             await c.execute(
-                """CREATE TABLE assets (id text PRIMARY KEY, status text, zone text,
+                f"""CREATE TABLE assets (id text {self.key_ddl}, status text, zone text,
                    updated_at timestamptz DEFAULT now(), amount numeric(10,2) DEFAULT 1.50, blob bytea)"""
             )
             for r in SEED_ROWS:
@@ -58,6 +61,9 @@ class PgDriver:
     async def update(self, key: str, changes: dict[str, Any]) -> None:
         await self._exec("UPDATE assets SET status = %s, updated_at = now() WHERE id = %s", (changes["status"], key))
 
+    async def _insert_null_key(self, row: dict[str, Any]) -> None:
+        await self._exec("INSERT INTO assets (id, status, zone) VALUES (NULL, %s, %s)", (row["status"], row["zone"]))
+
     async def delete(self, key: str) -> None:
         await self._exec("DELETE FROM assets WHERE id = %s", (key,))
 
@@ -72,13 +78,20 @@ class PgDriver:
         }
 
 
+class PgPollDriver(PgDriver):
+    key_ddl = "UNIQUE"
+
+    async def insert_null_key(self, row: dict[str, Any]) -> None:
+        await self._insert_null_key(row)
+
+
 @requires_pg
 class TestPostgresContract(ConnectorContract):
     latency_budget_s = 5.0
 
     @pytest.fixture
     async def driver(self, temp_database: str) -> AsyncIterator[PgDriver]:
-        d = PgDriver(temp_database)
+        d = PgPollDriver(temp_database)
         await d.setup()
         try:
             yield d

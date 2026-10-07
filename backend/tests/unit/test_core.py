@@ -45,7 +45,7 @@ def test_record_key_composite_and_missing() -> None:
 
 def test_diff_snapshots() -> None:
     first = diff_snapshots("t", None, {"1": {"s": "a"}})
-    assert [(c.op, c.key) for c in first] == [(ChangeOp.UPSERT, "1")]
+    assert [(c.op, c.key) for c in first] == [(ChangeOp.UPSERT, "1"), (ChangeOp.SNAPSHOT_END, "")]
     changes = diff_snapshots("t", {"1": {"s": "a"}, "2": {"s": "b"}}, {"1": {"s": "z"}, "3": {"s": "c"}})
     assert {(c.op, c.key) for c in changes} == {(ChangeOp.UPSERT, "1"), (ChangeOp.UPSERT, "3"), (ChangeOp.DELETE, "2")}
 

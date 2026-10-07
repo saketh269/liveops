@@ -4,9 +4,13 @@ import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from sqlalchemy import select
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from app import __version__
 from app.api import mappings, sites, sources, stream, system, uploads, webhooks
@@ -15,6 +19,7 @@ from app.config import get_settings
 from app.core.runner import RunnerManager
 from app.core.state import InMemoryStateStore, StateStore
 from app.db import Mapping, Source, new_session
+from app.secrets import SecretsError
 
 log = logging.getLogger("liveops")
 
@@ -39,16 +44,40 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         with new_session() as s:
             for m in s.scalars(select(Mapping).where(Mapping.active.is_(True))):
                 src = s.get(Source, m.source_id)
-                if src is not None:
+                if src is None:
+                    continue
+                try:
                     await app.state.runner.start(mapping_spec(m, src))
+                except SecretsError as e:
+                    # One unreadable source must not stop the app (LIVEOPS-41).
+                    app.state.runner.mark_error(m.id, src.id, str(e), SECRETS_HINT)
+                    log.error("mapping %s not started: %s", m.id, e)
     log.info("Live Ops %s started", __version__)
     yield
     await app.state.runner.stop_all()
     await app.state.store.close()
 
 
+SECRETS_HINT = "Open the source, enter its password or token again, and save. Then resume the mapping."
+
+
 def create_app() -> FastAPI:
+    settings = get_settings()
     app = FastAPI(title="Live Ops", version=__version__, lifespan=lifespan)
+
+    @app.exception_handler(SecretsError)
+    async def _secrets_error(_: Request, exc: SecretsError) -> JSONResponse:
+        return JSONResponse(status_code=409, content={"detail": {"message": str(exc), "hint": SECRETS_HINT}})
+
+    @app.exception_handler(RequestValidationError)
+    async def _validation_error(_: Request, exc: RequestValidationError) -> JSONResponse:
+        # FastAPI echoes the submitted value by default; never send passwords back (LIVEOPS-33).
+        errors = [{k: v for k, v in e.items() if k not in ("input", "ctx", "url")} for e in exc.errors()]
+        return JSONResponse(status_code=422, content={"detail": jsonable_encoder(errors)})
+
+    # The portal has no sign-in yet (v0.1, see ADR 0005): only answer for the
+    # host names it is meant to be reached by, which also blocks DNS rebinding.
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=settings.allowed_hosts)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=get_settings().cors_origins,

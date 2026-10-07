@@ -32,5 +32,7 @@ def get_class(connector_type: str) -> type[Connector]:
         ) from None
 
 
-def build(connector_type: str, settings: dict[str, Any], secrets: dict[str, Any]) -> Connector:
-    return get_class(connector_type)(settings, secrets)
+def build(
+    connector_type: str, settings: dict[str, Any], secrets: dict[str, Any], *, source_id: str | None = None
+) -> Connector:
+    return get_class(connector_type)(settings, secrets, source_id=source_id)

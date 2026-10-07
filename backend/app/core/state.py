@@ -100,6 +100,29 @@ class StateStore(abc.ABC):
     async def clear_mapping(self, site_id: str, mapping_id: str) -> None:
         """Drop all fields a mapping contributed (mapping paused/deleted)."""
 
+    async def reconcile(self, site_id: str, mapping_id: str, keep: set[str]) -> int:
+        """After a mapping's full-state snapshot: drop that mapping's fields from
+        every asset not in ``keep`` (e.g. rows deleted while the backend was down,
+        or asset ids that changed after a mapping edit). Returns how many assets
+        were touched. Stores may override with a faster version."""
+        touched = 0
+        for asset in await self.site_assets(site_id):
+            if asset.asset_id in keep:
+                continue
+            if any(v.mapping_id == mapping_id for v in asset.fields.values()):
+                await self.apply(
+                    AssetEvent(
+                        site_id=site_id,
+                        asset_id=asset.asset_id,
+                        op=AssetOp.REMOVE,
+                        source_id="",
+                        mapping_id=mapping_id,
+                        dataset="",
+                    )
+                )
+                touched += 1
+        return touched
+
     @abc.abstractmethod
     async def events(self, site_id: str, since: float | None = None, limit: int = 100) -> list[EventEntry]:
         """Event log entries after ``since`` (oldest first), or the latest

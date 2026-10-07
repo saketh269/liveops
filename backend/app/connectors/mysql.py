@@ -129,8 +129,8 @@ class MySQLConnector(PollingConnector):
         },
     )
 
-    def __init__(self, settings: dict[str, Any], secrets: dict[str, Any]) -> None:
-        super().__init__(settings, secrets)
+    def __init__(self, settings: dict[str, Any], secrets: dict[str, Any], *, source_id: str | None = None) -> None:
+        super().__init__(settings, secrets, source_id=source_id)
         self._conn: pymysql.connections.Connection[Any] | None = None
         self._lock = threading.Lock()
         self._datasets: dict[str, Dataset] | None = None

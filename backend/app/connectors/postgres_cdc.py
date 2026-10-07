@@ -123,8 +123,8 @@ class PostgresCdcConnector(Connector):
         },
     )
 
-    def __init__(self, settings: dict[str, Any], secrets: dict[str, Any]) -> None:
-        super().__init__(settings, secrets)
+    def __init__(self, settings: dict[str, Any], secrets: dict[str, Any], *, source_id: str | None = None) -> None:
+        super().__init__(settings, secrets, source_id=source_id)
         self._conn: psycopg.AsyncConnection[dict[str, Any]] | None = None
         self._datasets: dict[str, Dataset] | None = None
         self._pumps: set[_ReplicationPump] = set()

@@ -105,7 +105,7 @@ export type Asset = {
 };
 
 export type StreamMessage = {
-  type: "snapshot" | "upsert" | "remove" | "event";
+  type: "snapshot" | "upsert" | "remove" | "event" | "ping";
   site_id: string;
   assets: Asset[];
   event: Record<string, unknown> | null;

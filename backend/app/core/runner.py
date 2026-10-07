@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from app.connectors import build
-from app.connectors.base import Connector, ConnectorError
+from app.connectors.base import ChangeOp, Connector, ConnectorError
 from app.core.mapping import MappingConfig, MappingProblem, apply_mapping
 from app.core.state import StateStore
 
@@ -33,7 +33,8 @@ class MappingHealth:
     last_error_hint: str | None = None
     last_error_ts: float | None = None
     events_total: int = 0
-    skipped_records: int = 0
+    skipped_records: int = 0  # records the mapping couldn't use
+    connector_skipped: int = 0  # rows the connector dropped (no key value)
     lag_ms_recent: deque[float] = field(default_factory=lambda: deque(maxlen=200))
     _event_times: deque[float] = field(default_factory=lambda: deque(maxlen=2000))
 
@@ -58,7 +59,7 @@ class MappingHealth:
             "events_total": self.events_total,
             "events_per_min": len(recent),
             "lag_ms_p95": round(p95, 1) if p95 is not None else None,
-            "skipped_records": self.skipped_records,
+            "skipped_records": self.skipped_records + self.connector_skipped,
             "last_error": self.last_error,
             "last_error_hint": self.last_error_hint,
             "last_error_ts": self.last_error_ts,
@@ -93,6 +94,11 @@ class RunnerManager:
         self.health[spec.mapping_id] = MappingHealth(spec.mapping_id, spec.source_id)
         self._tasks[spec.mapping_id] = asyncio.create_task(self._run(spec), name=f"mapping:{spec.mapping_id}")
 
+    def mark_error(self, mapping_id: str, source_id: str, message: str, hint: str | None = None) -> None:
+        """Record a mapping that could not be started at all."""
+        h = self.health.setdefault(mapping_id, MappingHealth(mapping_id, source_id))
+        h.status, h.last_error, h.last_error_hint, h.last_error_ts = "error", message, hint, time.time()
+
     async def stop(self, mapping_id: str, *, clear: bool = True, site_id: str | None = None) -> None:
         task = self._tasks.pop(mapping_id, None)
         if task is not None:
@@ -114,9 +120,20 @@ class RunnerManager:
         while True:
             connector: Connector | None = None
             try:
-                connector = build(spec.source_type, spec.settings, spec.secrets)
-                h.status = "running"
+                connector = build(spec.source_type, spec.settings, spec.secrets, source_id=spec.source_id)
+                h.status = "starting"
+                seen: set[str] = set()
+                snapshot_done = False
                 async for change in connector.stream(spec.dataset, [spec.config.key_field], spec.options):
+                    h.connector_skipped = connector.skipped_records
+                    if change.op == ChangeOp.SNAPSHOT_END:
+                        removed = await self.state.reconcile(spec.site_id, spec.mapping_id, seen)
+                        if removed:
+                            log.info("mapping %s: removed %d stale assets after snapshot", spec.mapping_id, removed)
+                        snapshot_done, seen = True, set()
+                        h.status = "running"
+                        backoff = 1.0
+                        continue
                     try:
                         event = apply_mapping(
                             change,
@@ -129,9 +146,13 @@ class RunnerManager:
                         h.skipped_records += 1
                         h.last_error, h.last_error_ts = str(e), time.time()
                         continue
+                    if not snapshot_done:
+                        seen.add(event.asset_id)
                     await self.state.apply(event)
                     h.record_event(change.source_ts, change.received_ts)
-                    backoff = 1.0
+                    if snapshot_done:
+                        h.status = "running"
+                        backoff = 1.0
             except asyncio.CancelledError:
                 raise
             except Exception as e:  # noqa: BLE001 - a source failure must not kill the app

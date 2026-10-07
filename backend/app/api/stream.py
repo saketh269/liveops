@@ -14,16 +14,24 @@ import contextlib
 import logging
 import time
 from typing import Any
+from urllib.parse import urlsplit
 
 import anyio
 from fastapi import APIRouter, Depends, Query, WebSocket
 
 from app.api.deps import state_store
+from app.config import get_settings
 from app.core.eventlog import MAX_LIMIT, describe
 from app.core.events import StreamMessage
 from app.core.state import StateStore
 
 router = APIRouter(tags=["stream"])
+
+
+def _allowed_origin_hosts() -> set[str]:
+    return {h.strip("[]") for h in get_settings().allowed_hosts}
+
+
 log = logging.getLogger("liveops.stream")
 
 PING_INTERVAL_S = 20.0
@@ -47,6 +55,11 @@ async def site_events(
 @router.websocket("/ws/sites/{site_id}")
 async def site_stream(ws: WebSocket, site_id: str) -> None:
     """Snapshot of the site's assets, then live upserts/removes/feed events."""
+    origin = ws.headers.get("origin")
+    if origin and (urlsplit(origin).hostname or "") not in _allowed_origin_hosts():
+        # Browsers send Origin on WebSockets; refuse pages from other sites (LIVEOPS-15).
+        await ws.close(code=1008, reason="Origin not allowed")
+        return
     await ws.accept()
     store: StateStore = ws.app.state.store
     gen = store.subscribe(site_id)

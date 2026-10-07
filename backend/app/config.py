@@ -14,6 +14,9 @@ class Settings(BaseSettings):
     redis_url: str | None = None  # None = in-memory state store (single process)
     redis_key_prefix: str = "liveops"  # all Redis keys start with this (no { or })
     cors_origins: list[str] = ["http://localhost:5173"]
+    # Host names the portal answers to (Host header and WebSocket Origin). Add
+    # your server's name here if you deliberately serve it beyond this machine.
+    allowed_hosts: list[str] = ["localhost", "127.0.0.1", "[::1]", "backend", "testserver"]
     start_runners: bool = True  # tests switch this off
     log_level: str = "INFO"
     data_dir: str = "./data"  # uploaded files for csv_file sources (one sub-folder per source)

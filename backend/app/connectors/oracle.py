@@ -125,8 +125,8 @@ class OracleConnector(PollingConnector):
         },
     )
 
-    def __init__(self, settings: dict[str, Any], secrets: dict[str, Any]) -> None:
-        super().__init__(settings, secrets)
+    def __init__(self, settings: dict[str, Any], secrets: dict[str, Any], *, source_id: str | None = None) -> None:
+        super().__init__(settings, secrets, source_id=source_id)
         self._conn: Any = None
         self._lock = asyncio.Lock()
         self._datasets: dict[str, Dataset] | None = None
