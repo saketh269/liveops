@@ -17,3 +17,5 @@
     overflow-x: auto; padding: 10px 16px; }
   .nav nav { grid-auto-flow: column; }
 }
+/* Narrow screens: keep the top nav at its natural height instead of sharing the page height. */
+@media (max-width: 760px) { .shell { grid-template-rows: auto 1fr; } }

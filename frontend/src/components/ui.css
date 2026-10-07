@@ -1,0 +1,102 @@
+/* Shared styles for app pages (Sources, Sites, Mapping, Health). Tokens only. */
+.stack { display: grid; gap: var(--gap); }
+.stack-sm { display: grid; gap: 8px; }
+.row-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 8px; }
+.row-actions:first-child { margin-top: 0; }
+.lead { color: var(--muted); max-width: 70ch; margin: 4px 0 0; }
+
+.btn.danger { color: var(--bad); }
+.btn.danger:hover { border-color: var(--bad); }
+.btn.danger.solid { background: var(--bad); color: var(--panel); border-color: var(--bad); }
+.btn.link { border-color: transparent; background: transparent; color: var(--accent); padding-inline: 6px; }
+a.btn { text-decoration: none; display: inline-block; }
+.btn:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible,
+summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.notice { display: grid; gap: 4px; color: var(--fg); }
+.notice .hint { color: var(--fg); }
+.notice .problems { margin: 4px 0 0; padding-left: 20px; }
+
+.loading { display: flex; gap: 10px; align-items: center; color: var(--muted); padding: 12px 0; }
+.spinner { width: 14px; height: 14px; border-radius: 50%; border: 2px solid var(--line);
+  border-top-color: var(--accent); animation: spin 0.8s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.empty { display: grid; gap: 8px; text-align: left; }
+.empty ol { margin: 4px 0 0; padding-left: 20px; }
+
+.confirm { border: 1px solid var(--bad); background: var(--bad-soft); border-radius: 6px; padding: 10px 12px;
+  display: grid; gap: 6px; }
+.confirm p { margin: 0; }
+
+.card-list { display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(min(100%, 300px), 1fr)); }
+.card { display: grid; gap: 8px; align-content: start; }
+.card-head { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 8px; }
+.card-head h2, .card-head h3 { overflow-wrap: anywhere; }
+.badges { display: flex; flex-wrap: wrap; gap: 6px; }
+.meta { font-size: 0.8rem; color: var(--muted); display: flex; flex-wrap: wrap; gap: 4px 14px; }
+.meta dt { display: inline; color: var(--faint); }
+.meta dd { display: inline; margin: 0 0 0 4px; }
+
+.form-grid { display: grid; gap: 14px; align-items: start; grid-template-columns: repeat(auto-fill, minmax(min(100%, 240px), 1fr)); }
+.form-grid .wide { grid-column: 1 / -1; }
+.req { color: var(--bad); margin-left: 2px; }
+.field input[aria-invalid="true"], .field select[aria-invalid="true"] { border-color: var(--bad); }
+.field .err { font-size: 0.78rem; color: var(--bad); }
+.field input:disabled, .field select:disabled { opacity: 0.7; }
+fieldset { border: 1px solid var(--line); border-radius: var(--radius); padding: 12px 14px; margin: 0; min-width: 0; }
+legend { font-weight: 600; padding: 0 6px; }
+.check { display: flex; gap: 8px; align-items: center; font-size: 0.85rem; }
+.check input { accent-color: var(--accent); }
+.checks { display: flex; flex-wrap: wrap; gap: 6px 16px; }
+
+/* Test connection checklist */
+.checklist { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+.checklist li { display: grid; grid-template-columns: 24px minmax(0, 1fr); gap: 8px; align-items: start; }
+.checklist .mark { width: 22px; height: 22px; border-radius: 50%; display: grid; place-items: center;
+  font-weight: 700; font-size: 0.8rem; }
+.checklist .ok .mark { background: var(--ok-soft); color: var(--ok); }
+.checklist .fail .mark { background: var(--bad-soft); color: var(--bad); }
+.checklist .detail { color: var(--muted); font-size: 0.85rem; overflow-wrap: anywhere; }
+.checklist .fix { font-size: 0.85rem; }
+
+/* Connector picker */
+.picker-group { display: grid; gap: 8px; }
+.picker-group h3 { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted);
+  font-family: var(--f-mono); }
+.picker-option { text-align: left; display: grid; gap: 6px; width: 100%; font: inherit; color: var(--fg);
+  background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 12px 14px;
+  cursor: pointer; }
+.picker-option:hover { border-color: var(--accent); }
+.picker-option .name { font-weight: 600; }
+.picker-option .desc { color: var(--muted); font-size: 0.85rem; }
+
+/* Tables */
+.table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: var(--radius); max-width: 100%; }
+table.data { border-collapse: collapse; width: 100%; font-size: 0.82rem; }
+table.data th, table.data td { padding: 6px 10px; border-bottom: 1px solid var(--line); text-align: left;
+  white-space: nowrap; max-width: 280px; overflow: hidden; text-overflow: ellipsis; }
+table.data th { background: var(--panel-2); font-weight: 600; position: sticky; top: 0; }
+table.data th .type { display: block; font-weight: 400; color: var(--faint); font-family: var(--f-mono); font-size: 0.72rem; }
+table.data tr:last-child td { border-bottom: 0; }
+table.data td.num { text-align: right; font-family: var(--f-mono); }
+
+/* Mapping wizard */
+.steps { list-style: none; margin: 0; padding: 0; display: grid; gap: 12px; counter-reset: step; }
+.step { counter-increment: step; }
+.step > .panel { display: grid; gap: 10px; }
+.step h2::before { content: counter(step) ". "; color: var(--accent); }
+.step.locked > .panel { opacity: 0.55; }
+.translate-row { display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); gap: 8px; align-items: center; }
+.translate-row .arrow { color: var(--faint); }
+.translate-row code { overflow-wrap: anywhere; }
+
+/* Health */
+.health-row { display: grid; gap: 8px; }
+.stats { display: grid; gap: 8px; grid-template-columns: repeat(auto-fill, minmax(min(100%, 120px), 1fr)); margin: 0; }
+.stats div { background: var(--panel-2); border-radius: 6px; padding: 8px 10px; }
+.stats dt { font-size: 0.72rem; color: var(--muted); }
+.stats dd { margin: 0; font: 500 1rem var(--f-mono); font-variant-numeric: tabular-nums; }
+.app-health { display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center; }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden;
+  clip: rect(0 0 0 0); white-space: nowrap; border: 0; }

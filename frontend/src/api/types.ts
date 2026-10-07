@@ -111,3 +111,6 @@ export type StreamMessage = {
   event: Record<string, unknown> | null;
   ts: number;
 };
+
+// GET /api/health
+export type AppHealth = { ok: boolean; version: string; portal_db?: "ok" | "unreachable" };
