@@ -7,9 +7,11 @@ mutates ``MockApi.rows`` directly (that is the "source system").
 from __future__ import annotations
 
 import base64
+import gzip
 import json
 import threading
 import time
+import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
@@ -27,6 +29,7 @@ class MockApi:
         self.requests = 0
         self.tokens: set[str] = set()
         self.redirect_target = ""
+        self.token_body: Any = {}
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), self._handler())
         self.port = self.server.server_address[1]
         self.base = f"http://127.0.0.1:{self.port}"
@@ -39,6 +42,20 @@ class MockApi:
     def stop(self) -> None:
         self.server.shutdown()
         self.server.server_close()
+
+    _bombs: dict[int, bytes] = {}
+
+    @classmethod
+    def bomb(cls, layers: int) -> bytes:
+        """~200 MB of spaces, gzipped ``layers`` times (built once, a few KB on the wire)."""
+        if layers not in cls._bombs:
+            c = zlib.compressobj(9, zlib.DEFLATED, 16 + zlib.MAX_WBITS)
+            chunk = b" " * (1024 * 1024)
+            data = b"".join(c.compress(chunk) for _ in range(200)) + c.flush()
+            for _ in range(layers - 1):
+                data = gzip.compress(data, 9)
+            cls._bombs[layers] = data
+        return cls._bombs[layers]
 
     def items(self) -> list[dict[str, Any]]:
         with self.lock:
@@ -62,6 +79,14 @@ class MockApi:
                 self.wfile.write(data)
 
             def do_POST(self) -> None:  # noqa: N802
+                if urlsplit(self.path).path == "/oauth/bomb":  # token response that inflates to ~200 MB
+                    n = int(self.headers.get("Content-Length") or 0)
+                    self.rfile.read(n)
+                    return self._send(200, api.bomb(1), {"Content-Encoding": "gzip"})
+                if urlsplit(self.path).path == "/oauth/custom":  # token body set by the test
+                    n = int(self.headers.get("Content-Length") or 0)
+                    self.rfile.read(n)
+                    return self._send(200, api.token_body)
                 if urlsplit(self.path).path != "/oauth/token":
                     return self._send(404, {"error": "not found"})
                 n = int(self.headers.get("Content-Length") or 0)
@@ -115,6 +140,13 @@ class MockApi:
                     return self._send(200, [{"id": str(i), "pad": "x" * 1000} for i in range(3000)])
                 if path == "/v1/redirect":
                     return self._send(302, {}, {"Location": api.redirect_target or "/v1/assets"})
+                if path == "/v1/bomb":  # compressed bombs: ?layers=1|2, or ?enc=<any Content-Encoding>
+                    layers = int(q.get("layers", 2))
+                    enc = q.get("enc") or ", ".join(["gzip"] * layers)
+                    return self._send(200, api.bomb(layers), {"Content-Encoding": enc})
+                if path == "/v1/gzipped":  # a normal gzip-compressed JSON response
+                    raw = json.dumps(items).encode()
+                    return self._send(200, gzip.compress(raw), {"Content-Encoding": "gzip"})
                 if path == "/v1/html":
                     return self._send(200, b"<html>hello</html>")
                 return self._send(404, {"error": "not found"})

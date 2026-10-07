@@ -88,7 +88,8 @@ class _MultipartSink:
         self.size = 0
         self._out: BinaryIO | None = None
         self._in_file = False
-        self._done = False
+        self._done = False  # the file part ended (python-multipart saw the next boundary)
+        self.ended = False  # the closing boundary was seen: the body is complete (LIVEOPS-57)
         self._hfield = bytearray()
         self._hvalue = bytearray()
         self._headers: dict[bytes, bytes] = {}
@@ -102,7 +103,11 @@ class _MultipartSink:
             "on_headers_finished": self._headers_finished,
             "on_part_data": self._part_data,
             "on_part_end": self._part_end,
+            "on_end": self._end,
         }
+
+    def _end(self) -> None:
+        self.ended = True
 
     def _part_begin(self) -> None:
         self._headers = {}
@@ -179,6 +184,14 @@ async def _receive_file(request: Request, tmp: Path, limit: int) -> tuple[str, i
     if sink.filename is None:
         raise HTTPException(
             422, detail={"message": "No 'file' field in the upload", "hint": "Send the file in a field named 'file'."}
+        )
+    if not (sink._done and sink.ended):
+        raise HTTPException(
+            422,
+            detail={
+                "message": "The upload was cut off before the end",
+                "hint": "Upload the file again. The previous version of the file was kept.",
+            },
         )
     return sink.filename, sink.size
 

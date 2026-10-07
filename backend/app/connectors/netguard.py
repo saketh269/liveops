@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import socket
+from typing import Any
 
 import httpx
 
@@ -36,10 +37,34 @@ METADATA_IPS = {
 DNS_TIMEOUT_S = 5.0
 
 
+SITE_LOCAL_V6 = ipaddress.ip_network("fec0::/10")  # deprecated, but Python calls it global
+NAT64_V6 = (ipaddress.ip_network("64:ff9b::/96"), ipaddress.ip_network("64:ff9b:1::/48"))
+
+
+def _embedded_v4(ip: ipaddress.IPv6Address) -> ipaddress.IPv4Address | None:
+    """The IPv4 address an IPv6 address really leads to (mapped, 6to4, Teredo, NAT64)."""
+    if ip.ipv4_mapped is not None:
+        return ip.ipv4_mapped
+    if ip.sixtofour is not None:
+        return ip.sixtofour
+    if ip.teredo is not None:
+        return ip.teredo[1]
+    if any(ip in net for net in NAT64_V6):
+        return ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
+    return None
+
+
 def check_ip(ip: IPAddress, allow_private: bool) -> None:
     """Raise ``ConnectorError`` if the policy refuses ``ip``."""
-    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
-        ip = ip.ipv4_mapped
+    if isinstance(ip, ipaddress.IPv6Address):
+        if ip in SITE_LOCAL_V6 and not allow_private:
+            raise ConnectorError(
+                "This address is on a private or local network",
+                hint="For an API inside your company network, turn on 'Allow private network addresses'.",
+            )
+        v4 = _embedded_v4(ip)
+        if v4 is not None:
+            ip = v4
     if (
         ip in METADATA_IPS
         or ip.is_link_local
@@ -103,8 +128,8 @@ async def checked_ip(host: str, port: int, allow_private: bool) -> IPAddress:
     return ips[0]
 
 
-def check_host_sync(host: str, port: int, allow_private: bool) -> None:
-    """Blocking variant for clients we can't pin (boto3). Call from a worker thread."""
+def check_host_sync(host: str, port: int, allow_private: bool) -> IPAddress:
+    """Blocking variant (call from a worker thread). Returns the checked IP to connect to."""
     check_host_name(host)
     lit = _literal(host)
     try:
@@ -113,8 +138,59 @@ def check_host_sync(host: str, port: int, allow_private: bool) -> None:
         raise ConnectorError(
             "Couldn't look up the host name", hint="Check the host name and the server's DNS settings."
         ) from None
+    if not ips:
+        raise ConnectorError("The host name has no addresses", hint="Check the host name.")
     for ip in ips:
         check_ip(ip, allow_private)
+    return ips[0]
+
+
+class PinnedAddress:
+    """The IP a boto3 client may connect to, refreshed by each policy check."""
+
+    def __init__(self) -> None:
+        self.ip: str | None = None
+
+
+def pin_botocore_client(client: Any, pin: PinnedAddress) -> None:
+    """Make a botocore client open new connections only to ``pin.ip``.
+
+    urllib3 resolves ``_dns_host`` at connect time; we replace it with the IP
+    our policy just checked, so DNS can't change between check and connect.
+    TLS still verifies the certificate against the real host name.
+    """
+    from botocore.awsrequest import (
+        AWSHTTPConnection,
+        AWSHTTPConnectionPool,
+        AWSHTTPSConnection,
+        AWSHTTPSConnectionPool,
+    )
+
+    def _target() -> str:
+        if pin.ip is None:
+            raise ConnectorError("The storage address wasn't checked", hint="Try again.")
+        return pin.ip
+
+    class PinnedHTTP(AWSHTTPConnection):
+        def _new_conn(self) -> Any:
+            self._dns_host = _target()
+            return super()._new_conn()
+
+    class PinnedHTTPS(AWSHTTPSConnection):
+        def _new_conn(self) -> Any:
+            self._dns_host = _target()
+            return super()._new_conn()
+
+    class PinnedHTTPPool(AWSHTTPConnectionPool):
+        ConnectionCls = PinnedHTTP
+
+    class PinnedHTTPSPool(AWSHTTPSConnectionPool):
+        ConnectionCls = PinnedHTTPS
+
+    session = client._endpoint.http_session
+    classes = {"http": PinnedHTTPPool, "https": PinnedHTTPSPool}
+    session._pool_classes_by_scheme = classes
+    session._manager.pool_classes_by_scheme = classes
 
 
 class GuardedTransport(httpx.AsyncBaseTransport):
@@ -132,11 +208,23 @@ class GuardedTransport(httpx.AsyncBaseTransport):
         host = request.url.host
         port = request.url.port or (443 if request.url.scheme == "https" else 80)
         ip = await checked_ip(host, port, self.allow_private)
-        if _literal(host) is None:
-            request.url = request.url.copy_with(host=str(ip))
-            if request.url.scheme == "https":
-                request.extensions = {**request.extensions, "sni_hostname": host}
-        return await self._inner.handle_async_request(request)
+        if _literal(host) is not None:
+            return await self._inner.handle_async_request(request)
+        # Send a pinned *copy*: the caller's request (and so ``response.url``) keeps
+        # the logical host name, which relative Link headers resolve against (LIVEOPS-56).
+        extensions = dict(request.extensions)
+        if request.url.scheme == "https":
+            extensions["sni_hostname"] = host
+        pinned = httpx.Request(
+            request.method,
+            request.url.copy_with(host=str(ip)),
+            headers=request.headers,  # Host header still names the logical host
+            stream=request.stream,
+            extensions=extensions,
+        )
+        resp = await self._inner.handle_async_request(pinned)
+        resp.request = request
+        return resp
 
     async def aclose(self) -> None:
         await self._inner.aclose()

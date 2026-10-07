@@ -9,39 +9,45 @@ Every request must be signed with the source's signing secret:
 - ``X-LiveOps-Timestamp``: Unix time in seconds. Must be within 5 minutes of
   our clock (replay protection).
 - ``X-LiveOps-Signature``: ``sha256=`` + hex HMAC-SHA256 of
-  ``"{timestamp}.{raw body}"`` using the signing secret. The timestamp is part
-  of the signed message so it can't be changed by someone replaying a request.
+  ``"{source id}.{timestamp}.{raw body}"`` using the signing secret. The source
+  id and timestamp are part of the signed message, so a captured request can't
+  be replayed with a new timestamp or sent to another source (LIVEOPS-72).
+  (Changed in 0.1: earlier builds signed ``"{timestamp}.{raw body}"``.)
 
 Send a signed event with curl (bash)::
 
-    SECRET='your-signing-secret'; URL='https://liveops.example.com/api/webhooks/<source id>'
+    SECRET='your-signing-secret'; SOURCE_ID='<source id>'
+    URL="https://liveops.example.com/api/webhooks/$SOURCE_ID"
     BODY='{"id":"B01","status":"in_use","zone":"ICU"}'
     TS=$(date +%s)
-    SIG=$(printf '%s.%s' "$TS" "$BODY" | openssl dgst -sha256 -hmac "$SECRET" -hex | sed 's/^.* //')
+    SIG=$(printf '%s.%s.%s' "$SOURCE_ID" "$TS" "$BODY" | openssl dgst -sha256 -hmac "$SECRET" -hex | sed 's/^.* //')
     curl -sS -X POST "$URL" -H 'Content-Type: application/json' \\
          -H "X-LiveOps-Timestamp: $TS" -H "X-LiveOps-Signature: sha256=$SIG" --data "$BODY"
 
 The same request with ``{"id":"B01","_deleted":true}`` removes B01.
+``_deleted`` must be JSON ``true`` or ``false``.
 
-State: the latest record per key is kept in a bounded in-process buffer, so a
-mapping that starts after events arrived still gets the current state first.
-Each source has its own buffer, keyed by its source id. The buffer and the
-replay cache live in the API process (single process for v0.1); a restart
-empties them until the sender sends again.
+State: the latest record per key is kept (bounded, per source), so a mapping
+that starts after events arrived still gets the current state first, also
+after a backend restart (LIVEOPS-89):
+
+- with ``LIVEOPS_REDIS_URL``: in Redis. Any backend process can accept a
+  webhook; the process running the mapping receives it through a Redis
+  stream, and the replay cache is shared.
+- without Redis: in this process, written through to
+  ``LIVEOPS_DATA_DIR/webhooks/<source id>.jsonl``.
+
+See ``app/connectors/webhook_store.py``.
 """
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import hmac
 import json
 import re
-import threading
 import time
-from collections import OrderedDict
 from collections.abc import AsyncIterator
-from dataclasses import dataclass, field
 from typing import Any
 
 from app.connectors.base import (
@@ -61,6 +67,7 @@ from app.connectors.base import (
 )
 from app.connectors.registry import register
 from app.connectors.rest import infer_columns
+from app.connectors.webhook_store import DELETED_FIELD, WebhookStore, get_store
 
 SIGNATURE_HEADER = "X-LiveOps-Signature"
 TIMESTAMP_HEADER = "X-LiveOps-Timestamp"
@@ -70,9 +77,7 @@ HARD_MAX_BODY_BYTES = 10 * 1024 * 1024
 MAX_RECORDS_PER_REQUEST = 5_000
 DEFAULT_MAX_KEYS = 10_000
 HARD_MAX_KEYS = 100_000
-SUBSCRIBER_QUEUE = 10_000
 MIN_SECRET_LEN = 16
-DELETED_FIELD = "_deleted"
 
 
 # --------------------------------------------------------------------------
@@ -80,10 +85,10 @@ DELETED_FIELD = "_deleted"
 # --------------------------------------------------------------------------
 
 
-def sign(secret: str, timestamp: str, body: bytes) -> str:
-    """The value of the signature header for ``body`` sent at ``timestamp``."""
-    mac = hmac.new(secret.encode(), timestamp.encode() + b"." + body, hashlib.sha256)
-    return "sha256=" + mac.hexdigest()
+def sign(secret: str, timestamp: str, body: bytes, *, source_id: str) -> str:
+    """The signature header for ``body`` sent to ``source_id`` at ``timestamp``."""
+    msg = source_id.encode() + b"." + timestamp.encode() + b"." + body
+    return "sha256=" + hmac.new(secret.encode(), msg, hashlib.sha256).hexdigest()
 
 
 class SignatureError(Exception):
@@ -94,7 +99,15 @@ SIGNATURE_FORMAT = re.compile(r"sha256=([0-9a-f]{64})", re.ASCII)
 TIMESTAMP_FORMAT = re.compile(r"[0-9]{1,12}", re.ASCII)
 
 
-def verify(secret: str, timestamp: str | None, signature: str | None, body: bytes, now: float | None = None) -> str:
+def verify(
+    secret: str,
+    timestamp: str | None,
+    signature: str | None,
+    body: bytes,
+    *,
+    source_id: str,
+    now: float | None = None,
+) -> str:
     """Check a request; return the canonical MAC (64 lowercase hex) on success.
 
     Headers are matched exactly: no trimming, ASCII digits/hex only, so padded
@@ -120,134 +133,13 @@ def verify(secret: str, timestamp: str | None, signature: str | None, body: byte
             f"{TIMESTAMP_HEADER} is more than {REPLAY_WINDOW_S // 60} minutes from our clock. "
             "Send the current time, and check the sender's clock (NTP)."
         )
-    expected = sign(secret, timestamp, body)
+    expected = sign(secret, timestamp, body, source_id=source_id)
     if not hmac.compare_digest(expected, signature):
         raise SignatureError(
-            "Signature doesn't match. Sign the exact raw body as HMAC-SHA256 of '<timestamp>.<body>' "
+            "Signature doesn't match. Sign HMAC-SHA256 of '<source id>.<timestamp>.<raw body>' "
             "with this source's signing secret, sent as 'sha256=<hex>'."
         )
     return m.group(1)
-
-
-# --------------------------------------------------------------------------
-# In-process hub: latest state per key + live subscribers
-# --------------------------------------------------------------------------
-
-
-@dataclass
-class _Event:
-    record: Record
-    deleted: bool
-    ts: float
-
-
-@dataclass
-class _Subscriber:
-    loop: asyncio.AbstractEventLoop
-    queue: asyncio.Queue[_Event | None]
-    overflowed: bool = False
-
-
-@dataclass
-class _Channel:
-    max_keys: int = DEFAULT_MAX_KEYS
-    state: OrderedDict[str, Record] = field(default_factory=OrderedDict)
-    subscribers: list[_Subscriber] = field(default_factory=list)
-    received: int = 0
-    last_ts: float | None = None
-    seen_signatures: OrderedDict[str, float] = field(default_factory=OrderedDict)
-
-
-class WebhookHub:
-    """Thread-safe: the API may run on another thread/loop than the runner."""
-
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._channels: dict[str, _Channel] = {}
-
-    def _chan(self, cid: str, max_keys: int | None = None) -> _Channel:
-        ch = self._channels.get(cid)
-        if ch is None:
-            ch = self._channels[cid] = _Channel()
-        if max_keys:
-            ch.max_keys = max(1, min(max_keys, HARD_MAX_KEYS))
-        return ch
-
-    def check_replay(self, cid: str, signature: str, now: float | None = None) -> bool:
-        """True if this request (canonical ``timestamp:mac``) was already accepted within the window."""
-        now = time.time() if now is None else now
-        with self._lock:
-            ch = self._chan(cid)
-            while ch.seen_signatures and next(iter(ch.seen_signatures.values())) < now - 2 * REPLAY_WINDOW_S:
-                ch.seen_signatures.popitem(last=False)
-            if signature in ch.seen_signatures:
-                return True
-            ch.seen_signatures[signature] = now
-            while len(ch.seen_signatures) > 100_000:
-                ch.seen_signatures.popitem(last=False)
-            return False
-
-    def publish(self, cid: str, key_field: str, records: list[Record], ts: float, max_keys: int | None = None) -> None:
-        with self._lock:
-            ch = self._chan(cid, max_keys)
-            events = []
-            for raw in records:
-                deleted = raw.get(DELETED_FIELD) is True
-                rec = {k: v for k, v in raw.items() if k != DELETED_FIELD}
-                key = str(rec[key_field])
-                if deleted:
-                    ch.state.pop(key, None)
-                else:
-                    ch.state[key] = rec
-                    ch.state.move_to_end(key)
-                    while len(ch.state) > ch.max_keys:
-                        ch.state.popitem(last=False)
-                events.append(_Event(rec, deleted, ts))
-            ch.received += len(records)
-            ch.last_ts = ts
-            for sub in ch.subscribers:
-                for ev in events:
-                    sub.loop.call_soon_threadsafe(_offer, sub, ev)
-
-    def subscribe(self, cid: str) -> tuple[list[Record], _Subscriber]:
-        """Current state and a live queue, taken atomically so nothing is missed."""
-        sub = _Subscriber(asyncio.get_running_loop(), asyncio.Queue(maxsize=SUBSCRIBER_QUEUE))
-        with self._lock:
-            ch = self._chan(cid)
-            ch.subscribers.append(sub)
-            return list(ch.state.values()), sub
-
-    def unsubscribe(self, cid: str, sub: _Subscriber) -> None:
-        with self._lock:
-            ch = self._channels.get(cid)
-            if ch is not None and sub in ch.subscribers:
-                ch.subscribers.remove(sub)
-
-    def current(self, cid: str) -> list[Record]:
-        with self._lock:
-            ch = self._channels.get(cid)
-            return list(ch.state.values()) if ch else []
-
-    def stats(self, cid: str) -> tuple[int, float | None]:
-        with self._lock:
-            ch = self._channels.get(cid)
-            return (ch.received, ch.last_ts) if ch else (0, None)
-
-
-def _offer(sub: _Subscriber, ev: _Event) -> None:
-    if sub.overflowed:
-        return
-    try:
-        sub.queue.put_nowait(ev)
-    except asyncio.QueueFull:
-        # The consumer fell behind: stop feeding it and let it restart from state.
-        sub.overflowed = True
-        while not sub.queue.empty():
-            sub.queue.get_nowait()
-        sub.queue.put_nowait(None)
-
-
-HUB = WebhookHub()
 
 
 # --------------------------------------------------------------------------
@@ -262,7 +154,9 @@ class WebhookConnector(Connector):
         display_name="Webhook (push)",
         category=Category.API,
         modes=[Mode.PUSH],
-        description="Your system POSTs signed JSON records to a Live Ops URL; changes show up immediately.",
+        description="Your system POSTs signed JSON records to a Live Ops URL; changes show up immediately. "
+        "The last record per ID is kept, also across backend restarts, so the map shows the last known state "
+        "until the sender sends again.",
         maturity="beta",
         settings_schema={
             "type": "object",
@@ -308,7 +202,7 @@ class WebhookConnector(Connector):
 
     def __init__(self, settings: dict[str, Any], secrets: dict[str, Any], *, source_id: str | None = None) -> None:
         super().__init__(settings, secrets, source_id=source_id)
-        self.hub = HUB
+        self.store: WebhookStore = get_store()
 
     @property
     def key_field(self) -> str:
@@ -338,7 +232,7 @@ class WebhookConnector(Connector):
 
     @property
     def channel(self) -> str:
-        """The hub buffer for this source: its portal source id (ADR 0004, LIVEOPS-31)."""
+        """The webhook buffer for this source: its portal source id (ADR 0004, LIVEOPS-31)."""
         if not self.source_id:
             raise ConnectorError(
                 "This webhook source has no id yet", hint="Save the source first; its URL ends with the source id."
@@ -347,14 +241,19 @@ class WebhookConnector(Connector):
 
     # -- used by the API route -------------------------------------------
 
-    def accept(self, body: bytes, timestamp: str | None, signature: str | None) -> int:
+    async def accept(self, body: bytes, timestamp: str | None, signature: str | None) -> int:
         """Verify, parse and publish one request. Raises ``SignatureError``
         (-> 401) or ``ValueError`` (-> 422); returns the number of records."""
         secret = self._secret()
         cid = self.channel
-        mac = verify(secret, timestamp, signature, body)
-        if self.hub.check_replay(cid, f"{timestamp}:{mac}"):
+        mac = verify(secret, timestamp, signature, body, source_id=cid)
+        records = self._parse(body)
+        if await self.store.seen_before(cid, f"{timestamp}:{mac}"):
             raise SignatureError("This exact request was already received. Send a new timestamp and signature.")
+        await self.store.publish(cid, self.key_field, records, float(int(str(timestamp))), self.max_keys)
+        return len(records)
+
+    def _parse(self, body: bytes) -> list[Record]:
         try:
             doc = json.loads(body)
         except ValueError:
@@ -372,9 +271,12 @@ class WebhookConnector(Connector):
                 raise ValueError(
                     f"Record {i} has no {self.key_field!r} field. Every record needs it to identify what changed."
                 )
+            if DELETED_FIELD in item and not isinstance(item[DELETED_FIELD], bool):
+                raise ValueError(
+                    f'Record {i}: "{DELETED_FIELD}" must be true or false (JSON booleans, not text or numbers).'
+                )
             records.append(normalize_record(item))
-        self.hub.publish(cid, self.key_field, records, float(int(str(timestamp))), self.max_keys)
-        return len(records)
+        return records
 
     # -- contract ---------------------------------------------------------
 
@@ -393,31 +295,41 @@ class WebhookConnector(Connector):
         except ConnectorError as e:
             steps.append(TestStep(name="Webhook URL", ok=False, detail=str(e), hint=e.hint))
             return TestReport.from_steps(steps, started)
-        received, last = self.hub.stats(cid)
-        detail = (
-            f"{received} records received, last at {time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(last))} UTC"
-            if last
-            else "nothing received yet since the server started"
-        )
+        try:
+            st = await self.store.stats(cid)
+            current = len(await self.store.current(cid))
+        except ConnectorError as e:
+            steps.append(TestStep(name="Events received", ok=False, detail=str(e), hint=e.hint))
+            return TestReport.from_steps(steps, started)
+        last = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(st.last_ts)) + " UTC" if st.last_ts else None
+        if st.received:
+            detail = f"{st.received} records received, last at {last}; {current} records in the current state"
+        elif current:
+            detail = (
+                f"No new events since the server started; showing {current} records kept from before the restart "
+                f"(last event at {last})"
+            )
+        else:
+            detail = "Nothing received yet"
         steps.append(TestStep(name="Events received", ok=True, detail=detail))
         return TestReport.from_steps(steps, started)
 
     async def discover(self) -> list[Dataset]:
-        cols = infer_columns(self.hub.current(self.channel))
+        cols = infer_columns(await self.store.current(self.channel))
         if self.key_field not in {c.name for c in cols}:
             cols.insert(0, infer_columns([{self.key_field: ""}])[0])
         return [Dataset(name=self.dataset_name, columns=cols, primary_key=[self.key_field])]
 
     async def preview(self, dataset: str, limit: int = 20) -> list[Record]:
         self._resolve(dataset)
-        return self.hub.current(self.channel)[-limit:]
+        return (await self.store.current(self.channel))[-limit:]
 
     async def stream(
         self, dataset: str, key_fields: list[str], options: dict[str, Any] | None = None
     ) -> AsyncIterator[Change]:
         self._resolve(dataset)
         cid = self.channel
-        state, sub = self.hub.subscribe(cid)
+        state, sub = await self.store.open(cid)
         try:
             for rec in state:
                 key = _key(rec, key_fields)
@@ -427,7 +339,7 @@ class WebhookConnector(Connector):
                 yield Change(op=ChangeOp.UPSERT, dataset=dataset, key=key, record=rec)
             yield snapshot_end(dataset)  # exactly once, right after the current state (ADR 0004)
             while True:
-                ev = await sub.queue.get()
+                ev = await sub.get()
                 if ev is None:
                     raise ConnectorError(
                         "The live map fell behind the webhook sender",
@@ -443,7 +355,7 @@ class WebhookConnector(Connector):
                 else:
                     yield Change(op=ChangeOp.UPSERT, dataset=dataset, key=key, record=ev.record, source_ts=ev.ts)
         finally:
-            self.hub.unsubscribe(cid, sub)
+            await sub.close()
 
     def _resolve(self, dataset: str) -> None:
         if dataset != self.dataset_name:

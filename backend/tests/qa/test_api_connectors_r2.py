@@ -209,7 +209,7 @@ def test_rest_pagination(backend: Backend, path: str, extra: dict[str, Any], n_r
 
 
 def test_rest_link_header_relative_hostname_liveops56(backend: Backend) -> None:
-    """LIVEOPS-56 (open): relative next link with a host-name base URL."""
+    """LIVEOPS-56 (fixed): relative next link with a host-name base URL."""
     api = Api(BEDS)
     try:
         s = rest_settings(api.port, "/link", pagination="link_header")
@@ -222,8 +222,7 @@ def test_rest_link_header_relative_hostname_liveops56(backend: Backend) -> None:
         h = backend.mapping_health(m["id"])
         n = len(backend.assets(site["id"]))
         record("r2/rest/liveops56", assets=n, status=h and h.get("status"), error=h and h.get("last_error"))
-        if n != 10:
-            pytest.xfail(f"LIVEOPS-56 still open: {h}")
+        assert n == 10, f"LIVEOPS-56: {h}"
     finally:
         api.stop()
 
@@ -618,8 +617,8 @@ def test_webhook_deleted_non_boolean(backend: Backend) -> None:
         time.sleep(1.5)
         out[f"{bid}={val!r}"] = (r.status_code, backend.assets(site["id"]).get(bid))
     record("r2/webhook/deleted_non_bool", **{k: str(v) for k, v in out.items()})
-    if any(code == 202 and asset is not None for code, asset in out.values()):
-        pytest.xfail("LIVEOPS-90: non-boolean _deleted accepted (202) but not deleted")
+    # LIVEOPS-90 (fixed): a non-boolean _deleted is refused with 422 and the asset stays.
+    assert all(code == 422 and asset is not None for code, asset in out.values()), out
 
 
 def test_webhook_key_field_change(backend: Backend) -> None:
@@ -682,8 +681,9 @@ def test_webhook_restart(backend: Backend) -> None:
         finally:
             be.cleanup()
     record("r2/webhook/restart", **results)
-    if any(r["assets_after_restart"] == 0 for r in results.values()):
-        pytest.xfail("LIVEOPS-89: map goes empty after a backend restart; Health stays running")
+    # LIVEOPS-89 (fixed): the last known state is kept across a restart, with both stores.
+    assert all(r["assets_after_restart"] == len(BEDS) for r in results.values()), results
+    assert all(r["preview_rows"] == len(BEDS) for r in results.values()), results
 
 
 def test_webhook_regressions_17_31(backend: Backend) -> None:
@@ -698,7 +698,7 @@ def test_webhook_regressions_17_31(backend: Backend) -> None:
     )
     body = json.dumps({"bed_id": "ONLY-A", "status": "x"}).encode()
     t = str(int(time.time()))
-    sig = sign(secret, t, body)
+    sig = sign(secret, t, body, source_id=a["id"])  # LIVEOPS-72: source-bound
     url = f"{backend.base}/api/webhooks/{a['id']}"
     h = {"Content-Type": "application/json", "X-LiveOps-Timestamp": t}
     assert httpx.post(url, content=body, headers={**h, "X-LiveOps-Signature": sig}).status_code == 202

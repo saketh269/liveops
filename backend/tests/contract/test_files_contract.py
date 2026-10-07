@@ -420,7 +420,7 @@ def test_normal_xlsx_still_reads() -> None:
 def test_xlsx_cell_cap(monkeypatch: pytest.MonkeyPatch) -> None:
     from app.connectors import files
 
-    monkeypatch.setattr(files, "XLSX_MAX_CELLS", 10)
+    monkeypatch.setattr(files, "MAX_CELLS", 10)
     with pytest.raises(ConnectorError, match="cells"):
         parse_xlsx(xlsx_bytes([["id", "a", "b"]] + [[i, 1, 2] for i in range(10)]))
 
@@ -439,3 +439,91 @@ def test_file_parsers_raise_past_row_cap(monkeypatch: pytest.MonkeyPatch) -> Non
     with pytest.raises(ConnectorError, match="more than 3 rows"):
         files.parse_jsonl(b'{"id":1}\n{"id":2}\n{"id":3}\n{"id":4}\n')
     assert len(files.parse_csv(b"id\n1\n2\n3\n")) == 3
+
+
+# -- LIVEOPS-71: wide CSV ---------------------------------------------------------------
+
+
+def _wide_csv(cols: int, rows: int) -> bytes:
+    return (",".join(f"c{i}" for i in range(cols)) + "\n").encode() + b"a\n" * rows
+
+
+def test_wide_csv_is_refused_fast_with_bounded_memory() -> None:
+    import time
+    import tracemalloc
+
+    data = _wide_csv(3000, 30_000)
+    assert len(data) < 80_000
+    tracemalloc.start()
+    t0 = time.monotonic()
+    with pytest.raises(ConnectorError, match="more than 500 columns") as e:
+        parse_csv(data)
+    elapsed = time.monotonic() - t0
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    assert "columns you need" in e.value.hint
+    assert elapsed < 0.5 and peak < 5 * 1024 * 1024, (elapsed, peak)
+
+
+def test_csv_cell_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.connectors import files
+
+    monkeypatch.setattr(files, "MAX_CELLS", 1000)
+    with pytest.raises(ConnectorError, match="cells"):
+        parse_csv(_wide_csv(100, 11))
+    assert len(parse_csv(_wide_csv(100, 9))) == 9
+
+
+def test_header_dedup_is_linear() -> None:
+    import time
+
+    from app.connectors.files import _header
+
+    names = [f"n{i}" for i in range(400)] + ["dup"] * 100
+    t0 = time.monotonic()
+    out = _header(names, "x")
+    assert len(set(out)) == 500 and time.monotonic() - t0 < 0.05
+    big = [f"n{i}" for i in range(60_000)]
+    t0 = time.monotonic()
+    with pytest.raises(ConnectorError, match="columns"):
+        _header(big, "x")
+    assert time.monotonic() - t0 < 0.1
+
+
+def test_xlsx_with_too_many_columns_is_refused() -> None:
+    with pytest.raises(ConnectorError, match="more than 500 columns"):
+        parse_xlsx(xlsx_bytes([[f"c{i}" for i in range(600)], list(range(600))]))
+
+
+@requires_pg
+async def test_wide_csv_upload_is_422(client: httpx.AsyncClient, data_dir: Path) -> None:
+    sid = await new_source(client)
+    r = await upload(client, sid, "wide.csv", _wide_csv(3000, 30_000))
+    assert r.status_code == 422 and "columns" in r.json()["detail"]["message"]
+    assert not _found(data_dir, "wide.csv")
+
+
+# -- LIVEOPS-57: a cut-off upload never replaces the file ---------------------------------
+
+
+@requires_pg
+async def test_truncated_upload_keeps_previous_file(client: httpx.AsyncClient, data_dir: Path) -> None:
+    sid = await new_source(client)
+    good = csv_bytes([{"id": f"B{i}", "status": "free", "zone": "ICU"} for i in range(101)])
+    assert (await upload(client, sid, "beds.csv", good)).status_code == 201
+    boundary = "bnd"
+    head = f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="beds.csv"\r\n\r\n'.encode()
+    for body in (head + good[:200], head + good + b"\r\n--bnd"):  # no closing boundary / half a boundary
+        r = await client.post(
+            f"/api/sources/{sid}/upload",
+            content=body,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        )
+        assert r.status_code == 422, r.text
+        assert "cut off" in r.json()["detail"]["message"]
+    assert _read(data_dir / sid / "beds.csv") == good
+    assert not _found(data_dir, ".upload-*")
+
+
+def _read(p: Path) -> bytes:
+    return p.read_bytes()

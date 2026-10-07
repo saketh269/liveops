@@ -59,10 +59,12 @@ XLSX_MAX_MEMBER = 100 * 1024 * 1024
 XLSX_MAX_RATIO = 100  # uncompressed : compressed, for members over XLSX_RATIO_MIN_SIZE
 XLSX_RATIO_MIN_SIZE = 1024 * 1024
 XLSX_MAX_MEMBERS = 1_000
-XLSX_MAX_COLUMNS = 500
-XLSX_MAX_CELLS = 5_000_000
+MAX_COLUMNS = 500  # CSV and XLSX
+MAX_CELLS = 2_000_000  # rows x columns, CSV and XLSX (bounds memory, LIVEOPS-71)
 MAX_FILE_BYTES = 100 * 1024 * 1024
 MAX_FILES = 500
+DEFAULT_S3_TIMEOUT_S = 30.0
+MAX_S3_TIMEOUT_S = 120.0
 LOCAL_EXTENSIONS = (".csv", ".xlsx")
 S3_EXTENSIONS = (".csv", ".xlsx", ".jsonl", ".ndjson")
 SAFE_PART = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -73,14 +75,36 @@ SAFE_PART = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 # --------------------------------------------------------------------------
 
 
-def _header(names: list[Any]) -> list[str]:
+def _header(names: list[Any], what: str, *, trim_trailing: bool = False) -> list[str]:
+    """Column names from a header row. Linear time (set lookups) and capped (LIVEOPS-71).
+
+    ``trim_trailing`` drops empty cells at the end (xlsx pads rows to the sheet width)."""
+    names = list(names)
+    while trim_trailing and names and (names[-1] is None or str(names[-1]).strip() == ""):
+        names.pop()
+    if len(names) > MAX_COLUMNS:
+        raise ConnectorError(
+            f"{what} has more than {MAX_COLUMNS} columns",
+            hint="Keep only the columns you need on the map (ID, status, zone, ...) and upload again.",
+        )
     out: list[str] = []
+    seen: set[str] = set()
     for i, n in enumerate(names):
         name = str(n).strip() if n is not None else ""
-        if not name or name in out:
+        if not name or name in seen:
             name = f"column_{i + 1}"
+            while name in seen:
+                name += "_"
+        seen.add(name)
         out.append(name)
     return out
+
+
+def _too_many_cells(what: str) -> ConnectorError:
+    return ConnectorError(
+        f"{what} has more than {MAX_CELLS:,} cells (rows x columns)",
+        hint="Split it into smaller files, or remove columns you don't need.",
+    )
 
 
 def _cap(rows: list[Record], what: str) -> list[Record]:
@@ -134,13 +158,17 @@ def parse_csv(data: bytes, delimiter: str = ",", encoding: str = "utf-8-sig", wh
         head = next(reader, None)
         if head is None:
             return []
-        cols = _header(head)
+        cols = _header(head, what)
         rows: list[Record] = []
+        cells = 0
         for line in reader:
             if not any(cell.strip() for cell in line):
                 continue
             rec: Record = {c: (line[i] if i < len(line) and line[i] != "" else None) for i, c in enumerate(cols)}
             rows.append(rec)
+            cells += len(cols)
+            if cells > MAX_CELLS:
+                raise _too_many_cells(what)
             if len(rows) > MAX_ROWS:
                 break
     except csv.Error as e:
@@ -170,14 +198,11 @@ def parse_xlsx(data: bytes, sheet: str | None = None, what: str = "The workbook"
         else:
             ws = wb.worksheets[0]
         # max_col: a sheet can claim 16,384 columns; never build rows that wide.
-        it = ws.iter_rows(values_only=True, max_col=XLSX_MAX_COLUMNS)
+        it = ws.iter_rows(values_only=True, max_col=MAX_COLUMNS + 1)
         head = next(it, None)
         if head is None:
             return []
-        head_list = list(head)
-        while head_list and head_list[-1] is None:
-            head_list.pop()
-        cols = _header(head_list)
+        cols = _header(list(head), what, trim_trailing=True)
         rows: list[Record] = []
         cells = 0
         for line in it:
@@ -185,10 +210,8 @@ def parse_xlsx(data: bytes, sheet: str | None = None, what: str = "The workbook"
                 continue
             rows.append(normalize_record({c: (line[i] if i < len(line) else None) for i, c in enumerate(cols)}))
             cells += len(cols)
-            if cells > XLSX_MAX_CELLS:
-                raise ConnectorError(
-                    f"{what} has more than {XLSX_MAX_CELLS:,} cells", hint="Split it, or export it as CSV."
-                )
+            if cells > MAX_CELLS:
+                raise _too_many_cells(what)
             if len(rows) > MAX_ROWS:
                 break
         return _cap(rows, what)
@@ -422,6 +445,13 @@ class S3FilesConnector(PollingConnector):
                     "description": "Needed for an endpoint inside your company network (10.x, 192.168.x, "
                     "localhost). Cloud metadata and link-local addresses are always blocked.",
                 },
+                "timeout_s": {
+                    "type": "number",
+                    "title": "Timeout (seconds)",
+                    "default": 30,
+                    "minimum": 1,
+                    "maximum": 120,
+                },
                 "use_instance_role": {
                     "type": "boolean",
                     "title": "Use the Live Ops server's own AWS role (admin only)",
@@ -449,6 +479,7 @@ class S3FilesConnector(PollingConnector):
         self._client: Any = None
         self._cache: dict[str, _Cached] = {}
         self._keys: set[str] | None = None
+        self._pin = netguard.PinnedAddress()
 
     @property
     def bucket(self) -> str:
@@ -458,43 +489,77 @@ class S3FilesConnector(PollingConnector):
     def prefix(self) -> str:
         return str(self.settings.get("prefix") or "")
 
+    def _endpoint(self) -> tuple[str, str, int]:
+        """(endpoint URL, host, port). Always explicit, so nothing from the server's
+        AWS config or env (AWS_ENDPOINT_URL*, ~/.aws/config) can redirect it (LIVEOPS-66)."""
+        from urllib.parse import urlsplit
+
+        region = str(self.settings.get("region") or "us-east-1")
+        if not re.fullmatch(r"[a-z0-9-]{1,32}", region):
+            raise ConnectorError("Region must look like us-east-1", hint="Check the region setting.")
+        endpoint = str(self.settings.get("endpoint_url") or "").strip() or f"https://s3.{region}.amazonaws.com"
+        parts = urlsplit(endpoint)
+        scheme = parts.scheme.lower()
+        if scheme not in ("http", "https"):
+            raise ConnectorError(
+                "Endpoint URL must start with https://",
+                hint="Use the full address, e.g. https://minio.example.com:9000.",
+            )
+        if scheme == "http" and (self.settings.get("encryption") or "required") != "off":
+            raise ConnectorError(
+                "The endpoint uses plain http://, which isn't encrypted",
+                hint="Use https://, or set Encryption to Off for local testing only.",
+            )
+        if not parts.hostname or parts.path not in ("", "/") or parts.query:
+            raise ConnectorError(
+                "The endpoint URL must be just a scheme, host and port", hint="Use e.g. https://minio.example.com:9000."
+            )
+        return endpoint, parts.hostname, parts.port or (443 if scheme == "https" else 80)
+
+    def _timeout(self) -> float:
+        try:
+            t = float(self.settings.get("timeout_s") or DEFAULT_S3_TIMEOUT_S)
+        except (TypeError, ValueError):
+            t = DEFAULT_S3_TIMEOUT_S
+        return max(1.0, min(t, MAX_S3_TIMEOUT_S))
+
     def _s3(self) -> Any:
         if self._client is not None:
             return self._client
-        import boto3
+        import botocore.session
         from botocore.config import Config
 
-        endpoint = (self.settings.get("endpoint_url") or "").strip() or None
-        enc = self.settings.get("encryption") or "required"
-        if endpoint:
-            scheme = endpoint.split("://", 1)[0].lower() if "://" in endpoint else ""
-            if scheme not in ("http", "https"):
-                raise ConnectorError(
-                    f"Endpoint URL must start with https:// (got {endpoint!r})",
-                    hint="Use the full address, e.g. https://minio.example.com:9000.",
-                )
-            if scheme == "http" and enc != "off":
-                raise ConnectorError(
-                    "The endpoint uses plain http://, which isn't encrypted",
-                    hint="Use https://, or set Encryption to Off for local testing only.",
-                )
+        endpoint, _, _ = self._endpoint()
         creds = self._credentials()
+        # An isolated botocore session: no AWS_* env vars, no ~/.aws files, no
+        # configured endpoints, no env proxies (LIVEOPS-21/66).
+        session_vars = {k: (v[0], None, v[2], v[3]) for k, v in botocore.session.Session.SESSION_VARIABLES.items()}
+        session = botocore.session.Session(session_vars=session_vars)
+        session.set_config_variable("config_file", os.devnull)
+        session.set_config_variable("credentials_file", os.devnull)
+        session.set_config_variable("ignore_configured_endpoint_urls", True)
+        if not creds:  # admin-approved instance role: borrow the default credential chain only
+            session._credentials = botocore.session.Session().get_credentials()
+        timeout = self._timeout()
         cfg = Config(
-            connect_timeout=5,
-            read_timeout=30,
+            connect_timeout=min(timeout, 10.0),
+            read_timeout=timeout,
             retries={"max_attempts": 2, "mode": "standard"},
-            s3={"addressing_style": "path" if endpoint else "auto"},
+            s3={"addressing_style": "path"},  # the host we checked is the host we call
+            proxies={},
             user_agent_extra="liveops",
         )
-        self._client = boto3.session.Session().client(
+        client = session.create_client(
             "s3",
             endpoint_url=endpoint,
-            region_name=self.settings.get("region") or "us-east-1",
+            region_name=str(self.settings.get("region") or "us-east-1"),
             **creds,
             config=cfg,
-            verify=enc != "off",
+            verify=True,  # https always verifies; 'off' only permits plain http:// (LIVEOPS-66)
         )
-        return self._client
+        netguard.pin_botocore_client(client, self._pin)
+        self._client = client
+        return client
 
     def _credentials(self) -> dict[str, str]:
         """Only the keys entered on this source. Never boto3's default chain
@@ -521,17 +586,11 @@ class S3FilesConnector(PollingConnector):
         )
 
     def _check_endpoint(self) -> None:
-        """Apply the outbound network policy to the endpoint host (re-checked on every call)."""
-        endpoint = (self.settings.get("endpoint_url") or "").strip()
-        if not endpoint:
-            return
-        from urllib.parse import urlsplit
-
-        parts = urlsplit(endpoint)
-        if not parts.hostname:
-            raise ConnectorError("The endpoint URL has no host name", hint="Use e.g. https://minio.example.com:9000.")
-        port = parts.port or (443 if parts.scheme == "https" else 80)
-        netguard.check_host_sync(parts.hostname, port, self.settings.get("allow_private_network") is True)
+        """Apply the outbound network policy to the endpoint (AWS too), on every call,
+        and pin the client's new connections to the IP that passed (LIVEOPS-21)."""
+        _, host, port = self._endpoint()
+        ip = netguard.check_host_sync(host, port, self.settings.get("allow_private_network") is True)
+        self._pin.ip = str(ip)
 
     async def close(self) -> None:
         client, self._client = self._client, None
@@ -539,8 +598,15 @@ class S3FilesConnector(PollingConnector):
             await asyncio.to_thread(client.close)
 
     async def _run(self, fn: Any, *args: Any) -> Any:
+        deadline = 3 * self._timeout() + 10  # overall per call: retries can't stretch a poll forever
         try:
-            return await asyncio.to_thread(fn, *args)
+            async with asyncio.timeout(deadline):
+                return await asyncio.to_thread(fn, *args)
+        except TimeoutError:
+            raise ConnectorError(
+                f"The storage service took longer than {deadline:g} s",
+                hint="Check the endpoint and network, or use smaller files.",
+            ) from None
         except ConnectorError:
             raise
         except Exception as e:  # noqa: BLE001 - translated into a plain-English error
@@ -598,12 +664,14 @@ class S3FilesConnector(PollingConnector):
         steps: list[TestStep] = []
         try:
             await self._run(self._s3)
-            enc = self.settings.get("encryption") or "required"
+            endpoint, _, _ = self._endpoint()
+            https = endpoint.lower().startswith("https://")
             steps.append(
                 TestStep(
                     name="Settings, encryption and access key",
                     ok=True,
-                    detail="HTTPS" if enc != "off" else "plain HTTP allowed (local testing only)",
+                    detail=f"{endpoint}: "
+                    + ("HTTPS, certificate checked" if https else "plain HTTP (local testing only)"),
                 )
             )
         except ConnectorError as e:

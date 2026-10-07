@@ -280,3 +280,122 @@ async def test_xlsx_bomb_object_refused(s3env: S3Env) -> None:
             await c.snapshot(prefix + "/b.xlsx")
     finally:
         await c.close()
+
+
+# -- LIVEOPS-66 / 21: ambient AWS config, proxies, TLS and DNS pinning ---------------------
+
+
+class _Listener:
+    """Counts any connection made to it (stands in for an attacker's endpoint or proxy)."""
+
+    def __init__(self) -> None:
+        import socket
+        import threading
+
+        self.hits = 0
+        self.sock = socket.socket()
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(16)
+        self.sock.settimeout(0.2)
+        self.port = self.sock.getsockname()[1]
+        self._stop = False
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def _run(self) -> None:
+        while not self._stop:
+            try:
+                conn, _ = self.sock.accept()
+            except OSError:
+                continue
+            self.hits += 1
+            conn.close()
+
+    def close(self) -> None:
+        self._stop = True
+        self.thread.join()
+        self.sock.close()
+
+
+@pytest.fixture
+def listener() -> Iterator[_Listener]:
+    lst = _Listener()
+    yield lst
+    lst.close()
+
+
+async def test_ambient_endpoint_config_and_proxies_are_ignored(
+    s3env: S3Env, listener: _Listener, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    evil = f"http://127.0.0.1:{listener.port}"
+    cfg = tmp_path / "config"
+    cfg.write_text(f"[default]\nendpoint_url = {evil}\ns3 =\n  addressing_style = virtual\n")
+    for var, val in {
+        "AWS_ENDPOINT_URL_S3": evil,
+        "AWS_ENDPOINT_URL": evil,
+        "AWS_CONFIG_FILE": str(cfg),
+        "AWS_PROFILE": "nonexistent-profile",
+        "HTTP_PROXY": evil,
+        "HTTPS_PROXY": evil,
+        "ALL_PROXY": evil,
+        "AWS_CA_BUNDLE": "/nonexistent/ca.pem",
+    }.items():
+        monkeypatch.setenv(var, val)
+    c = S3FilesConnector(s3env.settings(), dict(s3env.keys["reader"]))
+    try:
+        assert (await c.test()).ok
+        client = await c._run(c._s3)
+        assert client._endpoint.host == s3env.url
+        assert client._endpoint.http_session._proxy_config.proxy_url_for(s3env.url) is None
+    finally:
+        await c.close()
+    aws = S3FilesConnector({"bucket": "b", "region": "eu-west-1"}, dict(s3env.keys["reader"]))
+    try:
+        client = await aws._run(aws._s3)
+        assert client._endpoint.host == "https://s3.eu-west-1.amazonaws.com"  # never the env/config endpoint
+    finally:
+        await aws.close()
+    assert listener.hits == 0
+
+
+async def test_encryption_off_never_disables_certificate_checks(s3env: S3Env) -> None:
+    c = S3FilesConnector(
+        s3env.settings(endpoint_url="https://minio.example.com:9000", encryption="off"), dict(s3env.keys["reader"])
+    )
+    try:
+        client = await c._run(c._s3)
+        assert client._endpoint.http_session._verify is True
+    finally:
+        await c.close()
+    for bad in ("ftp://x", "https://minio.example.com/some/path", "https://minio.example.com?x=1"):
+        with pytest.raises(ConnectorError):
+            S3FilesConnector(s3env.settings(endpoint_url=bad), {})._endpoint()
+
+
+async def test_connection_goes_to_the_checked_ip(s3env: S3Env, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The endpoint name resolves (via our check) to moto's IP; DNS is never asked again."""
+    import ipaddress
+
+    from app.connectors import netguard
+
+    monkeypatch.setattr(moto_settings, "S3_IGNORE_SUBDOMAIN_BUCKETNAME", True)  # moto: path-style for any host
+    answers = {"storage.liveops-test.invalid": [ipaddress.ip_address("127.0.0.1")]}
+    monkeypatch.setattr(netguard, "resolve_sync", lambda host, port: answers[host])
+    port = s3env.url.rsplit(":", 1)[1]
+    c = S3FilesConnector(
+        s3env.settings(endpoint_url=f"http://storage.liveops-test.invalid:{port}"), dict(s3env.keys["reader"])
+    )
+    try:
+        d = S3Driver(s3env)
+        # .invalid can't resolve in real DNS: listing works only because the checked IP is used.
+        assert d.dataset in {k for k, _ in await c._run(c._list_keys)}
+        answers["storage.liveops-test.invalid"] = [ipaddress.ip_address("169.254.169.254")]  # DNS rebinding
+        with pytest.raises(ConnectorError, match="blocked"):
+            await c._run(c._list_keys)
+    finally:
+        await c.close()
+
+
+def test_timeout_is_capped() -> None:
+    assert S3FilesConnector({"bucket": "b", "timeout_s": 10_000}, {})._timeout() == 120
+    assert S3FilesConnector({"bucket": "b", "timeout_s": "x"}, {})._timeout() == 30

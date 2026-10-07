@@ -54,7 +54,7 @@ async def receive(source_id: str, request: Request, session: Session = Depends(g
     conn = WebhookConnector(src.settings or {}, secrets_mod.decrypt(src.secrets_enc), source_id=src.id)
     body = await read_capped(request, conn.max_body_bytes)
     try:
-        n = conn.accept(body, request.headers.get(TIMESTAMP_HEADER), request.headers.get(SIGNATURE_HEADER))
+        n = await conn.accept(body, request.headers.get(TIMESTAMP_HEADER), request.headers.get(SIGNATURE_HEADER))
     except SignatureError as e:
         raise HTTPException(401, detail={"message": str(e)}) from None
     except ConnectorError as e:  # the source itself is misconfigured (e.g. secret too short)

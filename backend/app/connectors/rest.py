@@ -18,8 +18,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import re
 import time
+import zlib
 from typing import Any
 from urllib.parse import urljoin, urlsplit
 
@@ -251,9 +253,14 @@ class RestConnector(PollingConnector):
     def _url(self) -> str:
         base = str(self.settings.get("base_url", "")).strip()
         path = str(self.settings.get("path") or "")
-        if path:
-            return urljoin(base.rstrip("/") + "/", path.lstrip("/"))
-        return base
+        if not path:
+            return base
+        _check_relative_path(path)
+        url = urljoin(base.rstrip("/") + "/", path.lstrip("/"))
+        a, b = urlsplit(base), urlsplit(url)
+        if (a.scheme, a.hostname, a.port) != (b.scheme, b.hostname, b.port):
+            raise _absolute_path_error()
+        return url
 
     def _check_url(self, url: str, what: str) -> None:
         """Refuse anything that isn't http(s), and http unless allowed."""
@@ -321,6 +328,8 @@ class RestConnector(PollingConnector):
             or not all(isinstance(k, str) and isinstance(v, (str, int, float, bool)) for k, v in q.items())
         ):
             raise bad("query", "a list of name/value pairs (text values)")
+        if s.get("path"):
+            _check_relative_path(str(s["path"]))
         if not str(s.get("base_url") or "").strip():
             raise ConnectorError(
                 "Setting 'base_url' is empty", hint="Enter the API address, e.g. https://api.example.com."
@@ -336,7 +345,8 @@ class RestConnector(PollingConnector):
                 trust_env=False,
                 timeout=httpx.Timeout(timeout, connect=min(timeout, 10.0)),
                 follow_redirects=False,
-                headers={"Accept": "application/json", "User-Agent": "liveops/0.1"},
+                # Only codings we decode ourselves, with a cap (LIVEOPS-64).
+                headers={"Accept": "application/json", "Accept-Encoding": "gzip, deflate", "User-Agent": "liveops/0.1"},
             )
         return self._client
 
@@ -376,26 +386,36 @@ class RestConnector(PollingConnector):
             data["scope"] = str(self.settings["oauth_scope"])
         try:
             async with asyncio.timeout(self._deadline()):
-                resp = await self._http().post(token_url, data=data, auth=(str(cid), str(csec)))
+                async with self._http().stream("POST", token_url, data=data, auth=(str(cid), str(csec))) as resp:
+                    status = resp.status_code
+                    raw = await read_capped(resp, MAX_TOKEN_RESPONSE_BYTES) if status < 300 else b""
         except TimeoutError:
             raise ConnectorError("The token URL didn't answer in time", hint="Check the token URL.") from None
         except httpx.HTTPError as e:
             raise ConnectorError(f"Couldn't reach the token URL: {type(e).__name__}", hint=_network_hint(e)) from None
-        if resp.status_code in (400, 401, 403):
+        if status in (400, 401, 403):
             raise ConnectorError(
-                f"The token URL refused the client credentials (HTTP {resp.status_code})",
+                f"The token URL refused the client credentials (HTTP {status})",
                 hint="Check the client ID and secret, and that the client is allowed the client-credentials grant.",
             )
-        if resp.status_code >= 300:
-            raise ConnectorError(f"The token URL answered HTTP {resp.status_code}", hint="Check the token URL.")
+        if status >= 300:
+            raise ConnectorError(f"The token URL answered HTTP {status}", hint="Check the token URL.")
         try:
-            body = resp.json()
-            token = str(body["access_token"])
+            body = json.loads(raw)
+            token = body["access_token"]
+            if not isinstance(token, str) or not token.strip():
+                raise ValueError("empty access_token")
         except (ValueError, KeyError, TypeError):
             raise ConnectorError(
                 "The token URL didn't return an access_token", hint="Check the token URL is the OAuth2 token endpoint."
             ) from None
-        expires_in = float(body.get("expires_in") or 300)
+        try:
+            expires_in = float(body.get("expires_in") or 300)
+        except (TypeError, ValueError):
+            expires_in = 300.0
+        if not math.isfinite(expires_in) or expires_in <= 0:
+            expires_in = 300.0
+        expires_in = min(expires_in, 24 * 3600.0)  # never trust a token for more than a day
         self._token = token
         self._token_expires = time.monotonic() + max(0.0, expires_in - TOKEN_REFRESH_MARGIN_S)
         return token
@@ -427,14 +447,7 @@ class RestConnector(PollingConnector):
                     self._token = None  # expired early; next poll fetches a new one
                 if resp.status_code >= 300:
                     raise _status_error(resp.status_code)
-                declared = resp.headers.get("content-length")
-                if declared and declared.isdigit() and int(declared) > limit:
-                    raise _too_big(limit)
-                buf = bytearray()
-                async for chunk in resp.aiter_bytes():
-                    buf.extend(chunk)
-                    if len(buf) > limit:
-                        raise _too_big(limit)
+                buf = await read_capped(resp, limit)
         except httpx.HTTPError as e:
             raise ConnectorError(f"Couldn't reach the API: {type(e).__name__}", hint=_network_hint(e)) from None
         try:
@@ -511,7 +524,7 @@ class RestConnector(PollingConnector):
                 nxt = resp.links.get("next", {}).get("url")
                 if not nxt:
                     break
-                nxt = urljoin(str(resp.url), nxt)
+                nxt = urljoin(str(resp.request.url), nxt)  # the logical URL we asked for (LIVEOPS-56)
                 if not self._same_origin(nxt):
                     raise ConnectorError(
                         "The API's next-page link points at a different server",
@@ -612,6 +625,77 @@ class RestConnector(PollingConnector):
                 f"This API source has one dataset, {self.dataset_name!r}, not {dataset!r}",
                 hint="Pick the dataset listed for this source.",
             )
+
+
+MAX_TOKEN_RESPONSE_BYTES = 64 * 1024
+_DECODERS = {"gzip": 16 + zlib.MAX_WBITS, "x-gzip": 16 + zlib.MAX_WBITS, "deflate": zlib.MAX_WBITS}
+
+
+async def read_capped(resp: httpx.Response, limit: int) -> bytes:
+    """Read a response body, never holding or *decoding* more than ``limit`` bytes.
+
+    httpx would decode every listed Content-Encoding with no output bound, so a
+    few KB of stacked gzip can expand to GBs (LIVEOPS-64). We read the raw
+    bytes and inflate them ourselves with ``max_length``. Only one coding
+    (gzip or deflate) is accepted; stacked or unknown codings are refused.
+    """
+    declared = resp.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > limit:
+        raise _too_big(limit)
+    codings = [c.strip().lower() for c in resp.headers.get("content-encoding", "").split(",")]
+    codings = [c for c in codings if c and c != "identity"]
+    if len(codings) > 1 or (codings and codings[0] not in _DECODERS):
+        raise ConnectorError(
+            "The API sent the response in an encoding Live Ops doesn't accept",
+            hint="Ask the API owner to send plain or gzip-compressed JSON (one compression layer).",
+        )
+    dec = zlib.decompressobj(_DECODERS[codings[0]]) if codings else None
+    out = bytearray()
+    raw_total = 0
+    try:
+        async for chunk in resp.aiter_raw():
+            raw_total += len(chunk)
+            if raw_total > limit:
+                raise _too_big(limit)
+            if dec is None:
+                out.extend(chunk)
+            else:
+                data = chunk
+                while data and not dec.eof:
+                    out.extend(dec.decompress(data, limit - len(out) + 1))
+                    if len(out) > limit:
+                        raise _too_big(limit)
+                    data = dec.unconsumed_tail
+            if len(out) > limit:
+                raise _too_big(limit)
+        if dec is not None:
+            out.extend(dec.flush(limit - len(out) + 1))
+            if len(out) > limit:
+                raise _too_big(limit)
+    except zlib.error:
+        raise ConnectorError(
+            "The API's compressed response is damaged", hint="Try again; if it repeats, ask the API owner."
+        ) from None
+    return bytes(out)
+
+
+def _absolute_path_error() -> ConnectorError:
+    return ConnectorError(
+        "Setting 'path' must be a path on the base URL's server, not a full address",
+        hint="Put the server in 'Base URL' and only the part after it (like /v1/beds) in 'Path'.",
+    )
+
+
+def _check_relative_path(path: str) -> None:
+    """``path`` may not name another server: no scheme, no //host, no backslashes (LIVEOPS-24)."""
+    p = path.strip()
+    if (
+        re.match(r"^[A-Za-z][A-Za-z0-9+.\-]*:", p)
+        or p.startswith("//")
+        or "\\" in p
+        or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in p)
+    ):
+        raise _absolute_path_error()
 
 
 def _status_error(code: int) -> ConnectorError:

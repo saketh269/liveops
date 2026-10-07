@@ -300,7 +300,7 @@ def post_signed(be: Backend, source_id: str, secret: str, body_obj: Any, ts: int
         headers={
             "Content-Type": "application/json",
             "X-LiveOps-Timestamp": t,
-            "X-LiveOps-Signature": sign(secret, t, body),
+            "X-LiveOps-Signature": sign(secret, t, body, source_id=source_id),  # LIVEOPS-72: source-bound
         },
         timeout=10,
     )
