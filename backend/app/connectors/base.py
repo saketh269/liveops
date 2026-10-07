@@ -18,7 +18,7 @@ import datetime as dt
 import decimal
 import time
 import uuid
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
 from enum import StrEnum
 from typing import Any, ClassVar, Literal
 
@@ -218,6 +218,12 @@ class Connector(abc.ABC):
         # Records dropped because they had no value in the key column(s). The
         # runner shows this count on the Health page instead of failing.
         self.skipped_records = 0
+        # The mapping's row filter (ADR 0006), set by the runner. Connectors that
+        # key rows themselves (PollingConnector) drop non-matching rows *before*
+        # keying, so a current row is never hidden by an old one with the same
+        # key (e.g. a closed and an open visit for one bed). The runner applies
+        # the filter again to every change, so connectors may ignore it.
+        self.row_filter: Callable[[Record], bool] | None = None
 
     # -- required ---------------------------------------------------------
 
@@ -287,6 +293,9 @@ class PollingConnector(Connector):
         previous: dict[str, Record] | None = None
         while True:
             rows = await self.snapshot(dataset)
+            if self.row_filter is not None:
+                keep = self.row_filter
+                rows = [r for r in rows if keep(r)]
             current, skipped = key_records(rows, key_fields)
             self.skipped_records = skipped  # per poll: how many rows lack a key right now
             for change in diff_snapshots(dataset, previous, current):

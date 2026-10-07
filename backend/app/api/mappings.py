@@ -51,7 +51,7 @@ async def _check_columns(src: Source, dataset: str, config: MappingConfig) -> No
         await conn.close()
     if dataset not in datasets:
         raise HTTPException(422, detail={"message": f"{dataset!r} isn't available from this source"})
-    problems = validate_against_columns(config, {c.name for c in datasets[dataset].columns})
+    problems = validate_against_columns(config, {c.name: c.type for c in datasets[dataset].columns})
     if problems:
         raise HTTPException(422, detail={"message": "Mapping doesn't match the table", "problems": problems})
 
@@ -102,7 +102,8 @@ async def update_mapping(
     config = body.config or MappingConfig.model_validate(m.config)
     if body.dataset or body.config:
         await _check_columns(src, dataset, config)
-    shape_changed = dataset != m.dataset or config.model_dump() != m.config
+    # Compare normalised configs, so a config saved before a field existed isn't "changed".
+    shape_changed = dataset != m.dataset or config.model_dump() != MappingConfig.model_validate(m.config).model_dump()
     m.dataset, m.config = dataset, config.model_dump()
     if body.options is not None:
         m.options = body.options
