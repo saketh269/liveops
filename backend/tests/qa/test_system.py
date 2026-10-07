@@ -144,7 +144,6 @@ def test_multi_source_merge(store: str, pg: PgSource) -> None:
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason="LIVEOPS-45: poll connection errors have no hint")
 def test_poll_source_lost_shows_hint_and_recovers(backend: Backend, pg: PgSource) -> None:
     """Source goes away (reader's sessions killed, then permission revoked) -> Health error with a hint -> recovery."""
     src = pg_source(backend, pg)
@@ -161,7 +160,14 @@ def test_poll_source_lost_shows_hint_and_recovers(backend: Backend, pg: PgSource
     backend.wait_assets(site["id"], lambda a: a.get("B01", {}).get("state") == "back", 90)
     recovered = round(time.time() - t0, 1)
     # Source unreachable (wrong port) -> Health error; is there a hint?
-    backend.api("PUT", f"/api/sources/{src['id']}", 200, json={"settings": {**pg.settings(), "port": 1}})
+    # Changing host/port requires re-entering the password (LIVEOPS-24): without it -> 422.
+    backend.api("PUT", f"/api/sources/{src['id']}", 422, json={"settings": {**pg.settings(), "port": 1}})
+    backend.api(
+        "PUT",
+        f"/api/sources/{src['id']}",
+        200,
+        json={"settings": {**pg.settings(), "port": 1}, "secrets": {"password": pg.password}},
+    )
     h_down = wait_health(backend, m["id"], lambda h: "refused" in (h["last_error"] or ""), 30)
     record(
         "resilience/postgres_poll",
@@ -198,7 +204,6 @@ def test_cdc_reader_killed_then_recovers(backend: Backend, pgcdc: PgSource) -> N
     assert h["last_error_hint"]
 
 
-@pytest.mark.xfail(strict=True, reason="LIVEOPS-43: CDC doesn't report a dropped table")
 def test_cdc_table_dropped_is_reported(backend: Backend, pgcdc: PgSource) -> None:
     src = pg_source(backend, pgcdc, "postgres_cdc")
     site = backend.add_site("qa drop cdc", ["ICU"])
@@ -224,7 +229,6 @@ def test_cdc_table_dropped_is_reported(backend: Backend, pgcdc: PgSource) -> Non
     )
 
 
-@pytest.mark.xfail(strict=True, reason="LIVEOPS-39: MySQL CDC stalls after the binlog connection drops")
 def test_mysql_cdc_connection_killed(backend: Backend) -> None:
     my = MySqlSource()
     try:
@@ -262,9 +266,7 @@ def test_mysql_cdc_connection_killed(backend: Backend) -> None:
     "store",
     [
         "memory",
-        pytest.param(
-            "redis", marks=pytest.mark.xfail(strict=True, reason="LIVEOPS-40: deleted-while-down assets stay in Redis")
-        ),
+        "redis",
     ],
 )
 def test_backend_restart_resumes_and_rebuilds(store: str, pgcdc: PgSource) -> None:
@@ -411,9 +413,7 @@ def test_edge_empty_table(backend: Backend, pg: PgSource) -> None:
 @pytest.mark.parametrize(
     "type_",
     [
-        pytest.param(
-            "postgres", marks=pytest.mark.xfail(strict=True, reason="LIVEOPS-42: NULL key stops the poll mapping")
-        ),
+        "postgres",
         "postgres_cdc",
     ],
 )
@@ -476,7 +476,6 @@ def test_edge_unicode_and_long_strings(backend: Backend, pgcdc: PgSource) -> Non
     record("edge/unicode_long", ok=True)
 
 
-@pytest.mark.xfail(strict=True, reason="LIVEOPS-46: poll cap truncates silently")
 def test_edge_50k_rows_poll_cap(backend: Backend, pg: PgSource) -> None:
     pg.exec("CREATE TABLE big (id int PRIMARY KEY, status text)")
     pg.exec("INSERT INTO big SELECT g, 'ok' FROM generate_series(1, 50000) g")
@@ -517,9 +516,7 @@ def test_edge_50k_rows_poll_cap(backend: Backend, pg: PgSource) -> None:
     "type_",
     [
         "postgres",
-        pytest.param(
-            "postgres_cdc", marks=pytest.mark.xfail(strict=True, reason="LIVEOPS-43: CDC ignores a renamed table")
-        ),
+        "postgres_cdc",
     ],
 )
 def test_edge_table_renamed_while_mapped(type_: str, backend: Backend, pgcdc: PgSource) -> None:
