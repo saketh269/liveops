@@ -100,7 +100,14 @@ async def update_source(
     rm: RunnerManager = Depends(runner),
 ) -> SourceOut:
     s = _get(session, source_id)
-    secrets = secrets_mod.decrypt(s.secrets_enc)
+    try:
+        secrets = secrets_mod.decrypt(s.secrets_enc)
+    except secrets_mod.SecretsError:
+        # Saved secrets were encrypted with another key. Let the user re-enter
+        # them here; refuse only if they didn't (LIVEOPS-41 follow-up).
+        if not body.secrets or not any(v not in (None, "") for v in body.secrets.values()):
+            raise
+        secrets = {}
     settings = body.settings if body.settings is not None else (s.settings or {})
     new_secrets = body.secrets or {}
     # Saved credentials must not follow the source to a different server.

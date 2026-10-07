@@ -88,3 +88,9 @@ describe("reducer", () => {
     expect(diffAsset(asset("A"), asset("A", { updated_ts: 99, _sources: { state: "x" } }))).toEqual([]);
   });
 });
+
+test("pings do not move the last-update time (LIVEOPS-38)", () => {
+  let s = reduce(initialMapState(), msg("snapshot", [], 10));
+  s = reduce(s, { type: "ping", site_id: "s", assets: [], event: null, ts: 99 } as StreamMessage);
+  expect(s.lastTs).toBe(10);
+});

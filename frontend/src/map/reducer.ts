@@ -84,6 +84,8 @@ export function reduceAll(state: MapState, msgs: readonly StreamMessage[]): MapS
   const push = (e: Omit<FeedEntry, "id">) => added.push({ ...e, id: ++seq });
 
   for (const msg of msgs) {
+    // Keepalives say the link is up, not that data changed: they must not move "Last update" (LIVEOPS-38).
+    if (msg.type !== "snapshot" && msg.type !== "upsert" && msg.type !== "remove" && msg.type !== "event") continue;
     const ts = typeof msg.ts === "number" ? msg.ts : (lastTs ?? 0);
     lastTs = lastTs === null ? ts : Math.max(lastTs, ts);
     switch (msg.type) {
