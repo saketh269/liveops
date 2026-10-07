@@ -74,6 +74,7 @@ function SiteMap({ siteId }: { siteId: string }) {
   const editing = params.get("edit") === "1";
   const debug = params.get("debug") === "1";
   const force2d = params.get("view") === "2d";
+  const motion = params.get("motion") !== "off";
   const [site, setSite] = useState<Site | null>(null);
   const [sites, setSites] = useState<Site[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -82,6 +83,8 @@ function SiteMap({ siteId }: { siteId: string }) {
   const [selected, setSelected] = useState<string | null>(null);
   const [find, setFind] = useState("");
   const [sourceNames, setSourceNames] = useState<Record<string, string>>({});
+  // Removed records still walking out keep their last data in the details panel.
+  const [departing, setDeparting] = useState<ReadonlyMap<string, Asset>>(() => new Map());
   const live = useLiveSite(siteId);
   const { ui } = live;
 
@@ -100,7 +103,8 @@ function SiteMap({ siteId }: { siteId: string }) {
 
   const layout = useMemo(() => site?.layout ?? {}, [site]);
   const use2d = force2d || glError !== null;
-  const shown = (selected && ui.assets.get(selected)) || (hover && ui.assets.get(hover)) || null;
+  const recordOf = (id: string | null) => (id ? ui.assets.get(id) ?? departing.get(id) : undefined);
+  const shown = recordOf(selected) || recordOf(hover) || null;
 
   // Floors (ADR 0006): one floor is shown at a time; ?floor=<id> keeps the choice in the link.
   const floors = useMemo(() => floorsOf(layout), [layout]);
@@ -195,6 +199,9 @@ function SiteMap({ siteId }: { siteId: string }) {
                   selectedId={selected}
                   onSelect={select}
                   onHover={(id) => setHover(id)}
+                  motion={motion}
+                  ready={ui.snapshotReceived}
+                  onDeparting={setDeparting}
                   reason={force2d ? "selected with ?view=2d." : `${glError} Showing a top view instead.`}
                 />
               ) : (
@@ -210,6 +217,8 @@ function SiteMap({ siteId }: { siteId: string }) {
                   onSelect={select}
                   onFail={(r) => setGlError(`The 3D view could not start (${r}).`)}
                   debug={debug}
+                  motion={motion}
+                  onDeparting={setDeparting}
                 />
               )}
               {shown && (

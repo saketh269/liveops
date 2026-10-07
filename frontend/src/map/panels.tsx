@@ -80,7 +80,7 @@ export function Legend() {
           </li>
         ))}
       </ul>
-      <p className="muted lm-small">Shapes show the asset kind. A short pulse marks a state change. Assets whose zone is not in the layout sit in the Unassigned strip.</p>
+      <p className="muted lm-small">Shapes show the kind and role (bed, patient, nurse, doctor, cleaner, other staff, ambulance, equipment). A short pulse marks a state change. A figure walks only when its record's zone or position changes, or when it is added or removed. Assets whose zone is not in the layout sit in the Unassigned strip.</p>
     </section>
   );
 }

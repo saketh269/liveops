@@ -22,6 +22,10 @@ type Props = {
   assetFilter?: (assets: ReadonlyMap<string, Asset>) => ReadonlyMap<string, Asset>;
   /** Changing this re-frames the camera (e.g. the floor id). */
   viewKey?: string;
+  /** False (?motion=off) makes every change jump instead of walking. */
+  motion?: boolean;
+  /** Removed records still walking out, with their final data (for the details panel). */
+  onDeparting?: (assets: Map<string, Asset>) => void;
 };
 
 declare global {
@@ -31,12 +35,13 @@ declare global {
 }
 
 /** Hosts the Three.js scene. Asset updates bypass React and go straight to the scene. */
-export default function MapView3D({ layout, stateRef, listen, selectedId, onHover, onSelect, onFail, debug, plan, assetFilter, viewKey }: Props) {
+export default function MapView3D({ layout, stateRef, listen, selectedId, onHover, onSelect, onFail, debug, plan, assetFilter, viewKey, motion = true, onDeparting }: Props) {
   const hostRef = useRef<HTMLDivElement>(null);
   const labelsRef = useRef<HTMLDivElement>(null);
   const [scene, setScene] = useState<MapScene | null>(null);
-  const cbRef = useRef({ onHover, onSelect, onFail });
-  cbRef.current = { onHover, onSelect, onFail };
+  const [follow, setFollow] = useState(false);
+  const cbRef = useRef({ onHover, onSelect, onFail, onDeparting });
+  cbRef.current = { onHover, onSelect, onFail, onDeparting };
 
   useEffect(() => {
     let disposed = false;
@@ -48,6 +53,7 @@ export default function MapView3D({ layout, stateRef, listen, selectedId, onHove
           s = new MapScene(hostRef.current, labelsRef.current, {
             onHover: (id, x, y) => cbRef.current.onHover(id, x, y),
             onSelect: (id) => cbRef.current.onSelect(id),
+            onDeparting: (m) => cbRef.current.onDeparting?.(m),
           });
           setScene(s);
         } catch (e) {
@@ -65,11 +71,14 @@ export default function MapView3D({ layout, stateRef, listen, selectedId, onHove
   useEffect(() => {
     if (!scene) return;
     const cache = new PlacementCache();
+    // The first snapshot this view sees is placed instantly: no mass walk-in.
+    let primed = false;
     const push = (st: MapState) => {
       const assets = assetFilter ? assetFilter(st.assets) : st.assets;
       const placement = cache.get(layout, assets.values());
       scene.setLayout(layout, placement.unassigned);
-      scene.setAssets(assets, placement);
+      scene.setAssets(assets, placement, !primed);
+      if (st.snapshotReceived) primed = true;
     };
     push(stateRef.current);
     const off = listen(push);
@@ -79,6 +88,7 @@ export default function MapView3D({ layout, stateRef, listen, selectedId, onHove
         stats: () => scene.stats(),
         colorOf: (id: string) => scene.colorOf(id),
         screenOf: (id: string) => scene.screenOf(id),
+        positionOf: (id: string) => scene.positionOf(id),
         assetCount: () => stateRef.current.assets.size,
       };
     }
@@ -98,6 +108,9 @@ export default function MapView3D({ layout, stateRef, listen, selectedId, onHove
   useEffect(() => { scene?.setPlan(plan ?? null); }, [scene, plan]);
 
   useEffect(() => { scene?.setSelected(selectedId); }, [scene, selectedId]);
+  useEffect(() => { scene?.setMotionAllowed(motion); }, [scene, motion]);
+  const following = follow && !!selectedId;
+  useEffect(() => { scene?.setFollow(following); }, [scene, following]);
 
   return (
     <div className="lm-viewport">
@@ -115,7 +128,15 @@ export default function MapView3D({ layout, stateRef, listen, selectedId, onHove
         <button type="button" className="btn" onClick={() => scene?.zoom(1.25)} aria-label="Zoom out" disabled={!scene}>−</button>
         <button type="button" className="btn" onClick={() => scene?.rotate(-Math.PI / 8)} aria-label="Rotate left" disabled={!scene}>⟲</button>
         <button type="button" className="btn" onClick={() => scene?.rotate(Math.PI / 8)} aria-label="Rotate right" disabled={!scene}>⟳</button>
-        <button type="button" className="btn" onClick={() => scene?.resetCamera()} disabled={!scene}>Reset view</button>
+        <button
+          type="button"
+          className="btn"
+          aria-pressed={following}
+          onClick={() => setFollow((v) => !v)}
+          disabled={!scene || !selectedId}
+          title={selectedId ? "Keep the selected asset in view as it moves" : "Select an asset to follow it"}
+        >Follow</button>
+        <button type="button" className="btn" onClick={() => { setFollow(false); scene?.resetCamera(); }} disabled={!scene}>Reset view</button>
       </div>
       {!scene && <p className="lm-loading muted">Loading 3D view…</p>}
     </div>
