@@ -47,6 +47,12 @@ function isSoftwareRenderer(): boolean {
 const PULSE_MS = 700;
 /** Per-frame ease of a fly-to (0..1). */
 const FLY_EASE = 0.1;
+/**
+ * Software renderers (SwiftShader/llvmpipe) are fill-rate bound, and the angled view
+ * fills more of the canvas with floor and figures than the old top view: they draw at
+ * 80% resolution (upscaled, slightly soft) to keep the frame rate. GPUs draw at full.
+ */
+const SOFTWARE_RENDER_SCALE = 0.8;
 /** How quickly the camera catches up with a followed figure (per frame, 0..1). */
 const FOLLOW_EASE = 0.15;
 
@@ -100,7 +106,7 @@ export class MapScene implements MapCamera {
     // MSAA roughly halves frame rate on software renderers (SwiftShader/llvmpipe), so it is only used on a GPU.
     this.software = isSoftwareRenderer();
     this.renderer = new THREE.WebGLRenderer({ antialias: !this.software, powerPreference: "high-performance" });
-    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2) * (this.software ? SOFTWARE_RENDER_SCALE : 1));
     configureRenderer(this.renderer, this.palette, this.software);
     this.renderer.domElement.className = "lm-canvas";
     this.renderer.domElement.setAttribute("aria-hidden", "true");

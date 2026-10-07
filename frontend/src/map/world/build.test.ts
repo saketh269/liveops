@@ -1,6 +1,6 @@
 import type { Zone } from "../../api/types";
 import * as THREE from "three";
-import { RoomTiles, bayKerbs, buildWorld, chairSpots } from "./build";
+import { RoomTiles, bayKerbs, buildWorld, chairSpots, roundedBox } from "./build";
 import { PALETTES } from "./style";
 import { pointInPolygon } from "../placement";
 
@@ -90,5 +90,28 @@ describe("RoomTiles", () => {
       const n = new THREE.Vector3().crossVectors(v[1].clone().sub(v[0]), v[2].clone().sub(v[0]));
       expect(n.y).toBeGreaterThan(0);
     }
+  });
+});
+
+describe("roundedBox", () => {
+  /** Area of the faces pointing straight up (the top cap). */
+  const topArea = (g: THREE.BufferGeometry) => {
+    const ng = g.index ? g.toNonIndexed() : g;
+    const pos = ng.getAttribute("position");
+    const v = [new THREE.Vector3(), new THREE.Vector3(), new THREE.Vector3()];
+    let area = 0;
+    for (let i = 0; i < pos.count; i += 3) {
+      v.forEach((p, k) => p.fromBufferAttribute(pos, i + k));
+      const n = new THREE.Vector3().crossVectors(v[1].clone().sub(v[0]), v[2].clone().sub(v[0]));
+      if (n.y > 0 && Math.abs(n.x) < 1e-9 && Math.abs(n.z) < 1e-9) area += n.y / 2;
+    }
+    return area;
+  };
+
+  test("with a hole the top is only the ring around it (no overdraw under the floor)", () => {
+    const full = topArea(roundedBox(12, 8, 0.8, 0.35));
+    const ring = topArea(roundedBox(12, 8, 0.8, 0.35, [10.8, 6.8]));
+    expect(full).toBeGreaterThan(90);
+    expect(ring).toBeCloseTo(full - 10.8 * 6.8, 1);
   });
 });

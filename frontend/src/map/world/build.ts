@@ -60,8 +60,12 @@ export class Baker {
   }
 }
 
-/** Rounded rectangle extruded upwards from y = 0 to `h`, centred on the origin. */
-export function roundedBox(w: number, d: number, r: number, h: number): THREE.BufferGeometry {
+/**
+ * Rounded rectangle extruded upwards from y = 0 to `h`, centred on the origin. With
+ * `hole` ([w, d], centred) the top is a ring: a surface that something else covers
+ * (the floor over the slab) is not drawn twice.
+ */
+export function roundedBox(w: number, d: number, r: number, h: number, hole?: readonly [number, number]): THREE.BufferGeometry {
   const rr = Math.max(0.01, Math.min(r, w / 2 - 0.01, d / 2 - 0.01));
   const s = new THREE.Shape();
   const x = -w / 2, y = -d / 2;
@@ -70,6 +74,10 @@ export function roundedBox(w: number, d: number, r: number, h: number): THREE.Bu
   s.lineTo(x + w, y + d - rr); s.quadraticCurveTo(x + w, y + d, x + w - rr, y + d);
   s.lineTo(x + rr, y + d); s.quadraticCurveTo(x, y + d, x, y + d - rr);
   s.lineTo(x, y + rr); s.quadraticCurveTo(x, y, x + rr, y);
+  if (hole && hole[0] > 0 && hole[1] > 0 && hole[0] < w && hole[1] < d) {
+    const [hw, hd] = [hole[0] / 2, hole[1] / 2];
+    s.holes.push(new THREE.Path([new THREE.Vector2(-hw, -hd), new THREE.Vector2(-hw, hd), new THREE.Vector2(hw, hd), new THREE.Vector2(hw, -hd), new THREE.Vector2(-hw, -hd)]));
+  }
   const g = new THREE.ExtrudeGeometry(s, { depth: h, bevelEnabled: false, curveSegments: 4 });
   g.rotateX(-Math.PI / 2);
   return g;
@@ -165,10 +173,12 @@ export function buildWorld(input: WorldInput): BuiltWorld {
 
   // Slab with rounded edges, its top just under the floor.
   const m = WORLD.slabMargin;
-  const slab = new THREE.Mesh(roundedBox(width + 2 * m, depth + 2 * m, 0.8, WORLD.slabThickness), mat({ color: p.slab }));
+  // Its top is a ring around the floor: under the floor it would only be overdraw.
+  const slab = new THREE.Mesh(roundedBox(width + 2 * m, depth + 2 * m, 0.8, WORLD.slabThickness, [width - 0.1, depth - 0.1]), mat({ color: p.slab }));
   slab.position.y = -WORLD.slabThickness;
   slab.receiveShadow = true;
   slab.name = "slab";
+  slab.renderOrder = 1;
   group.add(slab);
 
   // Painted floor.
@@ -185,6 +195,9 @@ export function buildWorld(input: WorldInput): BuiltWorld {
   floor.position.y = WORLD.floorY;
   floor.receiveShadow = true;
   floor.name = "floor";
+  // Big surfaces draw after the figures and walls (renderOrder 0): pixels those cover
+  // fail the depth test instead of being shaded twice.
+  floor.renderOrder = 1;
   group.add(floor);
 
   // Room tiles (tinted live by the scene).
