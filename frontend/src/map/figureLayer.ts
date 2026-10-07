@@ -15,7 +15,7 @@ import type { FigureModel } from "./figures";
 /** What the layer needs to draw one figure. */
 export type FigurePose = { x: number; y: number; heading: number; level: number; size: number };
 
-export type LayerEntry = { id: string; key: string; pose: FigurePose; moving: boolean; color: THREE.Color };
+export type LayerEntry = { id: string; key: FigureModel; pose: FigurePose; moving: boolean; color: THREE.Color };
 
 type Template = { pos: Float32Array; nrm: Float32Array; shade: Float32Array; index: ArrayLike<number>; verts: number; height: number };
 

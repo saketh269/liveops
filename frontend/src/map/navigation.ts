@@ -398,10 +398,3 @@ export function navGridFor(layout: SiteLayout): NavGrid {
   if (!g) { g = new NavGrid(navFloorOf(layout)); grids.set(layout, g); }
   return g;
 }
-
-/** Total length of a polyline. */
-export function pathLength(pts: readonly Pt[]): number {
-  let d = 0;
-  for (let i = 1; i < pts.length; i++) d += Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]);
-  return d;
-}

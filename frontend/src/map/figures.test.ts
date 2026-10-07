@@ -1,4 +1,4 @@
-import { figureKey, figureModel, isPerson, isVehicle } from "./figures";
+import { figureModel, figureOf, isPerson, isVehicle } from "./figures";
 
 test("kind picks the model, role refines people (case-insensitive)", () => {
   expect(figureModel("Bed")).toBe("bed");
@@ -19,8 +19,8 @@ test("kind picks the model, role refines people (case-insensitive)", () => {
 test("unknown kinds fall back to the box figure", () => {
   expect(figureModel("pump")).toBe("other");
   expect(figureModel(undefined)).toBe("other");
-  expect(figureKey({ site_id: "s", asset_id: "1", updated_ts: 0, _sources: {}, kind: "Pump" })).toBe("other");
-  expect(figureKey({ site_id: "s", asset_id: "1", updated_ts: 0, _sources: {} })).toBe("other");
+  expect(figureOf({ site_id: "s", asset_id: "1", updated_ts: 0, _sources: {}, kind: "Pump" })).toBe("other");
+  expect(figureOf({ site_id: "s", asset_id: "1", updated_ts: 0, _sources: {} })).toBe("other");
   expect(isVehicle("ambulance") && !isVehicle("nurse")).toBe(true);
   expect(isPerson("cleaner") && !isPerson("bed")).toBe(true);
 });

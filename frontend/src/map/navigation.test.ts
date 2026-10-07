@@ -1,5 +1,5 @@
 import type { SiteLayout, Zone } from "../api/types";
-import { NavGrid, navFloorOf, navGridFor, nearestEntrance, pathLength } from "./navigation";
+import { NavGrid, navFloorOf, navGridFor, nearestEntrance } from "./navigation";
 import { pointInPolygon, type Pt } from "./placement";
 
 const rect = (id: string, x: number, y: number, w: number, h: number, extra: Partial<Zone> = {}): Zone =>
@@ -15,6 +15,7 @@ function samples(pts: Pt[], step = 0.1): Pt[] {
   }
   return out;
 }
+const pathLength = (pts: Pt[]) => pts.slice(1).reduce((d, p, i) => d + Math.hypot(p[0] - pts[i][0], p[1] - pts[i][1]), 0);
 const inZone = (z: Zone, [x, y]: Pt) => pointInPolygon(x, y, z.polygon);
 const distTo = (pts: Pt[], q: Pt) => Math.min(...samples(pts).map((p) => Math.hypot(p[0] - q[0], p[1] - q[1])));
 // Correctness tests use a generous time cap so a busy test runner can't turn them into fallbacks.

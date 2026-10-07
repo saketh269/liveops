@@ -9,7 +9,7 @@
 // and speed, so frame rate does not change where it is. The clock is injected
 // so tests are deterministic.
 import type { Asset, SiteLayout } from "../api/types";
-import { figureOf, isVehicle, type FigureModel } from "./figures";
+import { figureOf, isPerson, isVehicle, type FigureModel } from "./figures";
 import { navGridFor, nearestEntrance, type NavGrid } from "./navigation";
 import type { Placement, PlacementResult, Pt } from "./placement";
 
@@ -128,7 +128,6 @@ export class Motion {
 
   get isEnabled() { return this.enabled; }
   get walkerCount() { return this.walking.size; }
-  get size() { return this.figs.size; }
 
   get(id: string): FigureState | undefined {
     return this.figs.get(id);
@@ -336,7 +335,7 @@ export class Motion {
     if (f.target) {
       f.x = f.target.x; f.y = f.target.y; f.level = f.target.level; f.size = f.target.size;
     }
-    if (f.model === "bed" || f.model === "equipment" || f.model === "other") f.heading = 0;
+    if (!isPerson(f.model) && !isVehicle(f.model)) f.heading = 0; // beds and equipment rest square to the room
     f.walk = null;
     this.walking.delete(f.id);
     this.pending.delete(f.id);

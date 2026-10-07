@@ -56,7 +56,3 @@ export function figureOf(a: Asset): FigureModel {
 export const isVehicle = (m: FigureModel) => m === "ambulance" || m === "vehicle";
 export const isPerson = (m: FigureModel) => m === "patient" || m === "person" || m === "nurse" || m === "doctor" || m === "cleaner";
 
-/** Mesh group key for the 3D scene: one merged mesh per model. */
-export function figureKey(a: Asset): FigureModel {
-  return figureOf(a);
-}

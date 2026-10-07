@@ -4,7 +4,7 @@ import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import type { Asset, SiteLayout } from "../api/types";
 import { FigureLayer, type LayerEntry } from "./figureLayer";
-import { figureKey } from "./figures";
+import { figureOf } from "./figures";
 import { APPROACH_DISTANCE, Motion } from "./motion";
 import { floorSize, polygonCentroid, type PlacementResult, type Pt, type Rect } from "./placement";
 import { STATE_KEYS, onThemeChange, readStateColors, readToken, stateKey, type StateKey } from "./stateColors";
@@ -304,7 +304,7 @@ export class MapScene {
       const before = prev.get(id);
       if (before === a) continue;
       if (!this.figures.has(id)) continue;
-      if (figureKey(a) !== this.figures.keyOf(id)) { this.rebuild(prev); return; } // role changed: different figure
+      if (figureOf(a) !== this.figures.keyOf(id)) { this.rebuild(prev); return; } // role changed: different figure
       this.figures.setColor(id, this.colorFor(a));
       if (before && stateKey(before.state) !== stateKey(a.state) && !this.reducedMotion) this.pulses.set(id, now);
     }
@@ -347,7 +347,7 @@ export class MapScene {
     const entries: LayerEntry[] = [];
     // Figures: current records plus removed ones still walking out.
     for (const f of this.motion.all()) {
-      entries.push({ id: f.id, key: figureKey(f.asset), pose: f, moving: this.motion.isMoving(f.id), color: this.colorFor(f.asset) });
+      entries.push({ id: f.id, key: f.model, pose: f, moving: this.motion.isMoving(f.id), color: this.colorFor(f.asset) });
       const before = prev.get(f.id);
       if (before && before !== f.asset && stateKey(before.state) !== stateKey(f.asset.state) && !this.reducedMotion) this.pulses.set(f.id, now);
     }
