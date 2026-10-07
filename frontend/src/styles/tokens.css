@@ -1,0 +1,91 @@
+/* Live Ops design tokens. Every component uses these; never hard-code colors.
+   Light is the default; dark follows the OS or data-theme="dark". */
+:root {
+  --bg: #f3f5f6;
+  --panel: #ffffff;
+  --panel-2: #f8fafb;
+  --line: #dde3e6;
+  --fg: #14232b;
+  --muted: #5b6b73;
+  --faint: #8d9ba2;
+  --accent: #0d7480;
+  --accent-fg: #ffffff;
+  --accent-soft: #e1f1f2;
+  --ok: #1d8a4e;
+  --ok-soft: #e2f4ea;
+  --warn: #b7791f;
+  --warn-soft: #fbf1dd;
+  --bad: #c2392b;
+  --bad-soft: #fbe6e3;
+  --info: #2f62b5;
+  --info-soft: #e4ecfa;
+
+  /* Asset state colors on the map */
+  --state-free: #1d8a4e;
+  --state-in-use: #2f62b5;
+  --state-cleaning: #b7791f;
+  --state-alert: #c2392b;
+  --state-unknown: #8d9ba2;
+
+  --f-display: "Archivo", "Helvetica Neue", Arial, sans-serif;
+  --f-body: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --f-mono: "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace;
+
+  --radius: 8px;
+  --gap: 16px;
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0c1418; --panel: #121d22; --panel-2: #162329; --line: #22323a; --fg: #e3ecef; --muted: #97a8b0;
+    --faint: #6b7d85; --accent: #3fb6c1; --accent-fg: #06191c; --accent-soft: #12303a; --ok: #4cc584;
+    --ok-soft: #123326; --warn: #e4ad4f; --warn-soft: #3a2c12; --bad: #f07a6c; --bad-soft: #3d1b18;
+    --info: #7aa6f0; --info-soft: #18284a; --state-free: #4cc584; --state-in-use: #7aa6f0;
+    --state-cleaning: #e4ad4f; --state-alert: #f07a6c; --state-unknown: #6b7d85; color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0c1418; --panel: #121d22; --panel-2: #162329; --line: #22323a; --fg: #e3ecef; --muted: #97a8b0;
+  --faint: #6b7d85; --accent: #3fb6c1; --accent-fg: #06191c; --accent-soft: #12303a; --ok: #4cc584;
+  --ok-soft: #123326; --warn: #e4ad4f; --warn-soft: #3a2c12; --bad: #f07a6c; --bad-soft: #3d1b18;
+  --info: #7aa6f0; --info-soft: #18284a; --state-free: #4cc584; --state-in-use: #7aa6f0;
+  --state-cleaning: #e4ad4f; --state-alert: #f07a6c; --state-unknown: #6b7d85; color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+html, body, #root { height: 100%; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.5 var(--f-body); }
+h1, h2, h3 { font-family: var(--f-display); margin: 0; letter-spacing: -0.01em; text-wrap: balance; }
+h1 { font-size: 1.5rem; font-weight: 800; }
+h2 { font-size: 1.1rem; font-weight: 600; }
+a { color: var(--accent); }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.mono { font-family: var(--f-mono); font-variant-numeric: tabular-nums; }
+.muted { color: var(--muted); }
+
+.btn { font: 500 0.85rem var(--f-body); border: 1px solid var(--line); background: var(--panel); color: var(--fg);
+  border-radius: 6px; padding: 7px 14px; cursor: pointer; }
+.btn:hover { border-color: var(--accent); }
+.btn.primary { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
+.btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 16px; }
+.field { display: grid; gap: 4px; }
+.field label { font-weight: 500; font-size: 0.85rem; }
+.field input, .field select, .field textarea { font: inherit; color: var(--fg); background: var(--panel-2);
+  border: 1px solid var(--line); border-radius: 6px; padding: 7px 10px; }
+.field .help { font-size: 0.78rem; color: var(--muted); }
+
+.pill { font: 600 0.68rem/1 var(--f-mono); letter-spacing: 0.06em; text-transform: uppercase; padding: 5px 8px;
+  border-radius: 999px; background: var(--panel-2); color: var(--muted); white-space: nowrap; }
+.pill.ok { background: var(--ok-soft); color: var(--ok); }
+.pill.warn { background: var(--warn-soft); color: var(--warn); }
+.pill.bad { background: var(--bad-soft); color: var(--bad); }
+.pill.info { background: var(--info-soft); color: var(--info); }
+
+.notice { border-left: 4px solid var(--warn); background: var(--warn-soft); padding: 10px 14px; border-radius: 6px; }
+.notice.bad { border-left-color: var(--bad); background: var(--bad-soft); }
+.notice.info { border-left-color: var(--info); background: var(--info-soft); }
+
+@media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }

@@ -1,0 +1,47 @@
+# Live Ops: one command to run everything.
+#   1. Copy .env.example to .env and set LIVEOPS_SECRET_KEY
+#   2. docker compose up --build
+#   3. Open http://localhost:8080
+services:
+  portal-db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: liveops
+      POSTGRES_PASSWORD: ${PORTAL_DB_PASSWORD:-liveops}
+      POSTGRES_DB: liveops
+    volumes: [portal-db:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U liveops"]
+      interval: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      retries: 20
+
+  backend:
+    build: ./backend
+    env_file: .env
+    environment:
+      LIVEOPS_DATABASE_URL: postgresql+psycopg://liveops:${PORTAL_DB_PASSWORD:-liveops}@portal-db:5432/liveops
+      LIVEOPS_REDIS_URL: redis://redis:6379/0
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    depends_on:
+      portal-db: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')"]
+      interval: 5s
+      retries: 20
+
+  frontend:
+    build: ./frontend
+    ports: ["8080:80"]
+    depends_on:
+      backend: { condition: service_healthy }
+
+volumes:
+  portal-db:
