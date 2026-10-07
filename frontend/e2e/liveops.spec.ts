@@ -18,7 +18,7 @@ test("connect Postgres, test it, create a site, map beds, and see it running on 
   await page.goto("/sources");
   await expect(page.getByRole("heading", { name: "No sources yet" })).toBeVisible();
   await page.getByRole("link", { name: "Connect your first source" }).click();
-  await page.getByRole("button", { name: /PostgreSQL/ }).click();
+  await page.getByRole("button", { name: /^PostgreSQL(?! \(live)/ }).click();
   await page.getByLabel(/^Name/).fill("E2E hospital DB");
   await page.getByLabel(/^Host/).fill(env("E2E_SOURCE_HOST"));
   await page.getByLabel(/^Port/).fill(env("E2E_SOURCE_PORT"));
