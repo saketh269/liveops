@@ -46,3 +46,45 @@ test("state coverage lists unrecognised values", () => {
   expect(c).toMatchObject({ total: 3, colored: 1, noState: 1 });
   expect([...c.unrecognised]).toEqual([["weird", 1]]);
 });
+
+const floored = {
+  width: 100, depth: 60,
+  floors: [
+    { id: "g", name: "Ground", level: 0, width: 100, depth: 60 },
+    { id: "l1", name: "Level 1", level: 1, width: 60, depth: 40 },
+  ],
+  zones: [
+    { id: "zone-er", name: "ER", polygon: [[0, 0], [20, 0], [20, 10], [0, 10]] as [number, number][], floor_id: "g" },
+    { id: "zone-old", name: "Old", polygon: [[0, 0], [20, 0], [20, 10], [0, 10]] as [number, number][], floor_id: "l1" },
+  ],
+};
+
+test("auto layout on a floor: only that floor's zones change, ids stay unique", () => {
+  const cov = zoneCoverage(floored, [a("1", "ER"), a("2", "ICU"), a("4", "Old ")]);
+  const layout = buildAutoLayout(floored, cov, "l1");
+  expect(layout.zones!.filter((z) => z.floor_id === "g").map((z) => z.id)).toEqual(["zone-er"]);
+  const l1 = layout.zones!.filter((z) => z.floor_id === "l1");
+  expect(l1.map((z) => z.name)).toEqual(["Old", "ICU"]);
+  expect(validateLayout(l1, 60, 40)).toEqual([]);
+  expect(new Set(layout.zones!.map((z) => z.id)).size).toBe(layout.zones!.length);
+  expect(layout.floors).toEqual(floored.floors);
+});
+
+test("append on a floor grows only that floor and avoids ids on other floors", () => {
+  const withEr = { ...floored, zones: [...floored.zones, { id: "zone-icu", name: "Icu old", polygon: [], floor_id: "g" }] };
+  const cov = zoneCoverage(withEr, [a("1", "ER"), a("2", "ICU")]);
+  const layout = appendMissingZones(withEr, cov, "l1");
+  const added = layout.zones!.find((z) => z.name === "ICU")!;
+  expect(added.floor_id).toBe("l1");
+  expect(added.id).toBe("zone-icu-2");
+  expect(layout.floors![0]).toEqual(floored.floors[0]);
+  expect(layout.floors![1].depth).toBeGreaterThan(40);
+  expect(layout.depth).toBe(60); // top-level size follows the first floor
+});
+
+test("old layouts ignore the floor argument", () => {
+  const cov = zoneCoverage(template, [a("1", "ICU")]);
+  expect(buildAutoLayout(template, cov, "l1")).toEqual(buildAutoLayout(template, cov));
+  expect(appendMissingZones(template, cov, "x")).toEqual(appendMissingZones(template, cov));
+  expect(buildAutoLayout(template, cov).floors).toBeUndefined();
+});

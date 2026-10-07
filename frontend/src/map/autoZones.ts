@@ -1,5 +1,6 @@
 // Builds zones from the data itself, so a new site works without drawing a floor plan first.
 import type { Asset, SiteLayout, Zone } from "../api/types";
+import { floorById, floorIdOf, floorsOf, hasExplicitFloors } from "./floors";
 import { rectToPolygon } from "./geometry";
 import { compareIds, explicitPosition, floorSize, resolveZone } from "./placement";
 import { stateKey } from "./stateColors";
@@ -50,15 +51,48 @@ function slug(name: string): string {
 }
 
 /**
+ * Apply `fn` to one floor of a layout. Old layouts (no floors) are passed as is.
+ * With floors, `fn` sees that floor as a single-floor layout; its zones and size
+ * are written back to that floor, and every other floor's zones are kept.
+ * `reserved` holds zone ids used on other floors, so new ids stay unique.
+ */
+function onFloor(
+  layout: SiteLayout | null | undefined,
+  floorId: string | undefined,
+  fn: (sub: SiteLayout, reserved: Set<string>) => SiteLayout,
+): SiteLayout {
+  if (!hasExplicitFloors(layout)) return fn(layout ?? {}, new Set());
+  const f = floorById(layout, floorId) ?? floorsOf(layout)[0];
+  const all = layout!.zones ?? [];
+  const mine = all.filter((z) => floorIdOf(layout, z) === f.id);
+  const others = all.filter((z) => floorIdOf(layout, z) !== f.id);
+  const res = fn({ width: f.width, depth: f.depth, zones: mine }, new Set(others.map((z) => z.id)));
+  const floors = (layout!.floors ?? []).map((x) => (x.id === f.id ? { ...x, width: res.width ?? x.width, depth: res.depth ?? x.depth } : x));
+  const first = floorsOf({ ...layout, floors })[0];
+  return {
+    ...layout,
+    width: first.width,
+    depth: first.depth,
+    floors,
+    zones: [...others, ...(res.zones ?? []).map((z) => ({ ...z, floor_id: f.id }))],
+  };
+}
+
+/**
  * New layout with one zone per zone value in the data. Zones that already hold
  * assets keep their id, name and color; empty placeholder zones are dropped.
- * Zones are laid out as an even grid on the current floor.
+ * Zones are laid out as an even grid on the given floor (default: the first);
+ * other floors are not touched.
  */
-export function buildAutoLayout(layout: SiteLayout | null | undefined, cov: ZoneCoverage): SiteLayout {
+export function buildAutoLayout(layout: SiteLayout | null | undefined, cov: ZoneCoverage, floorId?: string): SiteLayout {
+  return onFloor(layout, floorId, (sub, reserved) => autoGrid(sub, cov, reserved));
+}
+
+function autoGrid(layout: SiteLayout, cov: ZoneCoverage, reserved: Set<string>): SiteLayout {
   const { width, depth } = floorSize(layout);
-  const kept = (layout?.zones ?? []).filter((z) => cov.used.has(z.id));
+  const kept = (layout.zones ?? []).filter((z) => cov.used.has(z.id));
   const names = [...cov.missing.keys()].sort(compareIds);
-  const ids = new Set(kept.map((z) => z.id));
+  const ids = new Set([...reserved, ...kept.map((z) => z.id)]);
   const fresh: Zone[] = names.map((name) => {
     let id = `zone-${slug(name)}`;
     for (let i = 2; ids.has(id); i++) id = `zone-${slug(name)}-${i}`;
@@ -67,7 +101,7 @@ export function buildAutoLayout(layout: SiteLayout | null | undefined, cov: Zone
   });
   const all = [...kept, ...fresh];
   const n = all.length;
-  if (!n) return { ...(layout ?? {}), width, depth, zones: [] };
+  if (!n) return { ...layout, width, depth, zones: [] };
 
   // Choose columns so cells come out close to square on this floor.
   const cols = Math.max(1, Math.min(n, Math.round(Math.sqrt((n * width) / depth)) || 1));
@@ -83,20 +117,25 @@ export function buildAutoLayout(layout: SiteLayout | null | undefined, cov: Zone
     const polygon = rectToPolygon({ x: r1(gap + c * (cw + gap)), y: r1(gap + r * (ch + gap)), w: r1(cw), h: r1(ch) });
     return { ...z, polygon };
   });
-  return { ...(layout ?? {}), width, depth, zones };
+  return { ...layout, width, depth, zones };
 }
 
 /**
  * Keep every existing zone where it is and add one zone per missing value in a
  * new band below the current floor (the floor grows to fit). Used when the
- * layout is already in use, so hand-drawn zones are never moved.
+ * layout is already in use, so hand-drawn zones are never moved. With floors,
+ * the zones go on the given floor (default: the first) and only it grows.
  */
-export function appendMissingZones(layout: SiteLayout | null | undefined, cov: ZoneCoverage): SiteLayout {
+export function appendMissingZones(layout: SiteLayout | null | undefined, cov: ZoneCoverage, floorId?: string): SiteLayout {
+  return onFloor(layout, floorId, (sub, reserved) => appendBand(sub, cov, reserved));
+}
+
+function appendBand(layout: SiteLayout, cov: ZoneCoverage, reserved: Set<string>): SiteLayout {
   const { width, depth } = floorSize(layout);
-  const existing = layout?.zones ?? [];
+  const existing = layout.zones ?? [];
   const names = [...cov.missing.keys()].sort(compareIds);
-  if (!names.length) return { ...(layout ?? {}), width, depth, zones: existing };
-  const ids = new Set(existing.map((z) => z.id));
+  if (!names.length) return { ...layout, width, depth, zones: existing };
+  const ids = new Set([...reserved, ...existing.map((z) => z.id)]);
   const gap = Math.max(1, width * 0.02);
   const cols = Math.min(names.length, Math.max(1, Math.floor(width / 18)));
   const rows = Math.ceil(names.length / cols);
@@ -111,5 +150,5 @@ export function appendMissingZones(layout: SiteLayout | null | undefined, cov: Z
     const r = Math.floor(i / cols);
     return { id, name, polygon: rectToPolygon({ x: r1(gap + c * (cw + gap)), y: r1(depth + gap + r * (ch + gap)), w: r1(cw), h: r1(ch) }) };
   });
-  return { ...(layout ?? {}), width, depth: r1(depth + gap + rows * (ch + gap)), zones: [...existing, ...added] };
+  return { ...layout, width, depth: r1(depth + gap + rows * (ch + gap)), zones: [...existing, ...added] };
 }
