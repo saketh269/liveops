@@ -258,7 +258,6 @@ def test_merge_three_sources(store: str, pg: PgSource) -> None:
         be.cleanup()
 
 
-@pytest.mark.xfail(strict=True, reason="LIVEOPS-92: overwritten shared field is not restored when the winner leaves")
 @pytest.mark.parametrize("store", ["memory", "redis"])
 def test_merge_shared_field_lost_when_winner_leaves(store: str, pg: PgSource) -> None:
     """Two sources map the same field. The newer one wins; when it removes the
@@ -424,7 +423,6 @@ def test_two_processes_ownership_and_takeover(pgcdc: PgSource) -> None:
         a.cleanup()
 
 
-@pytest.mark.xfail(strict=True, reason="LIVEOPS-79: a process that boots with no active mappings never joins")
 def test_late_joiner_takes_over(pgcdc: PgSource) -> None:
     """B boots before any mapping exists; the mapping is created via A; A dies."""
     a = Backend(redis=True)
@@ -681,9 +679,7 @@ def test_load_two_viewers_and_paging(store: str, type_: str, interval: int | Non
 @pytest.mark.parametrize(
     "how",
     [
-        pytest.param(
-            "pause", marks=pytest.mark.xfail(strict=True, reason="LIVEOPS-55: clear_mapping burst resyncs viewers")
-        ),
+        "pause",
         "source_delete",
     ],
 )

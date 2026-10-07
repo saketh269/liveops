@@ -105,6 +105,10 @@ class RunnerManager:
         """Start (or restart with a new spec) a mapping."""
         await self._start_local(spec)
 
+    async def join(self) -> None:
+        """At startup, before ``adopt``: take part in running mappings (no-op
+        in a single process; see ClusterRunnerManager)."""
+
     async def adopt(self, spec: MappingSpec) -> None:
         """At startup: run an active mapping. Same as ``start`` in one process;
         in a cluster it joins without restarting the current owner."""
@@ -152,6 +156,15 @@ class RunnerManager:
                 async for change in connector.stream(spec.dataset, [spec.config.key_field], spec.options):
                     h.connector_skipped = connector.skipped_records
                     if change.op == ChangeOp.SNAPSHOT_END:
+                        if snapshot_done:
+                            # ADR 0004: exactly one marker per stream(). A second one would
+                            # reconcile against an empty set and wipe the map (LIVEOPS-54).
+                            log.warning(
+                                "mapping %s: %s connector sent a second SNAPSHOT_END; ignored (contract violation)",
+                                spec.mapping_id,
+                                spec.source_type,
+                            )
+                            continue
                         removed = await self.state.reconcile(spec.site_id, spec.mapping_id, seen)
                         if removed:
                             log.info("mapping %s: removed %d stale assets after snapshot", spec.mapping_id, removed)

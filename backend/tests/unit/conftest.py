@@ -51,6 +51,7 @@ async def store_factory(request: pytest.FixtureRequest) -> AsyncIterator[StoreFa
 
     def factory(**kwargs: Any) -> StateStore:
         if request.param == "memory":
+            kwargs.pop("max_connections", None)
             s: StateStore = InMemoryStateStore(**kwargs)
         else:
             from app.core.redis_state import RedisStateStore

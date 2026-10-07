@@ -92,6 +92,15 @@ class ClusterRunnerManager(RunnerManager):
         self.instance_id = instance_id or f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
         self._ttl_s = lease_ttl_s
         self._tick_s = lease_ttl_s / 3
+        # LIVEOPS-52: we only trust a lease until (time the SET/renew was sent +
+        # ttl - margin), measured on our own monotonic clock. The watchdog stops
+        # the local runner at that point whatever Redis is doing, so the lease
+        # can never lapse to another process while we still run the mapping.
+        self._margin_s = lease_ttl_s / 4
+        self._call_timeout_s = lease_ttl_s / 5
+        self._valid_until: dict[str, float] = {}
+        # After our lease went stale, leave the mapping to healthy peers for one ttl.
+        self._backoff_until: dict[str, float] = {}
         self._lease_prefix = f"{prefix}:runner:lease:"
         self._ver_key = f"{prefix}:{{runner}}:ver"
         self._op_key = f"{prefix}:{{runner}}:op"
@@ -183,6 +192,12 @@ class ClusterRunnerManager(RunnerManager):
     def _lease(self, mapping_id: str) -> str:
         return self._lease_prefix + mapping_id
 
+    async def join(self) -> None:
+        """Take part in the cluster from startup, even with no mappings yet: listen
+        for control messages, pick up mappings started elsewhere, and take over
+        when an owner dies (LIVEOPS-79)."""
+        await self._ensure_background()
+
     async def _ensure_background(self) -> None:
         if self._bg and all(not t.done() for t in self._bg):
             return
@@ -192,6 +207,7 @@ class ClusterRunnerManager(RunnerManager):
         self._bg = [
             asyncio.create_task(self._listen_loop(), name="cluster-control"),
             asyncio.create_task(self._tick_loop(), name="cluster-tick"),
+            asyncio.create_task(self._watchdog_loop(), name="cluster-lease-watchdog"),
         ]
         # Make sure control messages reach us before we act on our own.
         with contextlib.suppress(TimeoutError):
@@ -217,8 +233,15 @@ class ClusterRunnerManager(RunnerManager):
         spec = self._wanted.get(mapping_id)
         if spec is None or self._running_here(mapping_id):
             return
-        got = await self._r.set(self._lease(mapping_id), self.instance_id, nx=True, px=int(self._ttl_s * 1000))
+        if time.monotonic() < self._backoff_until.get(mapping_id, 0.0):
+            return
+        sent = time.monotonic()
+        got = await asyncio.wait_for(
+            self._r.set(self._lease(mapping_id), self.instance_id, nx=True, px=int(self._ttl_s * 1000)),
+            self._call_timeout_s,
+        )
         if got:
+            self._valid_until[mapping_id] = sent + self._ttl_s
             log.info("mapping %s: this process (%s) owns it now", mapping_id, self.instance_id)
             self._remote.pop(mapping_id, None)
             await self._start_local(spec)
@@ -285,6 +308,18 @@ class ClusterRunnerManager(RunnerManager):
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 10.0)
 
+    async def _watchdog_loop(self) -> None:
+        """Stops local runners whose lease can no longer be trusted. Runs without
+        the lock and without Redis, so a hung tick can't keep a runner alive."""
+        while True:
+            now = time.monotonic()
+            for mid in [m for m in list(self._tasks) if self._running_here(m)]:
+                if now >= self._valid_until.get(mid, 0.0) - self._margin_s:
+                    log.warning("mapping %s: lease not renewed in time; stopping the local runner", mid)
+                    self._backoff_until[mid] = now + self._ttl_s
+                    await self._stop_local(mid)
+            await asyncio.sleep(min(0.25, self._ttl_s / 10))
+
     async def _tick_loop(self) -> None:
         while True:
             try:
@@ -298,9 +333,21 @@ class ClusterRunnerManager(RunnerManager):
 
     async def _tick(self) -> None:
         ttl_ms = int(self._ttl_s * 1000)
-        # 1. Renew our leases; stop runners whose lease we lost.
+        # 1. Renew our leases; stop runners whose lease we lost. A renew that
+        #    errors leaves the lease uncertain: the watchdog stops the runner
+        #    before it could lapse (LIVEOPS-52).
         for mid in [m for m in list(self._tasks) if self._running_here(m)]:
-            if not await self._renew(keys=[self._lease(mid)], args=[self.instance_id, ttl_ms]):
+            sent = time.monotonic()
+            try:
+                ok = await asyncio.wait_for(
+                    self._renew(keys=[self._lease(mid)], args=[self.instance_id, ttl_ms]), self._call_timeout_s
+                )
+            except (RedisError, OSError, TimeoutError) as e:
+                log.warning("mapping %s: lease renewal failed (%s); will stop if it can't renew in time", mid, e)
+                continue
+            if ok:
+                self._valid_until[mid] = sent + self._ttl_s
+            else:
                 log.warning("mapping %s: lost its lease; stopping here, another process takes over", mid)
                 await self._stop_local(mid)
         # 2. Catch up on control messages we may have missed.
@@ -312,7 +359,10 @@ class ClusterRunnerManager(RunnerManager):
                     await self._handle_control(mid, int(v), ops.get(mid, "start"))
         # 3. Take over mappings nobody runs.
         for mid in list(self._wanted):
-            await self._try_acquire(mid)
+            try:
+                await self._try_acquire(mid)
+            except (RedisError, OSError, TimeoutError) as e:
+                log.warning("mapping %s: couldn't try to take the lease (%s)", mid, e)
         # 4. Share health.
         for mid in [m for m in list(self._tasks) if self._running_here(m)]:
             await self._publish_health(mid)

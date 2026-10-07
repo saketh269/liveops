@@ -4,10 +4,16 @@ every backend process that points at the same Redis.
 Layout (``P`` = key prefix, ``{S}`` = site id as a cluster hash tag, so all of
 a site's keys live in one slot)::
 
-    P:{S}:a:<asset_id>   hash   f:<field> -> value as JSON
-                                s:<field> -> source id
-                                m:<field> -> mapping id
-                                t:<field> -> received ts (float as text)
+    P:{S}:a:<asset_id>   hash   f:<field> -> visible value as JSON
+                                s:<field> -> its source id
+                                m:<field> -> its mapping id
+                                t:<field> -> its received ts (float as text)
+                                c:<mapping>\x1f<field> -> that mapping's own
+                                    contribution "ts\x1fseq\x1fsource\x1fvalue"
+                                #seq -> apply counter (tie-break for equal ts)
+
+    Visible = newest contribution (ties: applied last). When a mapping leaves,
+    each field falls back to the next newest contribution (LIVEOPS-92).
     P:{S}:idx            zset   asset_id -> asset updated_ts
     P:{S}:log            stream event log, field "e" = entry JSON, MAXLEN ~
     P:{S}:ch             pub/sub channel for the site
@@ -44,26 +50,68 @@ log = logging.getLogger("liveops.state.redis")
 _LUA_LIB = r"""
 local enc = cjson.encode
 
--- Drop the fields one mapping set on one asset. Returns the list of change
--- strings ('"name":[old,null]') and whether the asset is now empty, or nil
--- when the mapping contributed nothing.
+local US = '\31'
+
+-- "ts\31seq\31source\31value" -> ts (number), seq, ts text, source, value JSON
+local function parse_c(v)
+  local a = string.find(v, US, 1, true)
+  local b = string.find(v, US, a + 1, true)
+  local c = string.find(v, US, b + 1, true)
+  local ts_s = string.sub(v, 1, a - 1)
+  return tonumber(ts_s), tonumber(string.sub(v, a + 1, b - 1)), ts_s, string.sub(v, b + 1, c - 1), string.sub(v, c + 1)
+end
+
+-- Drop one mapping's contributions to one asset; fields it was showing fall
+-- back to the newest remaining contribution. Returns (changes, empty,
+-- visible_changed) or nil when the mapping contributed nothing.
 local function remove_mapping(akey, mapping)
   local all = redis.call('HGETALL', akey)
   if #all == 0 then return nil end
   local h = {}
   for i = 1, #all, 2 do h[all[i]] = all[i + 1] end
-  local changes = {}
+  local pre = 'c:' .. mapping .. US
+  local affected, best, any = {}, {}, false
   for k, v in pairs(h) do
-    if string.sub(k, 1, 2) == 'm:' and v == mapping then
-      local name = string.sub(k, 3)
-      table.insert(changes, enc(name) .. ':[' .. h['f:' .. name] .. ',null]')
-      redis.call('HDEL', akey, 'f:' .. name, 's:' .. name, 'm:' .. name, 't:' .. name)
+    local p = string.sub(k, 1, 2)
+    if p == 'c:' then
+      if string.sub(k, 1, #pre) == pre then
+        affected[string.sub(k, #pre + 1)] = true
+        redis.call('HDEL', akey, k)
+      else
+        local sep = string.find(k, US, 3, true)
+        local m, name = string.sub(k, 3, sep - 1), string.sub(k, sep + 1)
+        local ts, seq, ts_s, src, val = parse_c(v)
+        local b = best[name]
+        if (not b) or ts > b[1] or (ts == b[1] and seq > b[2]) then best[name] = {ts, seq, ts_s, src, m, val} end
+      end
+    elseif p == 'm:' and v == mapping then
+      affected[string.sub(k, 3)] = true  -- value written before contributions were kept
     end
   end
-  if #changes == 0 then return nil end
-  local empty = redis.call('HLEN', akey) == 0
-  if empty then redis.call('DEL', akey) end
-  return changes, empty
+  if next(affected) == nil then return nil end
+  local changes, visible = {}, false
+  for name, _ in pairs(affected) do
+    if h['m:' .. name] == mapping then
+      local old, b = h['f:' .. name], best[name]
+      if b then
+        redis.call('HSET', akey, 'f:' .. name, b[6], 's:' .. name, b[4], 'm:' .. name, b[5], 't:' .. name, b[3])
+        if b[6] ~= old then table.insert(changes, enc(name) .. ':[' .. old .. ',' .. b[6] .. ']') end
+        if b[6] ~= old or b[4] ~= h['s:' .. name] then visible = true end
+      else
+        redis.call('HDEL', akey, 'f:' .. name, 's:' .. name, 'm:' .. name, 't:' .. name)
+        table.insert(changes, enc(name) .. ':[' .. old .. ',null]')
+        visible = true
+      end
+    end
+  end
+  for k, _ in pairs(h) do
+    if string.sub(k, 1, 2) == 'f:' and redis.call('HEXISTS', akey, k) == 1 then any = true break end
+  end
+  if not any then
+    for k, _ in pairs(best) do any = true break end
+  end
+  if not any then redis.call('DEL', akey) end
+  return changes, not any, visible
 end
 
 -- After a visible change: update the site index, append to the event log,
@@ -119,22 +167,30 @@ local op, site, asset, src, mapping, ts_s, maxlen = ARGV[1], ARGV[2], ARGV[3], A
 local ts = tonumber(ts_s)
 
 if op == 'remove' then
-  local changes, removed = remove_mapping(akey, mapping)
-  if not changes then return false end
-  return emit(akey, ikey, lkey, chan, site, asset, op, src, mapping, ts_s, maxlen, changes, removed)
+  local changes, empty, visible = remove_mapping(akey, mapping)
+  if not changes or not (empty or visible) then return false end
+  return emit(akey, ikey, lkey, chan, site, asset, op, src, mapping, ts_s, maxlen, changes, empty)
 end
 
 local changes = {}
 local changed = false
+local seq = nil
 for i = 8, #ARGV, 2 do
   local name, val = ARGV[i], ARGV[i + 1]
-  local cur = redis.call('HMGET', akey, 'f:' .. name, 's:' .. name, 't:' .. name)
-  if not (cur[3] and tonumber(cur[3]) > ts) then
-    if (not cur[1]) or cur[1] ~= val then
-      table.insert(changes, enc(name) .. ':[' .. (cur[1] or 'null') .. ',' .. val .. ']')
+  local ck = 'c:' .. mapping .. US .. name
+  local own = redis.call('HGET', akey, ck)
+  if not (own and parse_c(own) > ts) then
+    if not seq then seq = redis.call('HINCRBY', akey, '#seq', 1) end
+    redis.call('HSET', akey, ck, ts_s .. US .. seq .. US .. src .. US .. val)
+    -- The new contribution has the highest seq: it is visible unless a newer ts is.
+    local cur = redis.call('HMGET', akey, 'f:' .. name, 's:' .. name, 't:' .. name)
+    if not (cur[3] and tonumber(cur[3]) > ts) then
+      if (not cur[1]) or cur[1] ~= val then
+        table.insert(changes, enc(name) .. ':[' .. (cur[1] or 'null') .. ',' .. val .. ']')
+      end
+      if (not cur[1]) or cur[1] ~= val or cur[2] ~= src then changed = true end
+      redis.call('HSET', akey, 'f:' .. name, val, 's:' .. name, src, 'm:' .. name, mapping, 't:' .. name, ts_s)
     end
-    if (not cur[1]) or cur[1] ~= val or cur[2] ~= src then changed = true end
-    redis.call('HSET', akey, 'f:' .. name, val, 's:' .. name, src, 'm:' .. name, mapping, 't:' .. name, ts_s)
   end
 end
 if not changed then return false end
@@ -159,9 +215,9 @@ local touched = 0
 for _, asset in ipairs(redis.call('ZRANGE', ikey, 0, -1)) do
   if not keep[asset] then
     local akey = prefix .. asset
-    local changes, removed = remove_mapping(akey, mapping)
-    if changes then
-      emit(akey, ikey, lkey, chan, site, asset, 'remove', '', mapping, ts_s, maxlen, changes, removed)
+    local changes, empty, visible = remove_mapping(akey, mapping)
+    if changes and (empty or visible) then
+      emit(akey, ikey, lkey, chan, site, asset, 'remove', '', mapping, ts_s, maxlen, changes, empty)
       touched = touched + 1
     end
   end
@@ -240,9 +296,18 @@ class RedisStateStore(StateStore):
         self._closed = False
 
     @classmethod
-    def from_url(cls, url: str, **kwargs: Any) -> RedisStateStore:
-        client = aioredis.Redis.from_url(url, decode_responses=True, socket_connect_timeout=5, socket_timeout=10)
-        return cls(client, **kwargs)
+    def from_url(cls, url: str, *, max_connections: int = 200, **kwargs: Any) -> RedisStateStore:
+        # A blocking pool: when every connection is busy, callers wait (up to
+        # 5 s) for a free one instead of failing at once (LIVEOPS-53).
+        pool = aioredis.BlockingConnectionPool.from_url(
+            url,
+            max_connections=max_connections,
+            timeout=5,
+            decode_responses=True,
+            socket_connect_timeout=5,
+            socket_timeout=5,
+        )
+        return cls(aioredis.Redis.from_pool(pool), **kwargs)
 
     # keys
     def _site(self, site_id: str) -> str:

@@ -78,12 +78,10 @@ class Fanout:
         subs = self._subs.get(msg.site_id)
         if not subs:
             return
-        known = self._known[msg.site_id]
-        for a in msg.assets:
-            if msg.type == "upsert":
-                known.add(a["asset_id"])
-            elif msg.type == "remove":
-                known.discard(a["asset_id"])
+        if msg.type == "upsert":
+            # Only grows while the site has viewers: a burst of removes must not
+            # shrink the bound under a queue that is still full of them (LIVEOPS-55).
+            self._known[msg.site_id].update(a["asset_id"] for a in msg.assets)
         limit = self.limit(msg.site_id)
         for q in list(subs):
             if q.qsize() >= limit:
@@ -100,6 +98,21 @@ class Fanout:
         while not q.empty():
             q.get_nowait()
         q.put_nowait(StreamMessage(type=RESYNC, site_id=site_id))
+
+
+REMOVE_YIELD_EVERY = 50
+
+
+def _remove_event(site_id: str, asset_id: str, mapping_id: str) -> AssetEvent:
+    return AssetEvent(
+        site_id=site_id,
+        asset_id=asset_id,
+        op=AssetOp.REMOVE,
+        source_id="",
+        mapping_id=mapping_id,
+        dataset="",
+        received_ts=time.time(),
+    )
 
 
 def event_messages(site_id: str, entry: EventEntry | None) -> list[StreamMessage]:
@@ -128,23 +141,17 @@ class StateStore(abc.ABC):
         """After a mapping's full-state snapshot: drop that mapping's fields from
         every asset not in ``keep`` (e.g. rows deleted while the backend was down,
         or asset ids that changed after a mapping edit). Returns how many assets
-        were touched. Stores may override with a faster version."""
+        visibly changed. Stores may override with a faster version."""
         touched = 0
-        for asset in await self.site_assets(site_id):
+        for n, asset in enumerate(await self.site_assets(site_id)):
             if asset.asset_id in keep:
                 continue
-            if any(v.mapping_id == mapping_id for v in asset.fields.values()):
-                await self.apply(
-                    AssetEvent(
-                        site_id=site_id,
-                        asset_id=asset.asset_id,
-                        op=AssetOp.REMOVE,
-                        source_id="",
-                        mapping_id=mapping_id,
-                        dataset="",
-                    )
-                )
+            # A store with hidden (overridden) values may hold this mapping's
+            # contribution on any asset, so ask the store rather than the view.
+            if await self.apply(_remove_event(site_id, asset.asset_id, mapping_id)) is not None:
                 touched += 1
+            if n % REMOVE_YIELD_EVERY == 0:
+                await asyncio.sleep(0)
         return touched
 
     @abc.abstractmethod
@@ -182,15 +189,33 @@ class StateStore(abc.ABC):
                     await self._unlisten(site_id)
 
     async def _snapshot(self, site_id: str) -> StreamMessage:
-        return StreamMessage(
-            type="snapshot", site_id=site_id, assets=[a.flat() for a in await self.site_assets(site_id)]
-        )
+        assets = [a.flat() for a in await self.site_assets(site_id)]
+        # The queue bound scales with the site the viewer was given (LIVEOPS-48/55).
+        self._fanout.seed(site_id, [a["asset_id"] for a in assets])
+        return StreamMessage(type="snapshot", site_id=site_id, assets=assets)
+
+
+Contribution = tuple[FieldValue, int]  # (value from one mapping, apply sequence number)
+
+
+def _best(per_mapping: dict[str, Contribution]) -> FieldValue | None:
+    """The visible value of a field: the newest contribution (ties: applied last)."""
+    if not per_mapping:
+        return None
+    return max(per_mapping.values(), key=lambda c: (c[0].updated_ts, c[1]))[0]
 
 
 class InMemoryStateStore(StateStore):
+    """Reference store. Every field keeps one contribution per mapping; the
+    newest is visible. When a mapping leaves, the field falls back to the next
+    newest remaining contribution (LIVEOPS-92)."""
+
     def __init__(self, queue_size: int = 1000, eventlog_maxlen: int | None = None) -> None:
         super().__init__(queue_size)
         self._assets: dict[str, dict[str, Asset]] = defaultdict(dict)
+        # site -> asset -> field -> mapping -> contribution
+        self._contrib: dict[str, dict[str, dict[str, dict[str, Contribution]]]] = defaultdict(dict)
+        self._seq = 0
         self._lock = asyncio.Lock()
         self._log = InMemoryEventLog() if eventlog_maxlen is None else InMemoryEventLog(eventlog_maxlen)
 
@@ -209,43 +234,72 @@ class InMemoryStateStore(StateStore):
 
     def _apply_locked(self, event: AssetEvent) -> tuple[StreamMessage | None, EventEntry | None]:
         site = self._assets[event.site_id]
+        contribs = self._contrib[event.site_id]
         asset = site.get(event.asset_id)
         changes: dict[str, list[Any]] = {}
         removed = False
+        visible_changed = False
         if event.op == AssetOp.REMOVE:
-            if asset is None:
+            contrib = contribs.get(event.asset_id)
+            if asset is None or contrib is None:
                 return None, None
-            dropped = {k: v for k, v in asset.fields.items() if v.mapping_id == event.mapping_id}
-            if not dropped:
+            affected = [f for f, per in contrib.items() if event.mapping_id in per]
+            if not affected:
                 return None, None  # this mapping contributed nothing to the asset
-            changes = {k: [v.value, None] for k, v in dropped.items()}
-            asset.fields = {k: v for k, v in asset.fields.items() if v.mapping_id != event.mapping_id}
-            if not asset.fields:
+            for f in affected:
+                del contrib[f][event.mapping_id]
+                if not contrib[f]:
+                    del contrib[f]
+                cur, new = asset.fields.get(f), _best(contrib.get(f, {}))
+                if new is None:
+                    if cur is not None:
+                        changes[f] = [cur.value, None]
+                        visible_changed = True
+                        del asset.fields[f]
+                    continue
+                if cur is None or cur.value != new.value:
+                    changes[f] = [None if cur is None else cur.value, new.value]
+                if cur is None or cur.value != new.value or cur.source_id != new.source_id:
+                    visible_changed = True
+                asset.fields[f] = new
+            if not contrib:
                 del site[event.asset_id]
+                del contribs[event.asset_id]
                 removed = True
                 msg = StreamMessage(type="remove", site_id=event.site_id, assets=[{"asset_id": event.asset_id}])
+            elif not visible_changed:
+                return None, None  # only hidden (overridden) values left
             else:
                 asset.updated_ts = event.received_ts
                 msg = StreamMessage(type="upsert", site_id=event.site_id, assets=[asset.flat()])
         else:
             if asset is None:
                 asset = Asset(site_id=event.site_id, asset_id=event.asset_id)
-                site[event.asset_id] = asset
-            changed = False
+            contrib = contribs.get(event.asset_id, {})
+            self._seq += 1
             for k, v in expand_attributes(event.fields).items():
-                cur = asset.fields.get(k)
-                if cur is not None and cur.updated_ts > event.received_ts:
-                    continue  # a newer value already won
-                if cur is None or cur.value != v:
-                    changes[k] = [None if cur is None else cur.value, v]
-                if cur is None or cur.value != v or cur.source_id != event.source_id:
-                    changed = True
-                asset.fields[k] = FieldValue(
-                    value=v, source_id=event.source_id, mapping_id=event.mapping_id, updated_ts=event.received_ts
+                per = contrib.setdefault(k, {})
+                own = per.get(event.mapping_id)
+                if own is not None and own[0].updated_ts > event.received_ts:
+                    continue  # this mapping already sent something newer
+                per[event.mapping_id] = (
+                    FieldValue(
+                        value=v, source_id=event.source_id, mapping_id=event.mapping_id, updated_ts=event.received_ts
+                    ),
+                    self._seq,
                 )
-            if not asset.fields:
-                del site[event.asset_id]  # an empty upsert must not leave a ghost asset
-            if not changed:
+                cur, new = asset.fields.get(k), _best(per)
+                assert new is not None
+                if cur is None or cur.value != new.value:
+                    changes[k] = [None if cur is None else cur.value, new.value]
+                if cur is None or cur.value != new.value or cur.source_id != new.source_id:
+                    visible_changed = True
+                asset.fields[k] = new
+            if not contrib:
+                return None, None  # an empty upsert must not leave a ghost asset
+            site[event.asset_id] = asset
+            contribs[event.asset_id] = contrib
+            if not visible_changed:
                 return None, None
             asset.updated_ts = event.received_ts
             msg = StreamMessage(type="upsert", site_id=event.site_id, assets=[asset.flat()])
@@ -267,19 +321,18 @@ class InMemoryStateStore(StateStore):
         return [a.model_copy(deep=True) for a in self._assets.get(site_id, {}).values()]
 
     async def clear_mapping(self, site_id: str, mapping_id: str) -> None:
-        for asset in list(self._assets.get(site_id, {}).values()):
-            if any(v.mapping_id == mapping_id for v in asset.fields.values()):
-                await self.apply(
-                    AssetEvent(
-                        site_id=site_id,
-                        asset_id=asset.asset_id,
-                        op=AssetOp.REMOVE,
-                        source_id="",
-                        mapping_id=mapping_id,
-                        dataset="",
-                        received_ts=time.time(),
-                    )
-                )
+        await self.reconcile(site_id, mapping_id, set())
+
+    async def reconcile(self, site_id: str, mapping_id: str, keep: set[str]) -> int:
+        touched = 0
+        for n, (asset_id, contrib) in enumerate(list(self._contrib.get(site_id, {}).items())):
+            if asset_id in keep or not any(mapping_id in per for per in contrib.values()):
+                continue
+            if await self.apply(_remove_event(site_id, asset_id, mapping_id)) is not None:
+                touched += 1
+            if n % REMOVE_YIELD_EVERY == 0:
+                await asyncio.sleep(0)  # let WebSocket senders drain a big burst (LIVEOPS-55)
+        return touched
 
     async def events(self, site_id: str, since: float | None = None, limit: int = 100) -> list[EventEntry]:
         return self._log.query(site_id, since, limit)

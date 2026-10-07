@@ -31,7 +31,9 @@ def make_store() -> StateStore:
     if settings.redis_url:
         from app.core.redis_state import RedisStateStore
 
-        return RedisStateStore.from_url(settings.redis_url, prefix=settings.redis_key_prefix)
+        return RedisStateStore.from_url(
+            settings.redis_url, prefix=settings.redis_key_prefix, max_connections=settings.redis_max_connections
+        )
     return InMemoryStateStore()
 
 
@@ -67,6 +69,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.store = make_store()
     app.state.runner = make_runner(app.state.store)
     if settings.start_runners:
+        # Join the cluster first (Redis): even with no active mappings, this
+        # process must pick up mappings started elsewhere and take over (LIVEOPS-79).
+        await app.state.runner.join()
         with new_session() as s:
             for m in s.scalars(select(Mapping).where(Mapping.active.is_(True))):
                 src = s.get(Source, m.source_id)

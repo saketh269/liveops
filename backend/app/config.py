@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     secret_key: str = ""
     redis_url: str | None = None  # None = in-memory state store (single process)
     redis_key_prefix: str = "liveops"  # all Redis keys start with this (no { or })
+    redis_max_connections: int = 200  # per backend process; callers wait when all are busy
     cors_origins: list[str] = ["http://localhost:5173"]
     # Host names the portal answers to (Host header and WebSocket Origin). Add
     # your server's name here if you deliberately serve it beyond this machine.
