@@ -40,13 +40,14 @@ def portal_db(temp_database: str) -> Iterator[str]:
 
 
 @pytest.fixture
-def source_db() -> Iterator[str]:
+def source_db() -> Iterator[tuple[str, str]]:
     if not os.environ.get("LIVEOPS_TEST_PG_DSN"):
         pytest.skip("no pg")
     import uuid
 
     p = pg_params()
     name = f"lo_src_{uuid.uuid4().hex[:8]}"
+    role = f"lo_e2e_{uuid.uuid4().hex[:8]}"  # roles are cluster-wide: keep unique
     admin = os.environ["LIVEOPS_TEST_PG_DSN"]
     with psycopg.connect(admin, autocommit=True) as c:
         c.execute(f'CREATE DATABASE "{name}"')
@@ -55,19 +56,19 @@ def source_db() -> Iterator[str]:
             "CREATE TABLE beds (bed_id text PRIMARY KEY, unit text, status text, updated_at timestamptz DEFAULT now())"
         )
         c.execute("INSERT INTO beds (bed_id, unit, status) VALUES ('B01','ICU','free'), ('B02','ER','occupied')")
-        c.execute("DROP ROLE IF EXISTS lo_e2e_reader")
-        c.execute("CREATE ROLE lo_e2e_reader LOGIN PASSWORD 'pw'")
-        c.execute(f'GRANT CONNECT ON DATABASE "{name}" TO lo_e2e_reader')
-        c.execute("GRANT USAGE ON SCHEMA public TO lo_e2e_reader")
-        c.execute("GRANT SELECT ON beds TO lo_e2e_reader")
-    yield name
+        c.execute(f"CREATE ROLE {role} LOGIN PASSWORD 'pw'")
+        c.execute(f'GRANT CONNECT ON DATABASE "{name}" TO {role}')
+        c.execute(f"GRANT USAGE ON SCHEMA public TO {role}")
+        c.execute(f"GRANT SELECT ON beds TO {role}")
+    yield name, role
     with psycopg.connect(admin, autocommit=True) as c:
         c.execute("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = %s", (name,))
         c.execute(f'DROP DATABASE IF EXISTS "{name}"')
-        c.execute("DROP ROLE IF EXISTS lo_e2e_reader")
+        c.execute(f"DROP ROLE IF EXISTS {role}")
 
 
-def test_user_journey(portal_db: str, source_db: str) -> None:
+def test_user_journey(portal_db: str, source_db: tuple[str, str]) -> None:
+    source_db_name, role = source_db
     from app.main import create_app
 
     p = pg_params()
@@ -84,8 +85,8 @@ def test_user_journey(portal_db: str, source_db: str) -> None:
                 "settings": {
                     "host": p.get("host", "localhost"),
                     "port": int(p.get("port", 5432)),
-                    "database": source_db,
-                    "user": "lo_e2e_reader",
+                    "database": source_db_name,
+                    "user": role,
                     "encryption": "off",
                 },
                 "secrets": {"password": "pw"},
@@ -146,7 +147,7 @@ def test_user_journey(portal_db: str, source_db: str) -> None:
             assert assets["B01"]["state"] == "free" and assets["B01"]["zone"] == "ICU"
 
             changed_at = time.time()
-            with psycopg.connect(**{**p, "dbname": source_db}, autocommit=True) as c:
+            with psycopg.connect(**{**p, "dbname": source_db_name}, autocommit=True) as c:
                 c.execute("UPDATE beds SET status = 'occupied', updated_at = now() WHERE bed_id = 'B01'")
             while True:
                 msg = json.loads(ws.receive_text())

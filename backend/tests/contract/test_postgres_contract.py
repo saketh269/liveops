@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import uuid
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -18,6 +19,7 @@ class PgDriver:
         self.dataset = "public.assets"
         p = pg_params()
         self.admin = {**p, "dbname": dbname}
+        self.role = f"lo_reader_{uuid.uuid4().hex[:8]}"  # roles are cluster-wide: keep unique
 
     async def setup(self) -> None:
         async with await psycopg.AsyncConnection.connect(**self.admin, autocommit=True) as c:
@@ -29,19 +31,20 @@ class PgDriver:
                 await c.execute(
                     "INSERT INTO assets (id, status, zone) VALUES (%s, %s, %s)", (r["id"], r["status"], r["zone"])
                 )
-            await c.execute("DROP ROLE IF EXISTS lo_reader")
-            await c.execute("CREATE ROLE lo_reader LOGIN PASSWORD 'reader_pw'")
-            await c.execute(f'GRANT CONNECT ON DATABASE "{self.dbname}" TO lo_reader')
-            await c.execute("GRANT USAGE ON SCHEMA public TO lo_reader")
-            await c.execute("GRANT SELECT ON assets TO lo_reader")
+            await c.execute(f"CREATE ROLE {self.role} LOGIN PASSWORD 'reader_pw'")
+            await c.execute(f'GRANT CONNECT ON DATABASE "{self.dbname}" TO {self.role}')
+            await c.execute(f"GRANT USAGE ON SCHEMA public TO {self.role}")
+            await c.execute(f"GRANT SELECT ON assets TO {self.role}")
 
     async def teardown(self) -> None:
         async with await psycopg.AsyncConnection.connect(**{**self.admin, "dbname": "postgres"}, autocommit=True) as c:
-            await c.execute("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = 'lo_reader'")
+            await c.execute("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = %s", (self.role,))
         async with await psycopg.AsyncConnection.connect(**self.admin, autocommit=True) as c:
-            await c.execute("REVOKE ALL ON assets FROM lo_reader")
-            await c.execute("REVOKE ALL ON SCHEMA public FROM lo_reader")
-            await c.execute(f'REVOKE ALL ON DATABASE "{self.dbname}" FROM lo_reader')
+            await c.execute(f"REVOKE ALL ON assets FROM {self.role}")
+            await c.execute(f"REVOKE ALL ON SCHEMA public FROM {self.role}")
+            await c.execute(f'REVOKE ALL ON DATABASE "{self.dbname}" FROM {self.role}')
+        async with await psycopg.AsyncConnection.connect(**{**self.admin, "dbname": "postgres"}, autocommit=True) as c:
+            await c.execute(f"DROP ROLE IF EXISTS {self.role}")
 
     async def _exec(self, q: str, params: tuple[Any, ...]) -> None:
         async with await psycopg.AsyncConnection.connect(**self.admin, autocommit=True) as c:
@@ -64,7 +67,7 @@ class PgDriver:
             "host": p.get("host", "localhost"),
             "port": int(p.get("port", 5432)),
             "database": self.dbname,
-            "user": "lo_reader",
+            "user": self.role,
             "encryption": "off",
         }
 
