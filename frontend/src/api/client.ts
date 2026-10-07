@@ -1,6 +1,6 @@
 import type {
   AppHealth, ConnectorSpec, Dataset, Mapping, MappingConfig, MappingHealth, Site, SiteLayout, Source,
-  SourceRecord, StreamMessage, TestReport, UploadResult,
+  SourceRecord, StreamMessage, Suggestion, TestReport, UploadResult,
 } from "./types";
 
 export class ApiError extends Error {
@@ -63,6 +63,8 @@ export const api = {
   datasets: (id: string) => req<Dataset[]>("GET", `/api/sources/${id}/datasets`),
   preview: (id: string, dataset: string, limit = 20) =>
     req<SourceRecord[]>("GET", `/api/sources/${id}/preview?dataset=${encodeURIComponent(dataset)}&limit=${limit}`),
+  suggestions: (id: string, siteId?: string) =>
+    req<Suggestion[]>("GET", `/api/sources/${id}/suggestions${siteId ? `?site_id=${encodeURIComponent(siteId)}` : ""}`),
 
   sites: () => req<Site[]>("GET", "/api/sites"),
   site: (id: string) => req<Site>("GET", `/api/sites/${id}`),

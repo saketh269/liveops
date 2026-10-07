@@ -1,8 +1,9 @@
 import { useState, type FormEvent } from "react";
-import { Link } from "react-router-dom";
+import { Link, Route, Routes, useParams, useSearchParams } from "react-router-dom";
 import { api } from "../api/client";
 import type { Mapping, Site } from "../api/types";
 import { formatDate } from "../components/format";
+import { SetupFromSource } from "../components/setup/SetupFromSource";
 import { ConfirmDelete, EmptyState, ErrorNotice, Loading } from "../components/ui";
 import { useLoad } from "../components/useLoad";
 
@@ -91,6 +92,7 @@ function SiteCard({ site, mappings, onChanged }: { site: Site; mappings: Mapping
           <div className="row-actions">
             <Link className="btn primary" to={`/map/${site.id}`}>Open live map</Link>
             <Link className="btn" to={`/map/${site.id}?edit=1`}>Edit layout</Link>
+            <Link className="btn" to={`/sites/${site.id}/setup`}>Set up from a source</Link>
             <Link className="btn" to={`/mapping?site=${site.id}`}>Mappings</Link>
             <button type="button" className="btn" onClick={() => setEditing(true)}>Rename or change template</button>
           </div>
@@ -107,6 +109,43 @@ function SiteCard({ site, mappings, onChanged }: { site: Site; mappings: Mapping
 }
 
 export default function SitesPage() {
+  return (
+    <Routes>
+      <Route index element={<SitesList />} />
+      <Route path=":siteId/setup" element={<SiteSetupPage />} />
+    </Routes>
+  );
+}
+
+function SiteSetupPage() {
+  const { siteId = "" } = useParams();
+  const [params, setParams] = useSearchParams();
+  const { data, error, loading, reload } = useLoad(() => Promise.all([api.site(siteId), api.sources()]), [siteId]);
+  return (
+    <section className="stack">
+      <div className="page-head">
+        <div>
+          <h1>Set up {data ? data[0].name : "a site"} from a source</h1>
+          <p className="lead">Choose a source. Live Ops suggests which tables to show on the map and how; you check and create them in one go.</p>
+        </div>
+        <Link className="btn" to="/sites">Back to sites</Link>
+      </div>
+      {loading && !data && <Loading label="Loading…" />}
+      {error !== null && <ErrorNotice error={error} title="Couldn't load the site" onRetry={reload} />}
+      {data && data[1].length === 0 && (
+        <EmptyState title="Connect a source first" action={<Link className="btn primary" to="/sources/new">Connect a source</Link>}>
+          Suggestions are made from a source's tables. Connect one, test it, then come back here.
+        </EmptyState>
+      )}
+      {data && data[1].length > 0 && (
+        <SetupFromSource site={data[0]} sources={data[1]} initialSourceId={params.get("source") ?? undefined}
+          onSourceChange={(id) => setParams(id ? { source: id } : {}, { replace: true })} />
+      )}
+    </section>
+  );
+}
+
+function SitesList() {
   const { data, error, loading, reload } = useLoad(() => Promise.all([api.sites(), api.mappings()]));
   const [creating, setCreating] = useState(false);
   const sites = data?.[0] ?? [];

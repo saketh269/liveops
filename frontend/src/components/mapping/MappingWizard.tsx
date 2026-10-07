@@ -4,6 +4,8 @@ import type { ConnectorSpec, Dataset, Mapping, MappingConfig, Site, Source, Sour
 import { cellText, humanize } from "../format";
 import { ErrorNotice, Loading } from "../ui";
 import { useLoad } from "../useLoad";
+import { FilterEditor, draftsToFilter } from "./FilterEditor";
+import { draftProblem, toDraft, type FilterDraft } from "./filters";
 
 /** States the live map colors (see --state-* tokens). Anything else shows as "unknown". */
 export const MAP_STATES = ["free", "in_use", "cleaning", "alert"];
@@ -72,6 +74,7 @@ export function MappingWizard({ sites, sources, connectors, existing, initialSit
   const [stateMap, setStateMap] = useState<Record<string, string>>(cfg?.state_map ?? {});
   const [matchMode, setMatchMode] = useState<"id" | "other">(cfg?.match_key && cfg.match_key !== cfg.id_field ? "other" : "id");
   const [matchKey, setMatchKey] = useState(cfg?.match_key ?? "");
+  const [filters, setFilters] = useState<FilterDraft[]>(() => (cfg?.filter ?? []).map(toDraft));
   const [poll, setPoll] = useState(String(existing?.options?.poll_interval_s ?? 3));
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [serverError, setServerError] = useState<unknown>(null);
@@ -111,6 +114,7 @@ export function MappingWizard({ sites, sources, connectors, existing, initialSit
     setStateMap({});
     setMatchMode("id");
     setMatchKey("");
+    setFilters([]);
   };
 
   const pickSource = (id: string) => {
@@ -135,6 +139,7 @@ export function MappingWizard({ sites, sources, connectors, existing, initialSit
     // "kind" may come from a column (an extra field) or be one fixed value above, not both (LIVEOPS-32).
     else if (names.includes("kind") && kind.trim()) errs.extra = "Kind is set to a fixed value above; clear it there to read kind from a column.";
     else if (new Set(names).size !== names.length) errs.extra = "Each extra field name can be used only once.";
+    if (filters.some((f) => draftProblem(f, columns))) errs.filter = "Finish or remove the highlighted conditions.";
     setErrors(errs);
     setServerError(null);
     if (Object.keys(errs).length) return;
@@ -157,6 +162,9 @@ export function MappingWizard({ sites, sources, connectors, existing, initialSit
       attributes,
       kind: kind.trim() || null,
     };
+    // Send the filter when there is one, or to clear one that was saved.
+    const filter = draftsToFilter(filters, columns);
+    if (filter.length > 0 || cfg?.filter) config.filter = filter;
     const options = { ...(existing?.options ?? {}), poll_interval_s: pollN };
     setBusy(true);
     try {
@@ -341,6 +349,16 @@ export function MappingWizard({ sites, sources, connectors, existing, initialSit
               </div>
             ))}
           </div>
+        </Step>
+
+        <Step title="Which rows" locked={!hasDataset} lockedText={lockedText}>
+          <p className="muted" style={{ margin: 0 }}>
+            Show only some rows, for example visits that haven't ended or tasks that aren't done. A row that stops
+            matching leaves the map, as if it were deleted.
+          </p>
+          <FilterEditor idPrefix="m" columns={columns} drafts={filters} onChange={setFilters} sample={pv.data ?? undefined}
+            showErrors={!!errors.filter} />
+          {errors.filter && <span className="err" role="alert">{errors.filter}</span>}
         </Step>
 
         <Step title="Match key" locked={!hasDataset} lockedText={lockedText}>

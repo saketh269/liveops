@@ -61,7 +61,8 @@ export default function SetupHints({ site, assets, ready, onSite, onEditLayout }
   if (!ready || assets.size === 0) return null;
   const missingCount = [...zones.missing.values()].reduce((a, b) => a + b, 0);
   const unrecognisedCount = [...states.unrecognised.values()].reduce((a, b) => a + b, 0);
-  const incomplete = (mappings ?? []).filter((m) => m.active)
+  // Mappings that add details to another one (match_key differs from the ID) have no zone or state by design.
+  const incomplete = (mappings ?? []).filter((m) => m.active && !(m.config.match_key && m.config.match_key !== m.config.id_field))
     .map((m) => ({ m, gaps: [!m.config.fields.zone && "Zone", !m.config.fields.state && "State"].filter(Boolean) as string[] }))
     .filter((x) => x.gaps.length > 0);
 
@@ -99,7 +100,8 @@ export default function SetupHints({ site, assets, ready, onSite, onEditLayout }
               ))}
             </ul>
           ) : (
-            <>In the <Link to="/mapping">mapping</Link>, set <strong>Zone</strong> to the column that says where each one is and <strong>State</strong> to the status column.</>
+            <>In the <Link to="/mapping">mapping</Link>, set <strong>Zone</strong> to the column that says where each one is and <strong>State</strong> to the status column,
+              or <Link to={`/sites/${encodeURIComponent(site.id)}/setup`}>set up from a source</Link> to get suggestions.</>
           )}
         </div>
       )}
