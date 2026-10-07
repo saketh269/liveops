@@ -47,7 +47,11 @@ def describe(entry: EventEntry) -> str:
     asset = str(entry.get("asset_id", "?"))
     if entry.get("removed"):
         return f"{asset} removed"
-    parts = [f"{name} {_show(old)} → {_show(new)}" for name, (old, new) in sorted(entry.get("changes", {}).items())]
+    changes = entry.get("changes", {})
+    if changes and all(new is None for _, new in changes.values()):
+        # One source stopped reporting the asset; another source still does.
+        return f"{asset} no longer in this source (still reported by another)"
+    parts = [f"{n.removeprefix('attributes.')} {_show(a)} → {_show(b)}" for n, (a, b) in sorted(changes.items())]
     text = f"{asset} " + ", ".join(parts) if parts else f"{asset} updated"
     return text if len(text) <= 300 else text[:299] + "…"
 

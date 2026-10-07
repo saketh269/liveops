@@ -87,7 +87,7 @@ export function Legend() {
 
 const time = (ts: number) => new Date(ts * 1000).toLocaleTimeString();
 
-export function EventFeed({ feed, onSelect }: { feed: FeedEntry[]; onSelect: (id: string) => void }) {
+export function EventFeed({ feed, onSelect, sourceNames = {} }: { feed: FeedEntry[]; onSelect: (id: string) => void; sourceNames?: Record<string, string> }) {
   return (
     <section className="panel lm-panel" aria-labelledby="lm-feed-h">
       <h2 id="lm-feed-h">Events <span className="muted mono lm-total">{feed.length}</span></h2>
@@ -98,7 +98,7 @@ export function EventFeed({ feed, onSelect }: { feed: FeedEntry[]; onSelect: (id
           {feed.map((e) => (
             <li key={e.id} className={`lm-feed-item lm-feed-${e.kind}`}>
               <span className="mono muted lm-feed-time">{time(e.ts)}</span>
-              {e.source && <span className="pill" title={`Source ${e.source}`}>{e.source}</span>}
+              {e.source && <span className="pill" title={`Source ${e.source}`}>{sourceNames[e.source] ?? e.source}</span>}
               {e.assetId ? (
                 <button type="button" className="lm-link" onClick={() => onSelect(e.assetId!)}>{e.text}</button>
               ) : (
@@ -119,7 +119,8 @@ function show(v: unknown): string {
   return String(v);
 }
 
-export function AssetDetails({ asset, layout, pinned, onClose }: { asset: Asset; layout: SiteLayout; pinned: boolean; onClose: () => void }) {
+export function AssetDetails({ asset, layout, pinned, onClose, sourceNames = {} }: { asset: Asset; layout: SiteLayout; pinned: boolean; onClose: () => void; sourceNames?: Record<string, string> }) {
+  const name = (id: string | undefined) => (id ? sourceNames[id] ?? id : "");
   const k = stateKey(asset.state);
   const src = asset._sources ?? {};
   const zone = resolveZone(layout.zones ?? [], asset.zone);
@@ -142,14 +143,15 @@ export function AssetDetails({ asset, layout, pinned, onClose }: { asset: Asset;
             <tr key={f}>
               <th scope="row" className="mono">{f}</th>
               <td className="mono">{f === "updated_ts" && typeof asset[f] === "number" ? `${time(asset[f] as number)}` : show(asset[f])}</td>
-              <td className="mono muted">{src[f] ?? ""}</td>
+              <td className="muted">{name(src[f])}</td>
             </tr>
           ))}
           {attrs.map(([f, v]) => (
             <tr key={`a.${f}`}>
               <th scope="row" className="mono">attributes.{f}</th>
               <td className="mono">{show(v)}</td>
-              <td className="mono muted">{src[f] ?? src.attributes ?? ""}</td>
+              {/* Each attribute key keeps its own source (LIVEOPS-51). */}
+              <td className="muted">{name(src[`attributes.${f}`] ?? src.attributes)}</td>
             </tr>
           ))}
         </tbody>

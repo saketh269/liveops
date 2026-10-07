@@ -15,6 +15,7 @@ vi.mock("../api/client", () => ({
   api: {
     sites: () => Promise.resolve([site]),
     site: () => Promise.resolve(site),
+    sources: () => Promise.resolve([{ id: "src", name: "Hospital EHR" }]),
     updateSite: (...args: unknown[]) => updateSite(...args),
   },
   openSiteStream: (_id: string, onMessage: (m: StreamMessage) => void, onStatus?: (s: "open" | "closed") => void) => {

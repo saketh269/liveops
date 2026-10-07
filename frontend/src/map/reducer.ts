@@ -82,6 +82,7 @@ export function reduceAll(state: MapState, msgs: readonly StreamMessage[]): MapS
   const added: FeedEntry[] = [];
   let { serverEvents, snapshotReceived, lastTs, seq } = state;
   const push = (e: Omit<FeedEntry, "id">) => added.push({ ...e, id: ++seq });
+  let dropFromFeed: ((f: FeedEntry) => boolean) | null = null;
 
   for (const msg of msgs) {
     // Keepalives say the link is up, not that data changed: they must not move "Last update" (LIVEOPS-38).
@@ -130,6 +131,15 @@ export function reduceAll(state: MapState, msgs: readonly StreamMessage[]): MapS
       case "event": {
         const e = msg.event;
         if (!e) break;
+        if (!serverEvents) {
+          // The first server event can follow an upsert we already turned into a
+          // feed entry; drop that derived duplicate.
+          const evTs = typeof e.ts === "number" ? e.ts : ts;
+          const dup = (f: { kind: string; assetId: string | null; ts: number }) =>
+            f.kind !== "event" && f.assetId === str(e.asset_id) && Math.abs(f.ts - evTs) <= 3;
+          for (let i = added.length - 1; i >= 0; i--) if (dup(added[i])) added.splice(i, 1);
+          dropFromFeed = dup;
+        }
         serverEvents = true;
         const text = str(e.message) ?? str(e.text) ?? str(e.summary) ?? JSON.stringify(e);
         push({ ts: typeof e.ts === "number" ? e.ts : ts, kind: "event", text,
@@ -141,10 +151,10 @@ export function reduceAll(state: MapState, msgs: readonly StreamMessage[]): MapS
     }
   }
 
-  let feed = state.feed;
+  let feed = dropFromFeed ? state.feed.filter((f) => !dropFromFeed!(f)) : state.feed;
   if (added.length) {
     added.reverse();
-    feed = (added.length >= FEED_CAP ? added.slice(0, FEED_CAP) : [...added, ...state.feed.slice(0, FEED_CAP - added.length)]);
+    feed = (added.length >= FEED_CAP ? added.slice(0, FEED_CAP) : [...added, ...feed.slice(0, FEED_CAP - added.length)]);
   }
   return { assets: assets ?? state.assets, feed, serverEvents, snapshotReceived, lastTs, seq };
 }

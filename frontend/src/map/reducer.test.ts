@@ -94,3 +94,11 @@ test("pings do not move the last-update time (LIVEOPS-38)", () => {
   s = reduce(s, { type: "ping", site_id: "s", assets: [], event: null, ts: 99 } as StreamMessage);
   expect(s.lastTs).toBe(10);
 });
+
+test("first server event replaces the derived entry for the same change (no duplicate)", () => {
+  let s = reduce(initialMapState(), msg("snapshot", [asset("B03", { state: "free" })], 10));
+  s = reduce(s, msg("upsert", [asset("B03", { state: "in_use" })], 11));
+  expect(s.feed.length).toBe(1);
+  s = reduce(s, { type: "event", site_id: "s", assets: [], ts: 11, event: { asset_id: "B03", text: "B03 state free → in_use", source_id: "src", ts: 11 } } as StreamMessage);
+  expect(s.feed.map((f) => f.text)).toEqual(["B03 state free → in_use"]);
+});

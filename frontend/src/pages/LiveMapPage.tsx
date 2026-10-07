@@ -74,12 +74,15 @@ function SiteMap({ siteId }: { siteId: string }) {
   const [hover, setHover] = useState<string | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
   const [find, setFind] = useState("");
+  const [sourceNames, setSourceNames] = useState<Record<string, string>>({});
   const live = useLiveSite(siteId);
   const { ui } = live;
 
   useEffect(() => {
     api.site(siteId).then(setSite, (e) => setError(errorText(e, `Site "${siteId}"`)));
     api.sites().then(setSites, () => setSites([]));
+    // Show source names, not ids, in the feed and details.
+    api.sources().then((list) => setSourceNames(Object.fromEntries(list.map((s) => [s.id, s.name]))), () => {});
   }, [siteId]);
 
   useEffect(() => {
@@ -170,7 +173,7 @@ function SiteMap({ siteId }: { siteId: string }) {
               )}
               {shown && (
                 <div className={`lm-details-wrap ${selected ? "lm-details-wrap--pinned" : ""}`}>
-                  <AssetDetails asset={shown} layout={layout} pinned={!!selected} onClose={() => setSelected(null)} />
+                  <AssetDetails asset={shown} layout={layout} pinned={!!selected} onClose={() => setSelected(null)} sourceNames={sourceNames} />
                 </div>
               )}
             </div>
@@ -205,7 +208,7 @@ function SiteMap({ siteId }: { siteId: string }) {
           <div className="lm-side">
             <KpiPanel layout={layout} assets={ui.assets} />
             <Legend />
-            <EventFeed feed={ui.feed} onSelect={setSelected} />
+            <EventFeed feed={ui.feed} onSelect={setSelected} sourceNames={sourceNames} />
           </div>
         </div>
       )}
