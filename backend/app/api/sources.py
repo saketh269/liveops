@@ -29,6 +29,8 @@ def _warnings(src_type: str, settings: dict[str, Any]) -> list[str]:
         w.append("Encryption is off. Use this only for local testing; company databases should use Required.")
     if settings.get("allow_http"):
         w.append("Plain HTTP is allowed, so data and keys travel unencrypted. Use this only for local testing.")
+    if settings.get("allow_private_network") is True:
+        w.append("Private network addresses are allowed. Only use this for APIs or storage you trust on your network.")
     return w
 
 

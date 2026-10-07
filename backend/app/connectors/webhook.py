@@ -25,8 +25,9 @@ The same request with ``{"id":"B01","_deleted":true}`` removes B01.
 
 State: the latest record per key is kept in a bounded in-process buffer, so a
 mapping that starts after events arrived still gets the current state first.
-The buffer lives in the API process (single process for v0.1); a restart
-empties it until the sender sends again.
+Each source has its own buffer, keyed by its source id. The buffer and the
+replay cache live in the API process (single process for v0.1); a restart
+empties them until the sender sends again.
 """
 
 from __future__ import annotations
@@ -35,6 +36,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import re
 import threading
 import time
 from collections import OrderedDict
@@ -55,6 +57,7 @@ from app.connectors.base import (
     TestReport,
     TestStep,
     normalize_record,
+    snapshot_end,
 )
 from app.connectors.registry import register
 from app.connectors.rest import infer_columns
@@ -87,15 +90,30 @@ class SignatureError(Exception):
     """Why a request was refused. The message is safe to return to the caller."""
 
 
-def verify(secret: str, timestamp: str | None, signature: str | None, body: bytes, now: float | None = None) -> None:
+SIGNATURE_FORMAT = re.compile(r"sha256=([0-9a-f]{64})", re.ASCII)
+TIMESTAMP_FORMAT = re.compile(r"[0-9]{1,12}", re.ASCII)
+
+
+def verify(secret: str, timestamp: str | None, signature: str | None, body: bytes, now: float | None = None) -> str:
+    """Check a request; return the canonical MAC (64 lowercase hex) on success.
+
+    Headers are matched exactly: no trimming, ASCII digits/hex only, so padded
+    or re-encoded variants of a captured header are refused rather than
+    treated as new requests (LIVEOPS-17).
+    """
     if not timestamp or not signature:
         raise SignatureError(
             f"Missing {TIMESTAMP_HEADER} or {SIGNATURE_HEADER} header. Sign each request; see the webhook docs."
         )
-    try:
-        ts = int(timestamp)
-    except ValueError:
-        raise SignatureError(f"{TIMESTAMP_HEADER} must be Unix time in whole seconds.") from None
+    if not TIMESTAMP_FORMAT.fullmatch(timestamp):
+        raise SignatureError(f"{TIMESTAMP_HEADER} must be Unix time in whole seconds (digits only).")
+    m = SIGNATURE_FORMAT.fullmatch(signature)
+    if m is None:
+        raise SignatureError(
+            f"{SIGNATURE_HEADER} must be exactly 'sha256=' followed by 64 lowercase hex characters, "
+            "with no spaces or other characters."
+        )
+    ts = int(timestamp)
     now = time.time() if now is None else now
     if abs(now - ts) > REPLAY_WINDOW_S:
         raise SignatureError(
@@ -103,21 +121,12 @@ def verify(secret: str, timestamp: str | None, signature: str | None, body: byte
             "Send the current time, and check the sender's clock (NTP)."
         )
     expected = sign(secret, timestamp, body)
-    if not hmac.compare_digest(expected, signature.strip()):
+    if not hmac.compare_digest(expected, signature):
         raise SignatureError(
             "Signature doesn't match. Sign the exact raw body as HMAC-SHA256 of '<timestamp>.<body>' "
             "with this source's signing secret, sent as 'sha256=<hex>'."
         )
-
-
-def channel_id(secret: str) -> str:
-    """Buffer id for a source, derived from its signing secret.
-
-    Connectors aren't told their source id (contract gap, see LIVEOPS-6), so
-    the API route and the connector meet on a one-way fingerprint of the
-    secret both of them hold. Only someone with the secret can write into it.
-    """
-    return hashlib.sha256(b"liveops-webhook:" + secret.encode()).hexdigest()[:32]
+    return m.group(1)
 
 
 # --------------------------------------------------------------------------
@@ -165,7 +174,7 @@ class WebhookHub:
         return ch
 
     def check_replay(self, cid: str, signature: str, now: float | None = None) -> bool:
-        """True if this exact signature was already accepted within the window."""
+        """True if this request (canonical ``timestamp:mac``) was already accepted within the window."""
         now = time.time() if now is None else now
         with self._lock:
             ch = self._chan(cid)
@@ -329,7 +338,12 @@ class WebhookConnector(Connector):
 
     @property
     def channel(self) -> str:
-        return channel_id(self._secret())
+        """The hub buffer for this source: its portal source id (ADR 0004, LIVEOPS-31)."""
+        if not self.source_id:
+            raise ConnectorError(
+                "This webhook source has no id yet", hint="Save the source first; its URL ends with the source id."
+            )
+        return str(self.source_id)
 
     # -- used by the API route -------------------------------------------
 
@@ -337,9 +351,9 @@ class WebhookConnector(Connector):
         """Verify, parse and publish one request. Raises ``SignatureError``
         (-> 401) or ``ValueError`` (-> 422); returns the number of records."""
         secret = self._secret()
-        verify(secret, timestamp, signature, body)
-        cid = channel_id(secret)
-        if self.hub.check_replay(cid, str(signature)):
+        cid = self.channel
+        mac = verify(secret, timestamp, signature, body)
+        if self.hub.check_replay(cid, f"{timestamp}:{mac}"):
             raise SignatureError("This exact request was already received. Send a new timestamp and signature.")
         try:
             doc = json.loads(body)
@@ -368,18 +382,17 @@ class WebhookConnector(Connector):
         started = time.monotonic()
         steps: list[TestStep] = []
         try:
-            cid = self.channel
+            self._secret()
             steps.append(TestStep(name="Signing secret", ok=True, detail="set and long enough"))
         except ConnectorError as e:
             steps.append(TestStep(name="Signing secret", ok=False, detail=str(e), hint=e.hint))
             return TestReport.from_steps(steps, started)
-        steps.append(
-            TestStep(
-                name="Webhook URL",
-                ok=True,
-                detail="POST signed JSON to /api/webhooks/<this source's id>",
-            )
-        )
+        try:
+            cid = self.channel
+            steps.append(TestStep(name="Webhook URL", ok=True, detail=f"POST signed JSON to /api/webhooks/{cid}"))
+        except ConnectorError as e:
+            steps.append(TestStep(name="Webhook URL", ok=False, detail=str(e), hint=e.hint))
+            return TestReport.from_steps(steps, started)
         received, last = self.hub.stats(cid)
         detail = (
             f"{received} records received, last at {time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(last))} UTC"
@@ -408,8 +421,11 @@ class WebhookConnector(Connector):
         try:
             for rec in state:
                 key = _key(rec, key_fields)
-                if key is not None:
-                    yield Change(op=ChangeOp.UPSERT, dataset=dataset, key=key, record=rec)
+                if key is None:
+                    self.skipped_records += 1
+                    continue
+                yield Change(op=ChangeOp.UPSERT, dataset=dataset, key=key, record=rec)
+            yield snapshot_end(dataset)  # exactly once, right after the current state (ADR 0004)
             while True:
                 ev = await sub.queue.get()
                 if ev is None:
@@ -420,6 +436,7 @@ class WebhookConnector(Connector):
                     )
                 key = _key(ev.record, key_fields)
                 if key is None:
+                    self.skipped_records += 1
                     continue
                 if ev.deleted:
                     yield Change(op=ChangeOp.DELETE, dataset=dataset, key=key, record={}, source_ts=ev.ts)

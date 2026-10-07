@@ -42,7 +42,7 @@ class MockApi:
 
     def items(self) -> list[dict[str, Any]]:
         with self.lock:
-            return [dict(r) for r in sorted(self.rows.values(), key=lambda r: str(r["id"]))]
+            return [dict(r) for r in sorted(self.rows.values(), key=lambda r: str(r["id"] or "~"))]
 
     def _handler(self) -> type[BaseHTTPRequestHandler]:
         api = self

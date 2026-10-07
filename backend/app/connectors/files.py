@@ -35,7 +35,9 @@ from pathlib import Path
 from typing import Any
 
 from app.config import get_settings
+from app.connectors import netguard
 from app.connectors.base import (
+    MAX_SNAPSHOT_ROWS,
     Category,
     ConnectorError,
     ConnectorSpec,
@@ -45,12 +47,20 @@ from app.connectors.base import (
     Record,
     TestReport,
     TestStep,
+    check_row_cap,
     normalize_record,
 )
 from app.connectors.registry import register
 from app.connectors.rest import infer_columns, primary_key_guess
 
-MAX_ROWS = 50_000
+MAX_ROWS = MAX_SNAPSHOT_ROWS
+XLSX_MAX_UNCOMPRESSED = 200 * 1024 * 1024  # all members together, as declared in the zip
+XLSX_MAX_MEMBER = 100 * 1024 * 1024
+XLSX_MAX_RATIO = 100  # uncompressed : compressed, for members over XLSX_RATIO_MIN_SIZE
+XLSX_RATIO_MIN_SIZE = 1024 * 1024
+XLSX_MAX_MEMBERS = 1_000
+XLSX_MAX_COLUMNS = 500
+XLSX_MAX_CELLS = 5_000_000
 MAX_FILE_BYTES = 100 * 1024 * 1024
 MAX_FILES = 500
 LOCAL_EXTENSIONS = (".csv", ".xlsx")
@@ -74,11 +84,42 @@ def _header(names: list[Any]) -> list[str]:
 
 
 def _cap(rows: list[Record], what: str) -> list[Record]:
-    if len(rows) > MAX_ROWS:
-        raise ConnectorError(
-            f"{what} has more than {MAX_ROWS:,} rows", hint="Split it into smaller files, one per area or site."
-        )
+    """Complete or raise (ADR 0004): parsers stop at MAX_ROWS + 1, then this raises."""
+    try:
+        check_row_cap(len(rows), what, MAX_ROWS)
+    except ConnectorError as e:
+        raise ConnectorError(str(e), hint="Split it into smaller files, one per area or site.") from None
     return rows
+
+
+def check_xlsx_zip(data: bytes, what: str = "The workbook") -> None:
+    """Refuse decompression bombs before openpyxl inflates anything (LIVEOPS-19).
+
+    Uses the sizes in the zip directory. Those can't be used to sneak more data
+    through: ``zipfile`` stops each member at its declared size and fails the
+    CRC check if there is more.
+    """
+    import zipfile
+
+    try:
+        infos = zipfile.ZipFile(io.BytesIO(data)).infolist()
+    except (zipfile.BadZipFile, ValueError, OSError):
+        raise ConnectorError(
+            f"{what} isn't a readable .xlsx file", hint="Save it from Excel as 'Excel Workbook (.xlsx)'."
+        ) from None
+    too_big = ConnectorError(
+        f"{what} expands to too much data to read safely",
+        hint="Save a smaller workbook (fewer rows, one sheet), or export it as CSV.",
+    )
+    if len(infos) > XLSX_MAX_MEMBERS:
+        raise too_big
+    if sum(i.file_size for i in infos) > XLSX_MAX_UNCOMPRESSED:
+        raise too_big
+    for i in infos:
+        if i.file_size > XLSX_MAX_MEMBER:
+            raise too_big
+        if i.file_size > XLSX_RATIO_MIN_SIZE and i.file_size > XLSX_MAX_RATIO * max(i.compress_size, 1):
+            raise too_big
 
 
 def parse_csv(data: bytes, delimiter: str = ",", encoding: str = "utf-8-sig", what: str = "The file") -> list[Record]:
@@ -112,6 +153,7 @@ def parse_xlsx(data: bytes, sheet: str | None = None, what: str = "The workbook"
 
     from openpyxl import load_workbook
 
+    check_xlsx_zip(data, what)
     try:
         wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
     except (zipfile.BadZipFile, KeyError, ValueError, OSError):
@@ -127,16 +169,26 @@ def parse_xlsx(data: bytes, sheet: str | None = None, what: str = "The workbook"
             ws = wb[sheet]
         else:
             ws = wb.worksheets[0]
-        it = ws.iter_rows(values_only=True)
+        # max_col: a sheet can claim 16,384 columns; never build rows that wide.
+        it = ws.iter_rows(values_only=True, max_col=XLSX_MAX_COLUMNS)
         head = next(it, None)
         if head is None:
             return []
-        cols = _header(list(head))
+        head_list = list(head)
+        while head_list and head_list[-1] is None:
+            head_list.pop()
+        cols = _header(head_list)
         rows: list[Record] = []
+        cells = 0
         for line in it:
             if all(v is None or (isinstance(v, str) and not v.strip()) for v in line):
                 continue
             rows.append(normalize_record({c: (line[i] if i < len(line) else None) for i, c in enumerate(cols)}))
+            cells += len(cols)
+            if cells > XLSX_MAX_CELLS:
+                raise ConnectorError(
+                    f"{what} has more than {XLSX_MAX_CELLS:,} cells", hint="Split it, or export it as CSV."
+                )
             if len(rows) > MAX_ROWS:
                 break
         return _cap(rows, what)
@@ -231,8 +283,8 @@ class CsvFileConnector(PollingConnector):
                 "folder": {
                     "type": "string",
                     "title": "Folder on the server",
-                    "description": "Set automatically on the first upload. Admins can point it at a folder "
-                    "inside LIVEOPS_DATA_DIR.",
+                    "description": "Leave empty: uploads go to this source's own folder. Admins can point it "
+                    "at another folder inside LIVEOPS_DATA_DIR.",
                 },
                 "delimiter": {"type": "string", "title": "CSV delimiter", "default": ",", "maxLength": 1},
                 "encoding": {"type": "string", "title": "CSV encoding", "default": "utf-8-sig"},
@@ -245,18 +297,22 @@ class CsvFileConnector(PollingConnector):
         super().__init__(settings, secrets, source_id=source_id)
         self._cache: dict[str, _Cached] = {}
 
-    def folder(self) -> Path:
-        f = self.settings.get("folder")
+    def folder_name(self) -> str:
+        """``folder`` setting, else the source's own folder named by its id (ADR 0004)."""
+        f = self.settings.get("folder") or self.source_id
         if not f:
-            raise ConnectorError("No file has been uploaded yet", hint="Upload a .csv or .xlsx file to this source.")
-        return safe_folder(str(f))
+            raise ConnectorError("This source has no folder yet", hint="Save the source, then upload a file to it.")
+        return str(f)
+
+    def folder(self) -> Path:
+        return safe_folder(self.folder_name())
 
     def _list(self) -> list[Path]:
         root = self.folder()
         if not root.is_dir():
             raise ConnectorError(
-                f"Folder {self.settings.get('folder')!r} doesn't exist on the server",
-                hint="Upload a file to this source, or check the folder name.",
+                "No file has been uploaded to this source yet",
+                hint="Upload a .csv or .xlsx file to this source (or check the folder setting).",
             )
         out = []
         for p in sorted(root.iterdir()):
@@ -295,7 +351,7 @@ class CsvFileConnector(PollingConnector):
         steps: list[TestStep] = []
         try:
             files = await asyncio.to_thread(self._list)
-            steps.append(TestStep(name="Data folder", ok=True, detail=str(self.settings.get("folder"))))
+            steps.append(TestStep(name="Data folder", ok=True, detail=self.folder_name()))
         except ConnectorError as e:
             steps.append(TestStep(name="Data folder", ok=False, detail=str(e), hint=e.hint))
             return TestReport.from_steps(steps, started)
@@ -359,6 +415,20 @@ class S3FilesConnector(PollingConnector):
                     "default": "required",
                     "description": "HTTPS with certificate checks. Use 'off' (plain HTTP) only for local testing.",
                 },
+                "allow_private_network": {
+                    "type": "boolean",
+                    "title": "Allow private network addresses",
+                    "default": False,
+                    "description": "Needed for an endpoint inside your company network (10.x, 192.168.x, "
+                    "localhost). Cloud metadata and link-local addresses are always blocked.",
+                },
+                "use_instance_role": {
+                    "type": "boolean",
+                    "title": "Use the Live Ops server's own AWS role (admin only)",
+                    "default": False,
+                    "description": "Uses the server's IAM role instead of an access key. Works only if the "
+                    "administrator set LIVEOPS_S3_ALLOW_INSTANCE_ROLE=true. Leave off.",
+                },
                 "delimiter": {"type": "string", "title": "CSV delimiter", "default": ",", "maxLength": 1},
                 "encoding": {"type": "string", "title": "CSV encoding", "default": "utf-8-sig"},
                 "sheet": {"type": "string", "title": "Excel sheet (default: first sheet)"},
@@ -408,6 +478,7 @@ class S3FilesConnector(PollingConnector):
                     "The endpoint uses plain http://, which isn't encrypted",
                     hint="Use https://, or set Encryption to Off for local testing only.",
                 )
+        creds = self._credentials()
         cfg = Config(
             connect_timeout=5,
             read_timeout=30,
@@ -419,13 +490,48 @@ class S3FilesConnector(PollingConnector):
             "s3",
             endpoint_url=endpoint,
             region_name=self.settings.get("region") or "us-east-1",
-            aws_access_key_id=self.secrets.get("access_key_id") or None,
-            aws_secret_access_key=self.secrets.get("secret_access_key") or None,
-            aws_session_token=self.secrets.get("session_token") or None,
+            **creds,
             config=cfg,
             verify=enc != "off",
         )
         return self._client
+
+    def _credentials(self) -> dict[str, str]:
+        """Only the keys entered on this source. Never boto3's default chain
+        (env vars, ~/.aws, instance role) unless the admin allows it and the
+        source asks for it (LIVEOPS-16)."""
+        key_id = str(self.secrets.get("access_key_id") or "").strip()
+        secret = str(self.secrets.get("secret_access_key") or "")
+        if key_id and secret:
+            out = {"aws_access_key_id": key_id, "aws_secret_access_key": secret}
+            if self.secrets.get("session_token"):
+                out["aws_session_token"] = str(self.secrets["session_token"])
+            return out
+        if self.settings.get("use_instance_role") is True:
+            if get_settings().s3_allow_instance_role:
+                return {}  # explicit, admin-approved opt-in: boto3's default chain
+            raise ConnectorError(
+                "Using the server's own AWS role is turned off on this server",
+                hint="Enter an access key ID and secret access key, or ask the administrator to set "
+                "LIVEOPS_S3_ALLOW_INSTANCE_ROLE=true.",
+            )
+        raise ConnectorError(
+            "Enter an access key ID and secret access key",
+            hint="Create a read-only key (s3:ListBucket and s3:GetObject) for this bucket and enter both values.",
+        )
+
+    def _check_endpoint(self) -> None:
+        """Apply the outbound network policy to the endpoint host (re-checked on every call)."""
+        endpoint = (self.settings.get("endpoint_url") or "").strip()
+        if not endpoint:
+            return
+        from urllib.parse import urlsplit
+
+        parts = urlsplit(endpoint)
+        if not parts.hostname:
+            raise ConnectorError("The endpoint URL has no host name", hint="Use e.g. https://minio.example.com:9000.")
+        port = parts.port or (443 if parts.scheme == "https" else 80)
+        netguard.check_host_sync(parts.hostname, port, self.settings.get("allow_private_network") is True)
 
     async def close(self) -> None:
         client, self._client = self._client, None
@@ -441,6 +547,7 @@ class S3FilesConnector(PollingConnector):
             raise _s3_error(e, self.bucket) from None
 
     def _list_keys(self) -> list[tuple[str, int]]:
+        self._check_endpoint()
         out: list[tuple[str, int]] = []
         paginator = self._s3().get_paginator("list_objects_v2")
         for page in paginator.paginate(Bucket=self.bucket, Prefix=self.prefix, PaginationConfig={"PageSize": 1000}):
@@ -453,6 +560,7 @@ class S3FilesConnector(PollingConnector):
         return out
 
     def _read(self, key: str) -> list[Record]:
+        self._check_endpoint()
         s3 = self._s3()
         head = s3.head_object(Bucket=self.bucket, Key=key)
         sig = (head.get("ETag"), head.get("ContentLength"))
@@ -493,13 +601,13 @@ class S3FilesConnector(PollingConnector):
             enc = self.settings.get("encryption") or "required"
             steps.append(
                 TestStep(
-                    name="Encryption",
+                    name="Settings, encryption and access key",
                     ok=True,
                     detail="HTTPS" if enc != "off" else "plain HTTP allowed (local testing only)",
                 )
             )
         except ConnectorError as e:
-            steps.append(TestStep(name="Encryption", ok=False, detail=str(e), hint=e.hint))
+            steps.append(TestStep(name="Settings, encryption and access key", ok=False, detail=str(e), hint=e.hint))
             return TestReport.from_steps(steps, started)
         try:
             keys = await self._run(self._list_keys)

@@ -51,7 +51,7 @@ async def receive(source_id: str, request: Request, session: Session = Depends(g
                 "hint": "Copy the URL from the source's page in Live Ops.",
             },
         )
-    conn = WebhookConnector(src.settings or {}, secrets_mod.decrypt(src.secrets_enc))
+    conn = WebhookConnector(src.settings or {}, secrets_mod.decrypt(src.secrets_enc), source_id=src.id)
     body = await read_capped(request, conn.max_body_bytes)
     try:
         n = conn.accept(body, request.headers.get(TIMESTAMP_HEADER), request.headers.get(SIGNATURE_HEADER))

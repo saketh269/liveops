@@ -16,6 +16,7 @@ Safety:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import time
@@ -25,6 +26,7 @@ from urllib.parse import urljoin, urlsplit
 import httpx
 
 from app.connectors.base import (
+    MAX_SNAPSHOT_ROWS,
     Category,
     Column,
     ConnectorError,
@@ -35,17 +37,41 @@ from app.connectors.base import (
     Record,
     TestReport,
     TestStep,
+    check_row_cap,
     normalize_record,
 )
+from app.connectors.netguard import GuardedTransport
 from app.connectors.registry import register
 
-MAX_ROWS = 50_000  # records per snapshot
+MAX_ROWS = MAX_SNAPSHOT_ROWS  # records per snapshot; more raises (never truncates)
 DEFAULT_MAX_PAGES = 50
 HARD_MAX_PAGES = 1_000
 DEFAULT_MAX_RESPONSE_BYTES = 10 * 1024 * 1024
 HARD_MAX_RESPONSE_BYTES = 50 * 1024 * 1024
 SAMPLE_SIZE = 50  # records used to infer columns
 TOKEN_REFRESH_MARGIN_S = 30.0
+
+
+_STR_SETTINGS = (
+    "base_url",
+    "path",
+    "record_path",
+    "dataset_name",
+    "api_key_header",
+    "token_url",
+    "oauth_scope",
+    "page_param",
+    "page_size_param",
+    "cursor_param",
+    "cursor_path",
+)
+_INT_SETTINGS = ("page_size", "start_page", "max_pages")
+_NUM_SETTINGS = ("timeout_s", "max_response_mb")
+_ENUM_SETTINGS = {
+    "method": ("GET",),
+    "auth": ("none", "api_key", "bearer", "oauth2_client_credentials"),
+    "pagination": ("none", "page_number", "cursor", "link_header"),
+}
 
 
 def select_path(doc: Any, path: str | None) -> Any:
@@ -186,6 +212,13 @@ class RestConnector(PollingConnector):
                     "default": False,
                     "description": "Only for local testing. Company APIs should use HTTPS.",
                 },
+                "allow_private_network": {
+                    "type": "boolean",
+                    "title": "Allow private network addresses",
+                    "default": False,
+                    "description": "Needed for APIs inside your company network (10.x, 192.168.x, localhost). "
+                    "Cloud metadata and link-local addresses are always blocked.",
+                },
             },
         },
         secrets_schema={
@@ -253,12 +286,54 @@ class RestConnector(PollingConnector):
     def _max_pages(self) -> int:
         return max(1, min(int(self.settings.get("max_pages") or DEFAULT_MAX_PAGES), HARD_MAX_PAGES))
 
+    def check_settings(self) -> None:
+        """Type-check settings so a malformed form value gives a clear error, not a crash.
+
+        Messages name the setting but never echo its value.
+        """
+        s = self.settings
+        if not isinstance(s, dict):
+            raise ConnectorError("Settings must be an object", hint="Re-save the source from the form.")
+
+        def bad(name: str, what: str) -> ConnectorError:
+            return ConnectorError(f"Setting {name!r} must be {what}", hint=f"Fix {name!r} on the source and save.")
+
+        for name in _STR_SETTINGS:
+            if s.get(name) is not None and not isinstance(s[name], str):
+                raise bad(name, "text")
+        for name in _INT_SETTINGS:
+            v = s.get(name)
+            if v is not None and (isinstance(v, bool) or not isinstance(v, int)):
+                raise bad(name, "a whole number")
+        for name in _NUM_SETTINGS:
+            v = s.get(name)
+            if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float)) or v <= 0):
+                raise bad(name, "a positive number")
+        for name in ("allow_http", "allow_private_network"):
+            if s.get(name) is not None and not isinstance(s[name], bool):
+                raise bad(name, "true or false")
+        for name, allowed in _ENUM_SETTINGS.items():
+            if s.get(name) not in (None, "", *allowed):
+                raise bad(name, "one of " + ", ".join(allowed))
+        q = s.get("query")
+        if q is not None and (
+            not isinstance(q, dict)
+            or not all(isinstance(k, str) and isinstance(v, (str, int, float, bool)) for k, v in q.items())
+        ):
+            raise bad("query", "a list of name/value pairs (text values)")
+        if not str(s.get("base_url") or "").strip():
+            raise ConnectorError(
+                "Setting 'base_url' is empty", hint="Enter the API address, e.g. https://api.example.com."
+            )
+
     # -- HTTP -------------------------------------------------------------
 
     def _http(self) -> httpx.AsyncClient:
         if self._client is None:
             timeout = float(self.settings.get("timeout_s") or 15)
             self._client = httpx.AsyncClient(
+                transport=GuardedTransport(allow_private=self.settings.get("allow_private_network") is True),
+                trust_env=False,
                 timeout=httpx.Timeout(timeout, connect=min(timeout, 10.0)),
                 follow_redirects=False,
                 headers={"Accept": "application/json", "User-Agent": "liveops/0.1"},
@@ -300,7 +375,10 @@ class RestConnector(PollingConnector):
         if self.settings.get("oauth_scope"):
             data["scope"] = str(self.settings["oauth_scope"])
         try:
-            resp = await self._http().post(token_url, data=data, auth=(str(cid), str(csec)))
+            async with asyncio.timeout(self._deadline()):
+                resp = await self._http().post(token_url, data=data, auth=(str(cid), str(csec)))
+        except TimeoutError:
+            raise ConnectorError("The token URL didn't answer in time", hint="Check the token URL.") from None
         except httpx.HTTPError as e:
             raise ConnectorError(f"Couldn't reach the token URL: {type(e).__name__}", hint=_network_hint(e)) from None
         if resp.status_code in (400, 401, 403):
@@ -322,9 +400,26 @@ class RestConnector(PollingConnector):
         self._token_expires = time.monotonic() + max(0.0, expires_in - TOKEN_REFRESH_MARGIN_S)
         return token
 
+    def _deadline(self) -> float:
+        """Overall time for one request, so a server trickling bytes can't hold a poll forever."""
+        return 2 * float(self.settings.get("timeout_s") or 15)
+
     async def _get_json(self, url: str, params: dict[str, Any] | None) -> tuple[Any, httpx.Response]:
+        self.check_settings()
         self._check_url(url, "API URL")
         headers = await self._auth_headers()
+        try:
+            async with asyncio.timeout(self._deadline()):
+                return await self._get_json_inner(url, params, headers)
+        except TimeoutError:
+            raise ConnectorError(
+                f"The API took longer than {self._deadline():g} s to answer",
+                hint="Check the API is healthy, use smaller pages, or raise the timeout.",
+            ) from None
+
+    async def _get_json_inner(
+        self, url: str, params: dict[str, Any] | None, headers: dict[str, str]
+    ) -> tuple[Any, httpx.Response]:
         limit = self._max_bytes()
         try:
             async with self._http().stream("GET", url, params=params, headers=headers) as resp:
@@ -367,7 +462,10 @@ class RestConnector(PollingConnector):
         return [normalize_record(r) for r in found if isinstance(r, dict)]
 
     async def fetch_all(self, max_records: int = MAX_ROWS) -> list[Record]:
-        """Fetch every page (up to the page cap) and return the records."""
+        """Fetch every page (up to the page cap) and return all records.
+
+        Raises instead of truncating: a partial snapshot would look like deletes."""
+        self.check_settings()
         mode = self.settings.get("pagination") or "none"
         max_pages = self._max_pages()
         base_params: dict[str, Any] = {str(k): v for k, v in (self.settings.get("query") or {}).items()}
@@ -393,8 +491,7 @@ class RestConnector(PollingConnector):
             pages += 1
             recs = self._records_from(doc)
             out.extend(recs)
-            if len(out) >= max_records:
-                return out[:max_records]
+            check_row_cap(len(out), f"The API endpoint {self.dataset_name!r}", max_records)
             if mode == "page_number":
                 if len(recs) < page_size:
                     break
@@ -430,6 +527,26 @@ class RestConnector(PollingConnector):
     async def test(self) -> TestReport:
         started = time.monotonic()
         steps: list[TestStep] = []
+        try:
+            return await self._test(steps, started)
+        except Exception as e:  # noqa: BLE001 - test() must never raise
+            steps.append(
+                TestStep(
+                    name="Run test",
+                    ok=False,
+                    detail=f"Unexpected error: {type(e).__name__}",
+                    hint="Check the settings; if this repeats, report it with the source type.",
+                )
+            )
+            return TestReport.from_steps(steps, started)
+
+    async def _test(self, steps: list[TestStep], started: float) -> TestReport:
+        try:
+            self.check_settings()
+            steps.append(TestStep(name="Check the settings", ok=True, detail="valid"))
+        except ConnectorError as e:
+            steps.append(TestStep(name="Check the settings", ok=False, detail=str(e), hint=e.hint))
+            return TestReport.from_steps(steps, started)
         try:
             self._check_url(self._url(), "API URL")
             detail = self._url()
@@ -474,12 +591,14 @@ class RestConnector(PollingConnector):
         return params
 
     async def discover(self) -> list[Dataset]:
+        self.check_settings()
         doc, _ = await self._get_json(self._url(), self._first_page_params())
         cols = infer_columns(self._records_from(doc))
         return [Dataset(name=self.dataset_name, columns=cols, primary_key=primary_key_guess(cols))]
 
     async def preview(self, dataset: str, limit: int = 20) -> list[Record]:
         self._resolve(dataset)
+        self.check_settings()
         doc, _ = await self._get_json(self._url(), self._first_page_params())
         return self._records_from(doc)[:limit]
 

@@ -21,6 +21,9 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     data_dir: str = "./data"  # uploaded files for csv_file sources (one sub-folder per source)
     max_upload_mb: int = 50
+    # s3_files sources may use the server's own AWS credentials (instance role,
+    # env vars) only if this is true AND the source opts in. Default: never.
+    s3_allow_instance_role: bool = False
 
 
 @lru_cache
