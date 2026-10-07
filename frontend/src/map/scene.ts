@@ -8,10 +8,10 @@ import type { PlanView } from "./floors";
 import { FigureLayer, type LayerEntry } from "./figureLayer";
 import { figureOf } from "./figures";
 import { APPROACH_DISTANCE, Motion } from "./motion";
-import { floorSize, polygonCentroid, type PlacementResult, type Rect } from "./placement";
+import { floorSize, polygonBounds, polygonCentroid, type PlacementResult, type Rect } from "./placement";
 import { STATE_KEYS, onThemeChange, readStateColors, readToken, stateKey, type StateKey } from "./stateColors";
 import { buildWorld, type BuiltWorld } from "./world/build";
-import { FOCUS_ZOOM, ORBIT, VIEW_DIR, fitOrtho, flyStep, maxZoomFor, type FlyGoal } from "./world/camera";
+import { FOCUS_ZOOM, ORBIT, VIEW_DIR, fitOrtho, flyStep, maxZoomFor, zoomToFit, type FlyGoal, type MapCamera } from "./world/camera";
 import { applyLightPalette, configureRenderer, createLights, fitSun, type Lights } from "./world/lighting";
 import { currentPalette, type ScenePalette } from "./world/style";
 import { GLOW_MS, glowAt, isBed, newlyFree, roomStates, statesChanged, tintFor } from "./world/tint";
@@ -50,7 +50,7 @@ const FLY_EASE = 0.1;
 /** How quickly the camera catches up with a followed figure (per frame, 0..1). */
 const FOLLOW_EASE = 0.15;
 
-export class MapScene {
+export class MapScene implements MapCamera {
   private renderer: THREE.WebGLRenderer;
   private scene = new THREE.Scene();
   private camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 2000);
@@ -101,7 +101,7 @@ export class MapScene {
     this.software = isSoftwareRenderer();
     this.renderer = new THREE.WebGLRenderer({ antialias: !this.software, powerPreference: "high-performance" });
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
-    configureRenderer(this.renderer, this.palette);
+    configureRenderer(this.renderer, this.palette, this.software);
     this.renderer.domElement.className = "lm-canvas";
     this.renderer.domElement.setAttribute("aria-hidden", "true");
     container.appendChild(this.renderer.domElement);
@@ -226,7 +226,9 @@ export class MapScene {
       fonts: { data: readToken("--f-data") || "ui-monospace, monospace", body: readToken("--f-body") || "system-ui, sans-serif" },
     });
     this.floor.add(this.world.group);
+    this.scene.background = new THREE.Color(this.world.background);
     fitSun(this.lights, width, depth);
+    this.renderer.shadowMap.needsUpdate = true; // static shadows: redraw once for the new world
     this.paintRooms();
 
     if (unassigned) {
@@ -325,20 +327,32 @@ export class MapScene {
   }
 
   /** Smoothly bring a layout point to the centre of the view (reduced motion: jump). */
-  flyTo(x: number, y: number, zoom = Math.max(this.camera.zoom, FOCUS_ZOOM)) {
+  flyTo(point: readonly [number, number], zoom = Math.max(this.camera.zoom, FOCUS_ZOOM)) {
+    if (!Number.isFinite(point[0]) || !Number.isFinite(point[1])) return;
     this.userMoved = true;
-    const z = THREE.MathUtils.clamp(zoom, this.controls.minZoom, this.controls.maxZoom);
-    this.fly = { target: this.toWorld(x, y, new THREE.Vector3()), zoom: z };
+    const z = THREE.MathUtils.clamp(Number.isFinite(zoom) ? zoom : FOCUS_ZOOM, this.controls.minZoom, this.controls.maxZoom);
+    this.fly = { target: this.toWorld(point[0], point[1], new THREE.Vector3()), zoom: z };
     if (this.reducedMotion) this.stepFly();
   }
 
-  /** Fly to a zone of the current floor (e.g. a room picked in a panel). False if it is not on this floor. */
+  /** Fly to a zone of the current floor (e.g. a room picked in a panel), zoomed to fit it. False if it is not on this floor. */
   flyToZone(zoneId: string): boolean {
     const z = this.zoneById.get(zoneId);
     if (!z || !Array.isArray(z.polygon) || z.polygon.length < 3) return false;
-    const [cx, cy] = polygonCentroid(z.polygon);
-    this.flyTo(cx, cy);
+    const b = polygonBounds(z.polygon);
+    const aspect = Math.max(1, this.container.clientWidth) / Math.max(1, this.container.clientHeight);
+    this.flyTo(polygonCentroid(z.polygon), zoomToFit(this.frameHalf, aspect, b.w, b.h, this.controls.minZoom, this.controls.maxZoom));
     return true;
+  }
+
+  reset() {
+    this.resetCamera();
+  }
+
+  view(): { target: [number, number]; zoom: number } {
+    const { width, depth } = floorSize(this.layout);
+    const t = this.controls.target;
+    return { target: [Math.round((t.x + width / 2) * 100) / 100, Math.round((t.z + depth / 2) * 100) / 100], zoom: Math.round(this.camera.zoom * 1000) / 1000 };
   }
 
   private stepFly() {
@@ -444,7 +458,7 @@ export class MapScene {
     this.updateSelectionBox();
     if (changed && id && !this.following) {
       const f = this.motion.get(id);
-      if (f) this.flyTo(f.x, f.y);
+      if (f) this.flyTo([f.x, f.y]);
     }
   }
 
@@ -469,9 +483,9 @@ export class MapScene {
     const p = currentPalette();
     const themeChanged = p !== this.palette;
     this.palette = p;
-    configureRenderer(this.renderer, p);
+    configureRenderer(this.renderer, p, this.software);
     applyLightPalette(this.lights, p);
-    this.scene.background = new THREE.Color(p.sky);
+    this.scene.background = new THREE.Color(this.world?.background ?? p.sky);
     if (themeChanged && this.floor.children.length) this.buildFloor();
     else this.applyTokens();
   }

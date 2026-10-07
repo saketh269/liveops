@@ -1,9 +1,10 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type MutableRefObject } from "react";
 import type { Asset, SiteLayout } from "../api/types";
 import type { PlanView } from "./floors";
 import { PlacementCache } from "./placement";
 import type { MapState } from "./reducer";
 import type { MapScene } from "./scene";
+import type { MapCamera } from "./world/camera";
 import type { FlushListener } from "./useLiveSite";
 
 type Props = {
@@ -26,8 +27,12 @@ type Props = {
   motion?: boolean;
   /** Removed records still walking out, with their final data (for the details panel). */
   onDeparting?: (assets: Map<string, Asset>) => void;
+  // --- scene hook (ADR 0007): camera presets. Keep minimal. ---
   /** Zone id to fly the camera to (e.g. a room picked in a panel); changing it flies again. */
   focusZone?: string | null;
+  /** Filled with the camera handle (flyTo, flyToZone, reset, view) while the 3D scene runs; null otherwise. */
+  cameraRef?: MutableRefObject<MapCamera | null>;
+  // --- end scene hook ---
 };
 
 declare global {
@@ -37,7 +42,7 @@ declare global {
 }
 
 /** Hosts the Three.js scene. Asset updates bypass React and go straight to the scene. */
-export default function MapView3D({ layout, stateRef, listen, selectedId, onHover, onSelect, onFail, debug, plan, assetFilter, viewKey, motion = true, onDeparting, focusZone }: Props) {
+export default function MapView3D({ layout, stateRef, listen, selectedId, onHover, onSelect, onFail, debug, plan, assetFilter, viewKey, motion = true, onDeparting, focusZone, cameraRef }: Props) {
   const hostRef = useRef<HTMLDivElement>(null);
   const labelsRef = useRef<HTMLDivElement>(null);
   const [scene, setScene] = useState<MapScene | null>(null);
@@ -92,6 +97,9 @@ export default function MapView3D({ layout, stateRef, listen, selectedId, onHove
         screenOf: (id: string) => scene.screenOf(id),
         positionOf: (id: string) => scene.positionOf(id),
         roomTintOf: (zoneId: string) => scene.roomTintOf(zoneId),
+        flyTo: (x: number, y: number, zoom?: number) => scene.flyTo([x, y], zoom),
+        flyToZone: (zoneId: string) => scene.flyToZone(zoneId),
+        view: () => scene.view(),
         assetCount: () => stateRef.current.assets.size,
       };
     }
@@ -111,7 +119,14 @@ export default function MapView3D({ layout, stateRef, listen, selectedId, onHove
   useEffect(() => { scene?.setPlan(plan ?? null); }, [scene, plan]);
 
   useEffect(() => { scene?.setSelected(selectedId); }, [scene, selectedId]);
+  // scene hook: fly to a picked zone; hand the camera handle out while the scene runs.
   useEffect(() => { if (focusZone) scene?.flyToZone(focusZone); }, [scene, focusZone]);
+  useEffect(() => {
+    if (!cameraRef) return;
+    cameraRef.current = scene;
+    return () => { cameraRef.current = null; };
+  }, [scene, cameraRef]);
+  // --- end scene hook ---
   useEffect(() => { scene?.setMotionAllowed(motion); }, [scene, motion]);
   const following = follow && !!selectedId;
   useEffect(() => { scene?.setFollow(following); }, [scene, following]);

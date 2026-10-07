@@ -61,3 +61,31 @@ export function flyStep(camera: THREE.OrthographicCamera, target: THREE.Vector3,
   }
   return done;
 }
+
+/**
+ * Camera handle other modules use (HUD cards, problem pins, panels): positions are
+ * layout metres on the current floor. Exposed by MapView3D through its `cameraRef`.
+ */
+export type MapCamera = {
+  /** Smoothly bring `point` to the centre of the view at `zoom` (default: close enough to read a room). */
+  flyTo(point: readonly [number, number], zoom?: number): void;
+  /** Fly to a zone of the current floor, zoomed to fit it. False when it is not on this floor. */
+  flyToZone(zoneId: string): boolean;
+  /** Back to the default framing of the whole floor. */
+  reset(): void;
+  /** Where the camera looks now (layout metres) and its zoom. */
+  view(): { target: [number, number]; zoom: number };
+};
+
+/**
+ * Zoom that shows a `w` × `h` area (metres) with room around it, for a frustum of
+ * `frameHalf` half height at zoom 1 and viewport `aspect`; within [min, max].
+ */
+export function zoomToFit(frameHalf: number, aspect: number, w: number, h: number, min: number, max: number): number {
+  const a = aspect > 0 && Number.isFinite(aspect) ? aspect : 1;
+  // Ortho half extents at zoom z: frameHalf / z (vertical), frameHalf * a / z (horizontal).
+  // The angled view foreshortens depth, so a zone's depth counts a little less than its width.
+  const need = Math.max(h * 0.8, w / a, 1) * 1.8;
+  const z = (2 * frameHalf) / need;
+  return Math.min(max, Math.max(min, z));
+}
