@@ -89,6 +89,8 @@ export class Motion {
   private lastPlacement: PlacementResult | null = null;
   /** Bumped whenever the set of leaving figures changes. */
   departingVersion = 0;
+  /** Figures whose position or walking state changed outside step() (started walking, jumped, landed). */
+  private touched = new Set<string>();
 
   constructor(opts: MotionOptions = {}) {
     this.now = opts.now ?? defaultNow;
@@ -113,6 +115,7 @@ export class Motion {
     this.primed = false;
     this.lastAssets = null;
     this.lastPlacement = null;
+    this.touched.clear();
     if (hadLeaving) this.departingVersion++;
   }
 
@@ -138,6 +141,13 @@ export class Motion {
 
   isMoving(id: string): boolean {
     return this.walking.has(id);
+  }
+
+  /** Ids touched since the last call (see `touched`); the caller redraws them. */
+  drainTouched(): string[] {
+    const out = [...this.touched];
+    this.touched.clear();
+    return out;
   }
 
   /** Records that were removed but are still walking out, with their final data. */
@@ -276,6 +286,7 @@ export class Motion {
     }
     f.walk = { plan, route: null, cum: [0], total: 0, speed: isVehicle(model) ? DRIVE_SPEED : WALK_SPEED, t0: now, seg: 0 };
     f.level = 0;
+    this.touched.add(f.id);
     this.walking.add(f.id);
     // Re-queue at the back so a walker that changed again waits its turn fairly.
     this.pending.delete(f.id);
@@ -329,6 +340,7 @@ export class Motion {
     f.walk = null;
     this.walking.delete(f.id);
     this.pending.delete(f.id);
+    this.touched.add(f.id);
   }
 
   private landAll() {

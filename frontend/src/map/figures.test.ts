@@ -16,11 +16,11 @@ test("kind picks the model, role refines people (case-insensitive)", () => {
   expect(figureModel("bed", "nurse")).toBe("bed");
 });
 
-test("unknown kinds fall back to their own group", () => {
+test("unknown kinds fall back to the box figure", () => {
   expect(figureModel("pump")).toBe("other");
   expect(figureModel(undefined)).toBe("other");
-  expect(figureKey({ site_id: "s", asset_id: "1", updated_ts: 0, _sources: {}, kind: "Pump" })).toBe("other:pump");
-  expect(figureKey({ site_id: "s", asset_id: "1", updated_ts: 0, _sources: {} })).toBe("other:asset");
+  expect(figureKey({ site_id: "s", asset_id: "1", updated_ts: 0, _sources: {}, kind: "Pump" })).toBe("other");
+  expect(figureKey({ site_id: "s", asset_id: "1", updated_ts: 0, _sources: {} })).toBe("other");
   expect(isVehicle("ambulance") && !isVehicle("nurse")).toBe(true);
   expect(isPerson("cleaner") && !isPerson("bed")).toBe(true);
 });

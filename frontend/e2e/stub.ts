@@ -4,6 +4,10 @@ import type { Page, WebSocketRoute } from "@playwright/test";
 export const SITE_ID = "bench";
 const STATES = ["free", "available", "occupied", "in_use", "cleaning", "maintenance", "alert", "blocked", "unknown"];
 const KINDS = ["bed", "pump", "wheelchair", "monitor"];
+/** People and vehicles for the walking benchmark: [kind, role]. */
+export const PEOPLE: [string, string | undefined][] = [
+  ["staff", "nurse"], ["staff", "doctor"], ["staff", "cleaner"], ["patient", undefined], ["person", undefined], ["bed", undefined], ["equipment", undefined], ["ambulance", undefined],
+];
 
 export function benchSite(zonesX = 4, zonesY = 3) {
   const width = 120, depth = 72, gap = 2;
@@ -25,12 +29,13 @@ export function rng(seed = 42) {
   return () => ((s = (s * 1664525 + 1013904223) >>> 0) / 2 ** 32);
 }
 
-export function benchAssets(n: number, zones: number, rand = rng()) {
+export function benchAssets(n: number, zones: number, rand = rng(), people = false) {
   return Array.from({ length: n }, (_, i) => ({
     site_id: SITE_ID,
     asset_id: `A${String(i).padStart(4, "0")}`,
     label: `Asset ${i}`,
-    kind: KINDS[i % KINDS.length],
+    kind: people ? PEOPLE[i % PEOPLE.length][0] : KINDS[i % KINDS.length],
+    ...(people && PEOPLE[i % PEOPLE.length][1] ? { role: PEOPLE[i % PEOPLE.length][1] } : {}),
     zone: i % 97 === 0 ? "Loading dock" : `Zone ${(i % zones) + 1}`, // ~1% unassigned
     state: STATES[Math.floor(rand() * STATES.length)],
     attributes: { temp: 20 + (i % 7) },
@@ -45,9 +50,9 @@ export type Stub = { ws: () => WebSocketRoute | null; assets: ReturnType<typeof 
  * Routes /api and /ws for the page. After the snapshot, sends `changesPerSec`
  * random state changes in batches every 100 ms (skipping ids in `exclude`).
  */
-export async function stubBackend(page: Page, opts: { assets: number; changesPerSec: number; exclude?: Set<string> }): Promise<Stub> {
+export async function stubBackend(page: Page, opts: { assets: number; changesPerSec: number; exclude?: Set<string>; people?: boolean }): Promise<Stub> {
   const site = benchSite();
-  const assets = benchAssets(opts.assets, site.layout.zones.length);
+  const assets = benchAssets(opts.assets, site.layout.zones.length, rng(), opts.people);
   let socket: WebSocketRoute | null = null;
   let timer: ReturnType<typeof setInterval> | undefined;
   const rand = rng(7);

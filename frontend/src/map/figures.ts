@@ -56,13 +56,7 @@ export function figureOf(a: Asset): FigureModel {
 export const isVehicle = (m: FigureModel) => m === "ambulance" || m === "vehicle";
 export const isPerson = (m: FigureModel) => m === "patient" || m === "person" || m === "nurse" || m === "doctor" || m === "cleaner";
 
-/**
- * Mesh group key for the 3D scene: one InstancedMesh per key. Unknown kinds keep
- * their own group (and the existing per-kind fallback shape).
- */
-export function figureKey(a: Asset): string {
-  const m = figureOf(a);
-  if (m !== "other") return m;
-  const k = low(a.kind);
-  return `other:${k || "asset"}`;
+/** Mesh group key for the 3D scene: one merged mesh per model. */
+export function figureKey(a: Asset): FigureModel {
+  return figureOf(a);
 }
