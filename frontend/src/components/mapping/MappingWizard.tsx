@@ -261,7 +261,7 @@ export function MappingWizard({ sites, sources, connectors, existing, initialSit
             <div className="field">
               <label htmlFor="m-zone">Zone</label>
               <ColumnSelect id="m-zone" value={fields.zone} onChange={(v) => setFields({ ...fields, zone: v })} columns={columns} noneLabel="Not mapped" describedBy="m-zone-help" />
-              <span className="help" id="m-zone-help">Which area of the site the asset is in. Values should match zone names in the layout.</span>
+              <span className="help" id="m-zone-help">Which area of the site the asset is in, such as a unit or ward. The live map creates a zone for each value it finds.</span>
             </div>
             <div className="field">
               <label htmlFor="m-state">State</label>

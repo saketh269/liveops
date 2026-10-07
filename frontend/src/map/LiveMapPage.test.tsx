@@ -98,3 +98,15 @@ test("layout editor adds a zone and saves via updateSite; validation blocks bad 
   expect(await screen.findByText(/2 zones are named "icu"/)).toBeTruthy();
   expect(updateSite).toHaveBeenCalledTimes(1);
 });
+
+test("zones are created from the data when the layout matches none of it", async () => {
+  updateSite.mockReset();
+  updateSite.mockImplementation((_id: string, b: { layout: Site["layout"] }) => Promise.resolve({ ...site, layout: b.layout }));
+  renderAt("/map/s1");
+  await screen.findByRole("heading", { level: 1, name: "General Hospital" });
+  await send({ type: "snapshot", site_id: "s1", assets: [bed("B1", "free", "ER"), bed("B2", "occupied", "General")], event: null, ts: 1 });
+  await waitFor(() => expect(updateSite).toHaveBeenCalledTimes(1));
+  const zones = updateSite.mock.calls[0][1].layout.zones.map((z: { name: string }) => z.name);
+  expect(zones).toEqual(["ER", "General"]);
+  expect(await screen.findByText(/Created 2 zones from your data: ER, General/)).toBeTruthy();
+});

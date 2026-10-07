@@ -126,3 +126,8 @@
   .lm-view-controls .btn { padding: 4px 8px; }
   .lm-inline-field input { max-width: 150px; }
 }
+
+/* Setup notices above the map */
+.lm-hints { display: grid; gap: 8px; }
+.lm-hints .notice { line-height: 1.6; }
+.lm-link-btn { padding: 3px 10px; font-size: 0.8rem; }

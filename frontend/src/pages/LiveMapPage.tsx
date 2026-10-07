@@ -5,6 +5,7 @@ import type { Site } from "../api/types";
 import LayoutEditor from "../map/LayoutEditor";
 import Map2D from "../map/Map2D";
 import MapView3D from "../map/MapView3D";
+import SetupHints from "../map/SetupHints";
 import { AssetDetails, EventFeed, KpiPanel, Legend } from "../map/panels";
 import { assetName } from "../map/reducer";
 import { webglAvailable } from "../map/webgl";
@@ -149,6 +150,7 @@ function SiteMap({ siteId }: { siteId: string }) {
             {ui.snapshotReceived && ui.assets.size === 0 && (
               <div className="notice info">No assets on this site yet. <Link to="/mapping">Map a source</Link> to this site to see its records here.</div>
             )}
+            <SetupHints site={site} assets={ui.assets} ready={ui.snapshotReceived} onSite={setSite} onEditLayout={() => setEdit(true)} />
             <div className="lm-stage">
               {use2d ? (
                 <Map2D
