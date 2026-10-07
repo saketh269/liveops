@@ -61,3 +61,4 @@ From inside Docker, use `host.docker.internal` as the host name, not `localhost`
 - How we work, checks and ownership: [`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md)
 - Decisions: [`docs/adr/`](docs/adr)
 - Review checklist: [`docs/review-checklist.md`](docs/review-checklist.md)
+- Busy-hospital test data for the map (test tool, never shipped): [`tools/hospital-sim/`](tools/hospital-sim/README.md)
