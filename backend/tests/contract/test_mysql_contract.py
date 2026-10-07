@@ -61,7 +61,8 @@ class MySQLDriver:
         stmts: list[tuple[str, tuple[Any, ...]]] = [
             (f"CREATE DATABASE `{self.db}` CHARACTER SET utf8mb4", ()),
             (
-                f"""CREATE TABLE `{self.db}`.assets (id VARCHAR(64) PRIMARY KEY, status VARCHAR(64), zone TEXT,
+                f"""CREATE TABLE `{self.db}`.assets (pk BIGINT AUTO_INCREMENT PRIMARY KEY,
+                id VARCHAR(64) NULL UNIQUE, status VARCHAR(64), zone TEXT,
                 updated_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6), seen DATETIME(3) NULL,
                 amount DECIMAL(10,2) DEFAULT 1.50, blob_col VARBINARY(16), doc JSON NULL,
                 kind ENUM('bed', 'chair') NULL, tags SET('a', 'b') NULL)""",
@@ -114,6 +115,36 @@ class MySQLDriver:
 
         return await asyncio.to_thread(run)
 
+    async def insert_null_key(self, row: dict[str, Any]) -> None:
+        await self._exec("INSERT INTO assets (id, status, zone) VALUES (NULL, %s, %s)", (row["status"], row["zone"]))
+
+    async def binlog_dump_ids(self) -> list[int]:
+        def run() -> list[int]:
+            conn = pymysql.connect(**mysql_admin())
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT ID FROM information_schema.PROCESSLIST WHERE USER = %s AND COMMAND LIKE %s",
+                        (self.user, "Binlog Dump%"),
+                    )
+                    return [int(r[0]) for r in cur.fetchall()]
+            finally:
+                conn.close()
+
+        return await asyncio.to_thread(run)
+
+    async def kill(self, ids: list[int]) -> None:
+        def run() -> None:
+            conn = pymysql.connect(**mysql_admin())
+            try:
+                with conn.cursor() as cur:
+                    for i in ids:
+                        cur.execute(f"KILL {int(i)}")
+            finally:
+                conn.close()
+
+        await asyncio.to_thread(run)
+
     async def insert(self, row: dict[str, Any]) -> None:
         await self._exec(
             "INSERT INTO assets (id, status, zone) VALUES (%s, %s, %s)", (row["id"], row["status"], row["zone"])
@@ -140,11 +171,15 @@ class MySQLDriver:
 
 
 async def _initial(gen: AsyncIterator[Any], n: int = len(SEED_ROWS)) -> dict[str, Any]:
+    """Consume the initial state and the one SNAPSHOT_END marker."""
     seen: dict[str, Any] = {}
-    while len(seen) < n:
+    while True:
         ch = await asyncio.wait_for(gen.__anext__(), 10)
+        if ch.op == ChangeOp.SNAPSHOT_END:
+            break
         assert ch.op == ChangeOp.UPSERT
         seen[ch.key] = ch
+    assert len(seen) == n
     return seen
 
 
@@ -324,6 +359,176 @@ class TestMySQLCdcContract(ConnectorContract):
                 await c.stream(f"{driver.db}.nope", ["id"]).__anext__()
         finally:
             await c.close()
+
+
+@requires_mysql
+class TestMySQLCdcFixes:
+    """Fix round: LIVEOPS-39, 28, 26, 29, 34 and ADR 0004 for the mysql connector."""
+
+    @pytest.fixture
+    async def driver(self) -> AsyncIterator[MySQLDriver]:
+        d = MySQLDriver()
+        await d.setup()
+        try:
+            yield d
+        finally:
+            await d.teardown()
+
+    async def test_killed_binlog_connection_raises_so_the_runner_restarts(self, driver: MySQLDriver) -> None:
+        """LIVEOPS-39: no silent reconnect that then delivers nothing."""
+        c = MySQLConnector(driver.settings(mode="cdc"), {"password": READER_PW})
+        gen = c.stream(driver.dataset, ["id"]).__aiter__()
+        try:
+            await _initial(gen)
+            await driver.update("A1", {"status": "before-kill"})
+            assert (await asyncio.wait_for(gen.__anext__(), 5)).record["status"] == "before-kill"
+            ids = await driver.binlog_dump_ids()
+            assert len(ids) == 1
+            await driver.kill(ids)
+            t0 = time.monotonic()
+            with pytest.raises(ConnectorError) as e:
+                await asyncio.wait_for(gen.__anext__(), 10)
+            took = time.monotonic() - t0
+            assert "binary log" in str(e.value).lower() and e.value.hint
+            assert took < 3, took
+            print(f"mysql binlog kill detected in {took * 1000:.0f}ms")
+        finally:
+            await gen.aclose()
+            await c.close()
+        # What the runner does next: a new connector, fresh snapshot + marker, then live changes again.
+        c = MySQLConnector(driver.settings(mode="cdc"), {"password": READER_PW})
+        gen = c.stream(driver.dataset, ["id"]).__aiter__()
+        try:
+            await _initial(gen)
+            await driver.update("A2", {"status": "after-kill"})
+            ch = await asyncio.wait_for(gen.__anext__(), 5)
+            assert (ch.key, ch.record["status"]) == ("A2", "after-kill")
+        finally:
+            await gen.aclose()
+            await c.close()
+
+    async def test_killed_sessions_through_the_runner_show_error_then_recover(self, driver: MySQLDriver) -> None:
+        """LIVEOPS-39 end to end: Health shows the error, then the runner's retry delivers changes."""
+        from app.core.mapping import MappingConfig
+        from app.core.runner import MappingSpec, RunnerManager
+        from app.core.state import InMemoryStateStore
+
+        state = InMemoryStateStore()
+        runner = RunnerManager(state)
+        spec = MappingSpec(
+            mapping_id="m1",
+            site_id="s1",
+            source_id="src1",
+            source_type="mysql",
+            settings=driver.settings(mode="cdc"),
+            secrets={"password": READER_PW},
+            dataset=driver.dataset,
+            config=MappingConfig(id_field="id", fields={"state": "status"}),
+            options={},
+        )
+
+        async def asset_state(asset: str) -> object:
+            for a in await state.site_assets("s1"):
+                if a.asset_id == asset:
+                    return a.flat().get("state")
+            return None
+
+        async def wait_for(pred: Any, within: float) -> bool:
+            end = time.monotonic() + within
+            while time.monotonic() < end:
+                if await pred():
+                    return True
+                await asyncio.sleep(0.05)
+            return False
+
+        await runner.start(spec)
+        try:
+            assert await wait_for(lambda: _is(asset_state("A1"), "free"), 10)
+            assert await wait_for(lambda: _true_async(driver.binlog_dump_ids()), 5)
+            await driver.kill(await driver.binlog_dump_ids())
+            h = runner.health["m1"]
+            assert await wait_for(lambda: _true(h.last_error is not None), 5), "Health must show the failure"
+            assert "binary log" in (h.last_error or "").lower()
+            await asyncio.sleep(1.5)  # runner backoff (1 s) and reconnect
+            await driver.update("A1", {"status": "k0"})
+            assert await wait_for(lambda: _is(asset_state("A1"), "k0"), 5), "changes must flow again"
+        finally:
+            await runner.stop_all()
+
+    async def test_mapping_key_change_and_key_to_null(self, driver: MySQLDriver) -> None:
+        """LIVEOPS-28 (MySQL side): ``id`` is not the PK; before/after images give the old key."""
+        c = MySQLConnector(driver.settings(mode="cdc"), {"password": READER_PW})
+        gen = c.stream(driver.dataset, ["id"]).__aiter__()
+        try:
+            await _initial(gen)
+            await driver._exec("UPDATE assets SET id = 'A1x' WHERE id = 'A1'")
+            ops = [await asyncio.wait_for(gen.__anext__(), 5) for _ in range(2)]
+            assert [(x.op, x.key) for x in ops] == [(ChangeOp.DELETE, "A1"), (ChangeOp.UPSERT, "A1x")]
+            await driver._exec("UPDATE assets SET id = NULL WHERE id = 'A2'")
+            ch = await asyncio.wait_for(gen.__anext__(), 5)
+            assert (ch.op, ch.key) == (ChangeOp.DELETE, "A2")
+            await driver.insert_null_key({"status": "free", "zone": "ER"})
+            await driver.update("A3", {"status": "next"})
+            ch = await asyncio.wait_for(gen.__anext__(), 5)
+            assert ch.key == "A3" and c.skipped_records == 2
+        finally:
+            await gen.aclose()
+            await c.close()
+
+    @pytest.mark.parametrize("mode", ["cdc", "poll"])
+    async def test_more_rows_than_the_cap_raise_instead_of_truncating(
+        self, driver: MySQLDriver, mode: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """LIVEOPS-34: 3 rows with a cap of 2 must fail loudly; exactly the cap is fine."""
+        import app.connectors.mysql as mysql_mod
+
+        monkeypatch.setattr(mysql_mod, "MAX_ROWS", 2)
+        c = MySQLConnector(driver.settings(mode=mode), {"password": READER_PW})
+        gen = c.stream(driver.dataset, ["id"], {"poll_interval_s": 0.5}).__aiter__()
+        try:
+            with pytest.raises(ConnectorError) as e:
+                await asyncio.wait_for(gen.__anext__(), 10)
+            assert "more than 2 rows" in str(e.value) and e.value.hint
+        finally:
+            await gen.aclose()
+            await c.close()
+        await driver.delete("A3")
+        c = MySQLConnector(driver.settings(mode=mode), {"password": READER_PW})
+        gen = c.stream(driver.dataset, ["id"], {"poll_interval_s": 0.5}).__aiter__()
+        try:
+            await _initial(gen, 2)
+        finally:
+            await gen.aclose()
+            await c.close()
+
+    async def test_verify_checks_the_server_certificate(self, driver: MySQLDriver) -> None:
+        """LIVEOPS-29: the local server's auto-generated certificate is not trusted, so 'verify' fails."""
+        c = MySQLConnector(driver.settings(encryption="verify"), {"password": READER_PW})
+        try:
+            report = await c.test()
+        finally:
+            await c.close()
+        assert not report.ok and report.steps[0].name == "Reach the server" and not report.steps[0].ok
+        assert "certificate" in (report.steps[0].detail + report.steps[0].hint).lower()
+        c = MySQLConnector(driver.settings(), {"password": READER_PW})
+        try:
+            report = await c.test()
+        finally:
+            await c.close()
+        enc = next(s for s in report.steps if s.name == "Encryption")
+        assert enc.ok and "NOT verified" in enc.detail
+
+
+async def _is(value: Any, expected: object) -> bool:
+    return bool(await value == expected)
+
+
+async def _true(v: bool) -> bool:
+    return v
+
+
+async def _true_async(v: Any) -> bool:
+    return bool(await v)
 
 
 @requires_mysql

@@ -63,6 +63,7 @@ from app.connectors.base import (
     normalize_record,
     normalize_value,
     record_key,
+    snapshot_end,
 )
 from app.connectors.postgres import _connection_hint
 from app.connectors.registry import register
@@ -73,6 +74,7 @@ SSL_MODES = {"required": "require", "verify": "verify-full", "off": "disable"}
 MAX_ROWS = 100_000  # initial-state cap; the key cache below is bounded by it
 QUEUE_SIZE = 10_000  # replication messages buffered before the reader waits
 PG_EPOCH = dt.datetime(2000, 1, 1, tzinfo=dt.UTC).timestamp()
+TABLE_CHECK_S = 5.0  # how often a streaming table is checked for DROP / RENAME (LIVEOPS-43)
 
 
 @register
@@ -127,6 +129,7 @@ class PostgresCdcConnector(Connector):
         super().__init__(settings, secrets, source_id=source_id)
         self._conn: psycopg.AsyncConnection[dict[str, Any]] | None = None
         self._datasets: dict[str, Dataset] | None = None
+        self._names: dict[str, tuple[str, str]] = {}
         self._pumps: set[_ReplicationPump] = set()
         # Instrumentation for tests and health: how often the full table was read.
         self.snapshot_queries = 0
@@ -143,6 +146,8 @@ class PostgresCdcConnector(Connector):
             "user": s["user"],
             "password": self.secrets.get("password", ""),
             "sslmode": SSL_MODES.get(s.get("encryption", "required"), "require"),
+            # verify: check the certificate chain against the system CAs and the host name (verify-full)
+            **({"sslrootcert": "system"} if s.get("encryption") == "verify" else {}),
             "connect_timeout": 10,
             "application_name": "liveops",
             "options": "-c default_transaction_read_only=on -c statement_timeout=15000",
@@ -203,7 +208,14 @@ class PostgresCdcConnector(Connector):
                 TestStep(
                     name="Encryption",
                     ok=enc or want == "off",
-                    detail="encrypted (TLS)" if enc else "not encrypted",
+                    detail=(
+                        "not encrypted"
+                        if not enc
+                        else "encrypted (TLS), server certificate verified"
+                        if want == "verify"
+                        else "encrypted (TLS), server certificate NOT verified (use Verify for servers outside "
+                        "your network)"
+                    ),
                     hint="" if enc or want == "off" else "Turn on TLS on the server.",
                 )
             )
@@ -371,6 +383,7 @@ class PostgresCdcConnector(Connector):
             )
             d.columns.append(Column(name=c["column_name"], type=c["data_type"], nullable=c["is_nullable"] == "YES"))
         self._datasets = out
+        self._names = {f"{c['table_schema']}.{c['table_name']}": (c["table_schema"], c["table_name"]) for c in cols}
         return list(out.values())
 
     async def preview(self, dataset: str, limit: int = 20) -> list[Record]:
@@ -402,24 +415,40 @@ class PostgresCdcConnector(Connector):
                 ),
             )
         conn = await self._connect()
+        relid = await self._table_oid(schema, table)
+        if relid is None:
+            raise _table_gone(dataset)
         loop = asyncio.get_running_loop()
         pump = _ReplicationPump(self._conninfo(), pub, loop)
         self._pumps.add(pump)
         try:
             snapshot_name = await asyncio.to_thread(pump.open)
             self.last_slot_name = pump.slot
-            decoder = _Decoder(dataset, schema, table, key_fields, ds.primary_key, Transformer(conn))
+            decoder = _Decoder(dataset, relid, schema, table, key_fields, ds.primary_key, Transformer(conn))
             async for change in self._initial_state(conn, schema, table, snapshot_name, decoder):
                 yield change
+            self.skipped_records = decoder.skipped
+            yield snapshot_end(dataset)
             pump.start()
+            next_check = time.monotonic() + TABLE_CHECK_S
             while True:
-                item = await pump.queue.get()
+                try:
+                    item = await asyncio.wait_for(pump.queue.get(), max(0.0, next_check - time.monotonic()))
+                except TimeoutError:
+                    item = None
+                if time.monotonic() >= next_check:
+                    await self._check_table(dataset, relid, schema, table)
+                    next_check = time.monotonic() + TABLE_CHECK_S
+                if item is None:
+                    continue
                 if isinstance(item, BaseException):
                     raise ConnectorError(
                         f"Replication stream stopped: {_first_line(item, type(item).__name__)}",
                         hint="Check that the server is up and the user still has REPLICATION; it will reconnect.",
                     ) from item
-                for change in decoder.decode(item):
+                changes = decoder.decode(item)
+                self.skipped_records = decoder.skipped
+                for change in changes:
                     yield change
         finally:
             self._pumps.discard(pump)
@@ -449,7 +478,8 @@ class PostgresCdcConnector(Connector):
                     if count > MAX_ROWS:
                         raise ConnectorError(
                             f"Table {schema}.{table} has more than {MAX_ROWS:,} rows",
-                            hint="Live Ops shows up to 100,000 records per table. Map a smaller table or a view.",
+                            hint=f"Live Ops shows up to {MAX_ROWS:,} records per table. Map a smaller table "
+                            "(a publication can't carry a view).",
                         )
                     for row in rows:
                         change = decoder.remember(row, ts)
@@ -457,6 +487,32 @@ class PostgresCdcConnector(Connector):
                             yield change
         finally:
             await conn.execute("COMMIT")
+
+    async def _table_oid(self, schema: str, table: str) -> int | None:
+        conn = await self._connect()
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT c.oid FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace"
+                " WHERE n.nspname = %s AND c.relname = %s",
+                (schema, table),
+            )
+            row = await cur.fetchone()
+        return int(row["oid"]) if row else None
+
+    async def _check_table(self, dataset: str, relid: int, schema: str, table: str) -> None:
+        """Raise if the streamed table was dropped or renamed: pgoutput says nothing about a DROP."""
+        conn = await self._connect()
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT n.nspname AS s, c.relname AS t FROM pg_class c"
+                " JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.oid = %s",
+                (relid,),
+            )
+            row = await cur.fetchone()
+        if row is None:
+            raise _table_gone(dataset)
+        if (row["s"], row["t"]) != (schema, table):
+            raise _table_renamed(dataset, f"{row['s']}.{row['t']}")
 
     async def _published_tables(self, pub: str) -> set[str]:
         conn = await self._connect()
@@ -473,8 +529,7 @@ class PostgresCdcConnector(Connector):
                 f"Table {dataset!r} isn't readable with this user",
                 hint="Check the table name and that the user has SELECT on it.",
             )
-        schema, _, table = dataset.partition(".")
-        return schema, table
+        return self._names[dataset]
 
 
 # --------------------------------------------------------------------------
@@ -581,6 +636,7 @@ class _Relation:
 @dataclass
 class _Decoder:
     dataset: str
+    relid: int  # the streamed table's OID: survives renames, so a rename is noticed
     schema: str
     table: str
     key_fields: list[str]
@@ -624,16 +680,13 @@ class _Decoder:
         if kind in (b"I", b"U", b"D"):
             (relid,) = struct.unpack_from("!I", data, 1)
             rel = self.relations.get(relid)
-            if rel is None or (rel.schema, rel.table) != (self.schema, self.table):
+            if rel is None or relid != self.relid:
                 return []
             return self._row_change(kind, rel, data, 5)
         if kind == b"T":
             (nrels,) = struct.unpack_from("!I", data, 1)
             relids = struct.unpack_from(f"!{nrels}I", data, 6)
-            if any(
-                (r := self.relations.get(i)) is not None and (r.schema, r.table) == (self.schema, self.table)
-                for i in relids
-            ):
+            if self.relid in relids:
                 out = [
                     Change(op=ChangeOp.DELETE, dataset=self.dataset, key=k, record={}, source_ts=self.commit_ts)
                     for k in self.cache
@@ -659,6 +712,10 @@ class _Decoder:
             pos += 8
             cols.append((name, oid, bool(flags & 1)))
         self.relations[relid] = _Relation(schema, table, cols)
+        if relid != self.relid:
+            return
+        if (schema, table) != (self.schema, self.table):
+            raise _table_renamed(self.dataset, f"{schema}.{table}")
         identity = [c[0] for c in cols if c[2]]
         if identity and identity != self.primary_key:
             self.primary_key = identity
@@ -687,11 +744,19 @@ class _Decoder:
         old_key = self._key_of(old) if old else None
         prior = self.cache.get(old_key) if old_key else None
         new, _ = self._tuple(rel, data, pos + 1, prior)
+        if old_key is None and kind == b"U":
+            # No old tuple (identity unchanged): the identity columns of the new row find
+            # the record's previous mapping key, which may differ (LIVEOPS-28).
+            old_key = self._identity_key(new)
+            prior = self.cache.get(old_key) if old_key else None
         try:
             key = record_key(new, self.key_fields)
         except KeyError:
             self.skipped += 1
-            return []
+            if old_key is None:
+                return []
+            self._forget(old_key)  # the row lost its key value: it leaves the map
+            return [Change(op=ChangeOp.DELETE, dataset=self.dataset, key=old_key, record={}, source_ts=ts)]
         prior = prior if prior is not None else self.cache.get(key)
         if prior is not None:  # unchanged TOAST values: keep the last known value
             for name, _oid, _ in rel.columns:
@@ -710,8 +775,11 @@ class _Decoder:
             return record_key(partial, self.key_fields)
         except KeyError:
             pass
-        if self.primary_key and all(partial.get(f) is not None for f in self.primary_key):
-            return self.by_identity.get(tuple(partial[f] for f in self.primary_key))
+        return self._identity_key(partial)
+
+    def _identity_key(self, rec: Record) -> str | None:
+        if self.primary_key and all(rec.get(f) is not None for f in self.primary_key):
+            return self.by_identity.get(tuple(rec[f] for f in self.primary_key))
         return None
 
     def _tuple(self, rel: _Relation, data: bytes, pos: int, prior: Record | None) -> tuple[Record, int]:
@@ -737,6 +805,20 @@ class _Decoder:
             else:
                 raise ValueError(f"unknown pgoutput column kind {kind!r}")
         return out, pos
+
+
+def _table_gone(dataset: str) -> ConnectorError:
+    return ConnectorError(
+        f"Table {dataset} no longer exists, so the map can't follow it",
+        hint="Recreate the table (and add it back to the publication), or edit the mapping to use another table.",
+    )
+
+
+def _table_renamed(dataset: str, new_name: str) -> ConnectorError:
+    return ConnectorError(
+        f"Table {dataset} was renamed to {new_name}",
+        hint=f"Edit the mapping to use {new_name}, or rename the table back.",
+    )
 
 
 def _cstring(data: bytes, pos: int) -> tuple[str, int]:

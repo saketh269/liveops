@@ -40,11 +40,13 @@ from typing import Any, TypeVar
 
 import pymysql
 import pymysql.cursors
+from pymysql.constants import CLIENT
 from pymysqlreplication import BinLogStreamReader
 from pymysqlreplication.event import HeartbeatLogEvent
 from pymysqlreplication.row_event import DeleteRowsEvent, UpdateRowsEvent, WriteRowsEvent
 
 from app.connectors.base import (
+    MAX_SNAPSHOT_ROWS,
     Category,
     Change,
     ChangeOp,
@@ -57,14 +59,16 @@ from app.connectors.base import (
     Record,
     TestReport,
     TestStep,
+    check_row_cap,
     normalize_record,
     record_key,
+    snapshot_end,
 )
 from app.connectors.registry import register
 
 log = logging.getLogger("liveops.connectors.mysql")
 
-MAX_ROWS = 50_000  # per-dataset cap for poll snapshots and the CDC initial state
+MAX_ROWS = MAX_SNAPSHOT_ROWS  # per-dataset cap for poll snapshots and the CDC initial state; larger raises
 QUEUE_SIZE = 10_000
 # Without binlog_row_metadata=FULL the binlog library can't decode these faithfully
 # (binary as text, ENUM/SET as None), so rows of tables that have them are re-read
@@ -72,6 +76,22 @@ QUEUE_SIZE = 10_000
 LOOKUP_TYPES = {"binary", "varbinary", "tinyblob", "blob", "mediumblob", "longblob", "enum", "set"}
 INT_BITS = {"tinyint": 8, "smallint": 16, "mediumint": 24, "int": 32, "integer": 32, "bigint": 64}
 T = TypeVar("T")
+
+
+class _SafeConnection(pymysql.connections.Connection):
+    """PyMySQL connection that never sends credentials in plaintext when TLS was asked for.
+
+    Stock PyMySQL silently continues without TLS when the server (or someone in
+    the middle) doesn't advertise CLIENT_SSL, and only then authenticates
+    (LIVEOPS-26). Here the handshake is refused before any auth packet is sent.
+    """
+
+    def _request_authentication(self) -> None:
+        if self.ssl and not (self.server_capabilities & CLIENT.SSL):
+            raise pymysql.err.OperationalError(
+                2026, "The server did not offer TLS, so Live Ops refused to send the password"
+            )
+        super()._request_authentication()
 
 
 @register
@@ -174,7 +194,7 @@ class MySQLConnector(PollingConnector):
         return kw
 
     def _open(self) -> pymysql.connections.Connection[Any]:
-        conn = pymysql.connect(
+        conn = _SafeConnection(
             **self._connect_kwargs(),
             autocommit=True,
             cursorclass=pymysql.cursors.DictCursor,
@@ -202,6 +222,8 @@ class MySQLConnector(PollingConnector):
             return await asyncio.to_thread(self._run, fn)
         except pymysql.MySQLError as e:
             code, msg = _err(e)
+            if isinstance(e, pymysql.err.OperationalError):
+                await asyncio.to_thread(self._close_sync)  # e.g. killed session: reconnect next time
             raise ConnectorError(f"MySQL error {code}: {msg}", hint=_mysql_hint(code, msg, self.settings)) from None
 
     async def close(self) -> None:
@@ -250,7 +272,14 @@ class MySQLConnector(PollingConnector):
             TestStep(
                 name="Encryption",
                 ok=enc or want == "off",
-                detail=f"encrypted (TLS, {info['cipher']})" if enc else "not encrypted",
+                detail=(
+                    "not encrypted"
+                    if not enc
+                    else f"encrypted (TLS, {info['cipher']}), server certificate verified"
+                    if want == "verify"
+                    else f"encrypted (TLS, {info['cipher']}), server certificate NOT verified "
+                    "(use Verify for servers outside your network)"
+                ),
                 hint="" if enc or want == "off" else "Turn on TLS on the server.",
             )
         )
@@ -346,7 +375,7 @@ class MySQLConnector(PollingConnector):
         return [_record(r, json_cols) for r in await self._call(q)]
 
     async def snapshot(self, dataset: str) -> list[Record]:
-        query = await self._select_sql(dataset, MAX_ROWS)
+        query = await self._select_sql(dataset, MAX_ROWS + 1)  # one extra row tells "too many" from "exactly cap"
         json_cols = self._json_columns(dataset)
         self.snapshot_queries += 1
 
@@ -355,7 +384,9 @@ class MySQLConnector(PollingConnector):
                 cur.execute(query)
                 return list(cur.fetchall())
 
-        return [_record(r, json_cols) for r in await self._call(q)]
+        rows = await self._call(q)
+        check_row_cap(len(rows), dataset, MAX_ROWS)
+        return [_record(r, json_cols) for r in rows]
 
     async def stream(
         self, dataset: str, key_fields: list[str], options: dict[str, Any] | None = None
@@ -411,19 +442,19 @@ class MySQLConnector(PollingConnector):
 
         self.snapshot_queries += 1
         log_file, log_pos, rows = await self._call(snap)
-        if len(rows) > MAX_ROWS:
-            raise ConnectorError(
-                f"Table {dataset} has more than {MAX_ROWS:,} rows",
-                hint="Live Ops shows up to 50,000 records per table. Map a smaller table or a view.",
-            )
+        check_row_cap(len(rows), dataset, MAX_ROWS)
         ts = time.time()
+        snapshot_skipped = 0
         for row in rows:
             rec = _record(row, json_cols)
             try:
                 key = record_key(rec, key_fields)
             except KeyError:
+                snapshot_skipped += 1
                 continue
             yield Change(op=ChangeOp.UPSERT, dataset=dataset, key=key, record=rec, source_ts=ts)
+        self.skipped_records = snapshot_skipped
+        yield snapshot_end(dataset)
 
         server_id = int(self.settings.get("server_id") or random.randint(100_000, 2**31 - 1))  # noqa: S311
         pump = _BinlogPump(
@@ -433,7 +464,7 @@ class MySQLConnector(PollingConnector):
             table,
             log_file,
             log_pos,
-            lambda ev: _changes(ev, dataset, key_fields, json_cols, unsigned),
+            lambda ev, on_skip: _changes(ev, dataset, key_fields, json_cols, unsigned, on_skip),
             asyncio.get_running_loop(),
             ignore_decode_errors=needs_lookup,
         )
@@ -446,9 +477,10 @@ class MySQLConnector(PollingConnector):
                     code, msg = _err(item) if isinstance(item, pymysql.MySQLError) else (0, str(item))
                     raise ConnectorError(
                         f"Binary log stream stopped: {msg or type(item).__name__}",
-                        hint=_mysql_hint(code, msg, self.settings)
-                        or "Check that the server is up and binary logs aren't purged too early; it will reconnect.",
+                        hint=(_mysql_hint(code, msg, self.settings) if code != 2013 else "")
+                        or "The connection to the binary log dropped; Live Ops reloads the table and reconnects.",
                     ) from item
+                self.skipped_records = snapshot_skipped + pump.skipped
                 for change in item:
                     if needs_lookup and change.op == ChangeOp.UPSERT:
                         fresh = await self._row_by_key(dataset, key_fields, change.record, json_cols)
@@ -517,7 +549,7 @@ class _BinlogPump:
         table: str,
         log_file: str,
         log_pos: int,
-        convert: Callable[[Any], list[Change]],
+        convert: Callable[[Any, Callable[[], None]], list[Change]],
         loop: asyncio.AbstractEventLoop,
         *,
         ignore_decode_errors: bool = False,
@@ -538,12 +570,32 @@ class _BinlogPump:
             use_column_name_cache=True,
             ignore_decode_errors=ignore_decode_errors,
             enable_logging=False,
+            pymysql_wrapper=self._connection,
         )
+        self.skipped = 0  # rows in change events without a key value
+        self._stream_connections = 0
         self._convert = convert
         self._loop = loop
         self.queue: asyncio.Queue[list[Change] | BaseException] = asyncio.Queue(maxsize=QUEUE_SIZE)
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name=f"mysql-binlog-{server_id}", daemon=True)
+
+    def _connection(self, **kwargs: Any) -> pymysql.connections.Connection[Any]:
+        """Connection factory for the binlog library.
+
+        The library silently reconnects the binlog stream inside ``fetchone()`` after
+        a dropped or killed connection, and then delivers nothing for our table
+        (LIVEOPS-39). A second stream connection is refused here instead, so the
+        error reaches the runner, which restarts with a fresh snapshot.
+        """
+        if "db" not in kwargs and "database" not in kwargs:  # the stream (the control conn uses a db)
+            self._stream_connections += 1
+            if self._stream_connections > 1:
+                raise pymysql.err.OperationalError(2013, "Lost connection to the binary log stream")
+        return _SafeConnection(**kwargs)
+
+    def _skip(self) -> None:
+        self.skipped += 1
 
     def start(self) -> None:
         self._thread.start()
@@ -556,7 +608,7 @@ class _BinlogPump:
                     return
                 if event is None or isinstance(event, HeartbeatLogEvent):
                     continue
-                changes = self._convert(event)
+                changes = self._convert(event, self._skip)
                 if changes and not self._put(changes):
                     return
         except Exception as e:  # noqa: BLE001 - surfaced to the stream as a ConnectorError
@@ -589,7 +641,12 @@ class _BinlogPump:
 
 
 def _changes(
-    event: Any, dataset: str, key_fields: list[str], json_cols: set[str], unsigned: dict[str, int]
+    event: Any,
+    dataset: str,
+    key_fields: list[str],
+    json_cols: set[str],
+    unsigned: dict[str, int],
+    on_skip: Callable[[], None],
 ) -> list[Change]:
     ts = float(event.timestamp) if getattr(event, "timestamp", None) else None
 
@@ -605,20 +662,25 @@ def _changes(
     for row in event.rows:
         if isinstance(event, UpdateRowsEvent):
             before, after = rec_of(row["before_values"]), rec_of(row["after_values"])
-            try:
-                key = record_key(after, key_fields)
-            except KeyError:
-                continue
+            old: str | None = None
             with contextlib.suppress(KeyError):
                 old = record_key(before, key_fields)
-                if old != key:
+            try:
+                key = record_key(after, key_fields)
+            except KeyError:  # the row lost its key value: it leaves the map
+                on_skip()
+                if old is not None:
                     out.append(Change(op=ChangeOp.DELETE, dataset=dataset, key=old, record={}, source_ts=ts))
+                continue
+            if old is not None and old != key:  # mapping key changed: drop the old asset
+                out.append(Change(op=ChangeOp.DELETE, dataset=dataset, key=old, record={}, source_ts=ts))
             out.append(Change(op=ChangeOp.UPSERT, dataset=dataset, key=key, record=after, source_ts=ts))
             continue
         rec = rec_of(row["values"])
         try:
             key = record_key(rec, key_fields)
         except KeyError:
+            on_skip()
             continue
         if isinstance(event, DeleteRowsEvent):
             out.append(Change(op=ChangeOp.DELETE, dataset=dataset, key=key, record={}, source_ts=ts))
