@@ -66,7 +66,10 @@ def _out(s: Source) -> SourceOut:
     except secrets_mod.SecretsError:
         # Still list the source so the user can re-enter its password (LIVEOPS-91/41).
         secrets_set, unreadable = {}, True
-        warnings.append("The saved password or token can't be read (the server's secret key changed). Enter it again.")
+        warnings.append(
+            "The saved password or token can't be read because the server's secret key changed. "
+            "Open the source and enter its password again."
+        )
     return SourceOut(
         id=s.id,
         name=s.name,

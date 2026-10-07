@@ -76,7 +76,6 @@ test.describe("after LIVEOPS_SECRET_KEY changes", () => {
   test.afterAll(() => { other?.kill("SIGTERM"); });
 
   test("a source saved with the old key: readable 409 and a way to re-enter the password (LIVEOPS-91)", async ({ page, request }) => {
-    test.fail(true, "LIVEOPS-91: GET /api/sources and /api/sources/{id} return 409, so the edit form never shows");
     const name = `QA key ${tag()}`;
     const src = await createSource(request, { name, type: "postgres", settings: pgSettings(), secrets: { password: env("E2E_RO_PASSWORD") } });
     try {

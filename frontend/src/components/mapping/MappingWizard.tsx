@@ -131,7 +131,9 @@ export function MappingWizard({ sites, sources, connectors, existing, initialSit
     if (poll.trim() === "" || !(pollN >= MIN_POLL_S && pollN <= 3600)) errs.poll = `Enter a number of seconds between ${MIN_POLL_S} and 3600.`;
     const names = extraFields.filter((f) => f.name.trim() || f.column).map((f) => f.name.trim());
     if (extraFields.some((f) => (f.name.trim() === "") !== (f.column === ""))) errs.extra = "Each extra field needs both a name and a column.";
-    else if (names.some((n) => (MAIN_FIELDS as readonly string[]).includes(n) || n === "kind")) errs.extra = "Zone, state, label and kind are set above; use another name.";
+    else if (names.some((n) => (MAIN_FIELDS as readonly string[]).includes(n))) errs.extra = "Zone, state and label are set above; use another name.";
+    // "kind" may come from a column (an extra field) or be one fixed value above, not both (LIVEOPS-32).
+    else if (names.includes("kind") && kind.trim()) errs.extra = "Kind is set to a fixed value above; clear it there to read kind from a column.";
     else if (new Set(names).size !== names.length) errs.extra = "Each extra field name can be used only once.";
     setErrors(errs);
     setServerError(null);
@@ -148,7 +150,10 @@ export function MappingWizard({ sites, sources, connectors, existing, initialSit
         ...Object.fromEntries(extraFields.filter((f) => f.name.trim() && f.column).map((f) => [f.name.trim(), f.column])),
       },
       state_map: Object.fromEntries(
-        Object.entries(stateMap).filter(([raw, to]) => to.trim() && to.trim() !== raw).map(([r, t]) => [r, t.trim()])),
+        Object.entries(stateMap)
+          // Drop blank and no-op entries, but keep identity entries that were already saved (LIVEOPS-32).
+          .filter(([raw, to]) => to.trim() && (to.trim() !== raw || cfg?.state_map?.[raw] === raw))
+          .map(([r, t]) => [r, t.trim()])),
       attributes,
       kind: kind.trim() || null,
     };

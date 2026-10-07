@@ -38,7 +38,6 @@ async function seed(request: APIRequestContext) {
 
 test("edit + save unchanged keeps fields.kind and state_map {free: free} (LIVEOPS-32)", async ({ page, request }) => {
   // Current behaviour (867e295): the save is refused, see LIVEOPS-32 comment.
-  test.fail(true, "LIVEOPS-32: fields.kind is refused by the wizard and {free: free} is dropped");
   const { src, site, m } = await seed(request);
   try {
     await page.goto(`/mapping/${m.id}/edit`);

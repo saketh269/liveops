@@ -74,7 +74,6 @@ test("CSV source: create, upload, map, and see a new file version on the live ma
 
 test("CSV source page lets the user upload a file (LIVEOPS-80)", async ({ page }) => {
   // Known gap: the UI has no file picker; uploads only work through the API.
-  test.fail(true, "LIVEOPS-80: no upload control in the UI");
   await connectCsv(page, `QA CSV UI ${tag()}`);
   await shot(page, "csv-source-page-no-upload");
   await expect(page.locator('input[type="file"]')).toHaveCount(1, { timeout: 3_000 });

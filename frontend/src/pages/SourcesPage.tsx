@@ -1,4 +1,5 @@
 import { useState } from "react";
+import UploadPanel from "../components/sources/UploadPanel";
 import { Link, Route, Routes, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { api } from "../api/client";
 import type { ConnectorSpec, Source } from "../api/types";
@@ -149,6 +150,9 @@ function EditSource() {
       </div>
       {isNew && !saved && <div className="notice info" role="status">Source saved. Testing the connection now.</div>}
       {source.warnings.map((w) => <div key={w} className="notice">{w}</div>)}
+      {source.type === "csv_file" && (
+        <UploadPanel sourceId={source.id} onUploaded={() => setTestKey((k) => k + 1)} />
+      )}
       <TestPanel key={testKey} sourceId={source.id} autoRun={isNew || testKey > 0} />
       <section className="panel stack" aria-labelledby="edit-head">
         <h2 id="edit-head">Edit source</h2>

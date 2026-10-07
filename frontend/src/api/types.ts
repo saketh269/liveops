@@ -36,6 +36,7 @@ export type Source = {
   type: string;
   settings: Record<string, unknown>;
   secrets_set: Record<string, boolean>;
+  secrets_unreadable?: boolean;
   warnings: string[];
   created_ts: number;
   updated_ts: number;
@@ -119,3 +120,6 @@ export type StreamMessage = {
 
 // GET /api/health
 export type AppHealth = { ok: boolean; version: string; portal_db?: "ok" | "unreachable" };
+
+// POST /api/sources/{id}/upload
+export type UploadResult = { dataset: string; bytes: number; rows: number; columns: string[] };

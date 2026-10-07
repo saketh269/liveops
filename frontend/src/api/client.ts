@@ -1,6 +1,6 @@
 import type {
   AppHealth, ConnectorSpec, Dataset, Mapping, MappingConfig, MappingHealth, Site, SiteLayout, Source,
-  SourceRecord, StreamMessage, TestReport,
+  SourceRecord, StreamMessage, TestReport, UploadResult,
 } from "./types";
 
 export class ApiError extends Error {
@@ -47,6 +47,18 @@ export const api = {
   updateSource: (id: string, b: { name?: string; settings?: Record<string, unknown>; secrets?: Record<string, unknown> }) =>
     req<Source>("PUT", `/api/sources/${id}`, b),
   deleteSource: (id: string) => req<void>("DELETE", `/api/sources/${id}`),
+  uploadFile: async (id: string, file: File): Promise<UploadResult> => {
+    const body = new FormData();
+    body.append("file", file, file.name);
+    const res = await fetch(`/api/sources/${id}/upload`, { method: "POST", body });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const d = data?.detail ?? {};
+      const msg = typeof d === "string" ? d : d.message ?? (res.status === 413 ? "The file is too large" : `Upload failed (${res.status})`);
+      throw new ApiError(res.status, msg, d.hint);
+    }
+    return data as UploadResult;
+  },
   testSource: (id: string) => req<TestReport>("POST", `/api/sources/${id}/test`),
   datasets: (id: string) => req<Dataset[]>("GET", `/api/sources/${id}/datasets`),
   preview: (id: string, dataset: string, limit = 20) =>
