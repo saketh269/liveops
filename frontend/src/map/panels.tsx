@@ -28,8 +28,21 @@ export function countAssets(layout: SiteLayout, assets: ReadonlyMap<string, Asse
   return { byState, zones, total: assets.size };
 }
 
-export function KpiPanel({ layout, assets }: { layout: SiteLayout; assets: ReadonlyMap<string, Asset> }) {
-  const { byState, zones, total } = countAssets(layout, assets);
+type KpiProps = {
+  layout: SiteLayout;
+  assets: ReadonlyMap<string, Asset>;
+  /** The floor being shown: the "By zone" table lists only its zones and assets. Totals stay site-wide. */
+  floor?: { name: string; layout: SiteLayout; assets: ReadonlyMap<string, Asset> };
+};
+
+/** Above this many zones, empty ones are left out of the table so busy zones stay visible. */
+const ZONE_TABLE_ALL = 20;
+
+export function KpiPanel({ layout, assets, floor }: KpiProps) {
+  const { byState, total } = countAssets(layout, assets);
+  const all = floor ? countAssets(floor.layout, floor.assets).zones : countAssets(layout, assets).zones;
+  const zones = all.length > ZONE_TABLE_ALL ? all.filter((z) => z.total > 0) : all;
+  const hidden = all.length - zones.length;
   return (
     <section className="panel lm-panel" aria-labelledby="lm-kpi-h">
       <h2 id="lm-kpi-h">Status <span className="muted mono lm-total">{total} assets</span></h2>
@@ -41,8 +54,8 @@ export function KpiPanel({ layout, assets }: { layout: SiteLayout; assets: Reado
           </li>
         ))}
       </ul>
-      <h3 className="lm-sub">By zone</h3>
-      {zones.length === 0 ? (
+      <h3 className="lm-sub">By zone{floor ? <span className="muted"> · {floor.name}</span> : null}</h3>
+      {all.length === 0 ? (
         <p className="muted">No zones yet. Use Edit layout to draw them.</p>
       ) : (
         <table className="lm-zone-table">
@@ -64,6 +77,7 @@ export function KpiPanel({ layout, assets }: { layout: SiteLayout; assets: Reado
           </tbody>
         </table>
       )}
+      {hidden > 0 && <p className="muted lm-small">{hidden} empty zones not listed.</p>}
     </section>
   );
 }

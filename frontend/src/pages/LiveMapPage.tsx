@@ -256,7 +256,7 @@ function SiteMap({ siteId }: { siteId: string }) {
             </div>
           </div>
           <div className="lm-side">
-            <KpiPanel layout={layout} assets={ui.assets} />
+            <KpiPanel layout={layout} assets={ui.assets} floor={floors.length > 1 ? { name: floors.find((f) => f.id === floorId)?.name ?? "", layout: viewLayout, assets: floorAssets } : undefined} />
             <Legend />
             <EventFeed feed={ui.feed} onSelect={select} sourceNames={sourceNames} />
           </div>

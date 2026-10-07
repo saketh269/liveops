@@ -57,15 +57,34 @@ export function floorById(layout: SiteLayout | null | undefined, id: string | nu
   return floorsOf(layout).find((f) => f.id === id);
 }
 
-/** Match a floor by id, then by name (case-insensitive), as used by an asset's `floor` field. */
+/**
+ * Match an asset's `floor` value to a floor: by id, then by name (case-insensitive),
+ * then by number — so a source sending `2` or `"2"` lands on the floor with id "2",
+ * or named "Floor 2" / "Level 2" / "2F".
+ */
 export function resolveFloor(layout: SiteLayout | null | undefined, value: unknown): Floor | undefined {
   if (value === undefined || value === null || value === "") return undefined;
   const floors = floorsOf(layout);
-  const v = String(value);
-  const lv = v.trim().toLowerCase();
-  return floors.find((f) => f.id === v)
+  const v = String(value).trim();
+  const lv = v.toLowerCase();
+  const exact = floors.find((f) => f.id === v)
     ?? floors.find((f) => f.name.trim().toLowerCase() === lv)
     ?? floors.find((f) => f.id.toLowerCase() === lv);
+  if (exact) return exact;
+  const n = floorNumber(v);
+  if (n === null) return undefined;
+  // Not by `level`: levels are often 0-based, so value 1 would land on "Floor 2".
+  return floors.find((f) => floorNumber(f.id) === n) ?? floors.find((f) => floorNumber(f.name) === n);
+}
+
+/** The floor number in "2", "Floor 2", "Level 02", "2F", "L2"; basement "B1" is -1. Null if none. */
+export function floorNumber(text: unknown): number | null {
+  const t = String(text ?? "").trim().toLowerCase();
+  if (!t) return null;
+  const b = /^(?:b|basement\s*|level\s*b|lower\s*level\s*)(\d+)$/.exec(t);
+  if (b) return -Number(b[1]);
+  const m = /^(?:(?:floor|level|lvl|fl|l)\s*-?\s*)?(-?\d+)\s*(?:f|fl|st|nd|rd|th|(?:st|nd|rd|th)?\s*floor)?$/.exec(t);
+  return m ? Number(m[1]) : null;
 }
 
 /** Floor id of a zone or entrance: its `floor_id` if that floor exists, else the first floor. */
