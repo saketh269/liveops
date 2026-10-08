@@ -1,9 +1,9 @@
 // Shared, pure helpers for the HUD cards: what an asset is, where it is, and
 // which feed entries are worth a line in a small card.
 import type { Asset, SiteLayout, Zone } from "../../api/types";
-import { humanize } from "../../components/format";
 import { figureOf, type FigureModel } from "../figures";
 import { resolveZone } from "../placement";
+import { eventText, inSentence, ownStatus, whoName, type EventContext } from "../labels";
 import type { FeedEntry } from "../reducer";
 import { assetName } from "../reducer";
 import { STATE_LABELS, stateKey } from "../stateColors";
@@ -25,11 +25,13 @@ export function zoneOf(layout: SiteLayout, a: Asset): Zone | undefined {
   return resolveZone(layout.zones ?? [], a.zone);
 }
 
-/** The value the source sent for the state (e.g. "boarding"), falling back to the mapped state. */
+/**
+ * The record's own status in words, lower case ("waiting for provider"): the value its
+ * own source sent, never an attached source's (map/labels.ts ownStatus).
+ */
 export function rawStatus(a: Asset): string {
-  const raw = a.attributes?.status;
-  if (typeof raw === "string" && raw) return humanize(raw).toLowerCase();
-  return typeof a.state === "string" && a.state ? humanize(a.state).toLowerCase() : STATE_LABELS[stateKey(a.state)].toLowerCase();
+  const s = ownStatus(a);
+  return s ? inSentence(s) : STATE_LABELS[stateKey(a.state)].toLowerCase();
 }
 
 /** Admitted but still held where they are, waiting for a bed upstairs: the source's own status says "boarding". */
@@ -60,43 +62,54 @@ export function byAgeDesc(now: number) {
   };
 }
 
-/** Fields whose change is worth a line in a small card. */
-const KEY_FIELDS = new Set(["state", "zone", "status", "anchor", "floor", "attributes.status"]);
-
-/** "status a → b, latitude 1 → 2" → ["status a → b", "latitude 1 → 2"] (the server's describe() format). */
-function changeParts(text: string): string[] {
-  return text.split(/, (?=[\w.]+ .*? → )/);
+/** "status a → b, latitude 1 → 2" → [["status","a","b"], …] (the old server describe() format). */
+function legacyChanges(text: string): Record<string, [unknown, unknown]> | null {
+  const out: Record<string, [unknown, unknown]> = {};
+  for (const p of text.split(/, (?=[\w.]+ .*? → )/)) {
+    const m = /^([\w.]+) (.*) → (.*)$/.exec(p);
+    if (!m) return null;
+    const v = (x: string) => (x === "—" || x === "∅" ? null : x);
+    const key = m[1] === "status" ? "attributes.status" : m[1];
+    out[key] = [v(m[2]), v(m[3])];
+  }
+  return Object.keys(out).length ? out : null;
 }
+
+export type HeadlineContext = EventContext & { assets?: ReadonlyMap<string, Asset> };
 
 /**
- * The part of a feed line worth showing in a small card: additions, removals and
- * changes of state, zone, status or anchor. Null for churn such as GPS or badge pings
- * (those stay in the record's fields).
+ * A feed entry as one plain line for a small card: who, and what happened
+ * ("moved from ED Waiting Room to ED-02 · now waiting for provider"). Null for churn
+ * such as GPS or badge pings (those stay in the record's fields).
  */
-export function headline(e: FeedEntry): { name: string | null; what: string } | null {
-  if (e.kind === "added" || e.kind === "removed") return { name: null, what: e.text };
-  let name: string | null = null;
-  let body = e.text;
-  if (e.kind === "change") {
+export function headline(e: FeedEntry, ctx: HeadlineContext = {}): { name: string | null; what: string } | null {
+  const asset = e.assetId ? ctx.assets?.get(e.assetId) : undefined;
+  let changes = e.changes;
+  let removed = e.removed ?? e.kind === "removed";
+  let name: string | null = asset ? whoName(asset) : e.assetId;
+  if (!changes && !removed) {
+    // Lines without structured changes: "<id> <field> a → b, …", "<label>: <field> a → b", "<id> removed".
+    let body = e.text;
     const i = e.text.indexOf(": ");
-    if (i <= 0) return null;
-    name = e.text.slice(0, i);
-    body = e.text.slice(i + 2);
-  } else if (e.assetId && e.text.startsWith(`${e.assetId} `)) {
-    name = e.assetId;
-    body = e.text.slice(e.assetId.length + 1);
-    if (!body.includes(" → ")) return { name, what: body }; // "removed", "no longer in this source"
-  } else {
-    return { name: null, what: e.text };
+    if (e.kind === "added") return { name, what: "was added to the map" };
+    if (e.kind === "change" && i > 0) { body = e.text.slice(i + 2); if (!asset) name = e.text.slice(0, i); }
+    else if (e.assetId && e.text.startsWith(`${e.assetId} `)) body = e.text.slice(e.assetId.length + 1);
+    else return { name: null, what: e.text };
+    if (/^(removed|left the map)/.test(body)) removed = true;
+    else {
+      changes = legacyChanges(body) ?? undefined;
+      if (!changes) return { name, what: body };
+    }
   }
-  const keep = changeParts(body).filter((p) => {
-    const m = /^([\w.]+) (.*) → (.*)$/.exec(p);
-    return m !== null && KEY_FIELDS.has(m[1]) && m[2] !== m[3]; // "anchor — → —" says nothing
-  });
-  return keep.length ? { name, what: keep.join(", ") } : null;
+  if (!asset && changes) {
+    const label = changes.label?.[1] ?? changes.label?.[0];
+    if (typeof label === "string" && label) name = label;
+  }
+  const what = eventText({ changes, removed, source: e.source, assetId: e.assetId }, asset, ctx);
+  return what ? { name, what } : null;
 }
 
-export const isHeadline = (e: FeedEntry) => headline(e) !== null;
+export const isHeadline = (e: FeedEntry, ctx: HeadlineContext = {}) => headline(e, ctx) !== null;
 
 /**
  * Short chip labels for a set of names: drops a prefix every name shares up to a
