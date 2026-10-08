@@ -183,7 +183,7 @@ function EventList({ events, onSelect, empty }: { events: Line[]; onSelect: (id:
 }
 
 /** Fields not listed as facts: identity, and what the header already says. */
-const HIDDEN = new Set(["site_id", "asset_id", "_sources", "attributes", "label", "kind", "updated_ts", "state"]);
+const HIDDEN = new Set(["site_id", "asset_id", "_sources", "_attached", "attributes", "label", "kind", "updated_ts", "state"]); // --- state: _attached (LIVEOPS-116) ---
 
 type Fact = { key: string; label: string; value: string };
 
@@ -222,7 +222,7 @@ const FIRST_FACTS = ["status", "zone", "current_location", "anchor", "bed_id", "
 function rawFacts(a: Asset): Fact[] {
   const show = (v: unknown) => (v === undefined || v === null ? "null" : typeof v === "object" ? JSON.stringify(v) : String(v));
   const out: Fact[] = [];
-  for (const k of Object.keys(a).sort()) if (k !== "_sources" && k !== "attributes") out.push({ key: k, label: k, value: show(a[k]) });
+  for (const k of Object.keys(a).sort()) if (k !== "_sources" && k !== "_attached" && k !== "attributes") out.push({ key: k, label: k, value: show(a[k]) }); // --- state: _attached ---
   for (const [k, v] of Object.entries(a.attributes ?? {}).sort(([x], [y]) => x.localeCompare(y))) out.push({ key: `attributes.${k}`, label: `attributes.${k}`, value: show(v) });
   return out;
 }

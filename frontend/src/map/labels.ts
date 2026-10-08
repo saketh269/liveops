@@ -185,6 +185,24 @@ export function ownSources(a: Asset): Set<string> {
   return out;
 }
 
+// --- state (LIVEOPS-116) ---
+/** One attached mapping's own values, as the server sends them under `_attached`. */
+export type AttachedRecord = { source_id: string; attributes?: Record<string, unknown>; [field: string]: unknown };
+
+/**
+ * Attached mappings' own values (a transport on a patient, a cleaning task on a bed), keyed by
+ * mapping id. The server keeps them apart from the record's own fields, so the merged
+ * `attributes.status` is always the record's own and these still say "Transport: in progress".
+ */
+export function attachedOf(a: Asset | undefined): AttachedRecord[] {
+  const raw = a?._attached;
+  if (!raw || typeof raw !== "object") return [];
+  return Object.values(raw as Record<string, unknown>).filter(
+    (g): g is AttachedRecord => !!g && typeof g === "object" && typeof (g as AttachedRecord).source_id === "string",
+  );
+}
+// --- end state ---
+
 /** Source of one attribute (per-key source, else the whole-attributes source). */
 export function attributeSource(a: Asset, key: string): string | null {
   const s = a._sources ?? {};
@@ -294,6 +312,12 @@ export function attachedSections(a: Asset, sourceNames: Record<string, string>, 
     m[k] = v;
     bySource.set(sid, m);
   }
+  // --- state (LIVEOPS-116): the attached source's own values, including a status the record's own status hides ---
+  for (const g of attachedOf(a)) {
+    if (own.has(g.source_id)) continue;
+    bySource.set(g.source_id, { ...(bySource.get(g.source_id) ?? {}), ...(g.attributes ?? {}) });
+  }
+  // --- end state ---
   const out: AttachedSection[] = [];
   for (const [sid, attrs] of bySource) {
     const title = shortSourceName(sourceNames[sid] ?? "Details");
@@ -363,7 +387,10 @@ export function eventText(e: EventInput, asset: Asset | undefined, ctx: EventCon
     const what = /^[A-Z][a-z]/.test(short) ? short.charAt(0).toLowerCase() + short.slice(1) : short; // "transport", "EVS"
     // Once the attached source is gone the record's own status shows again: that is not the attached source's news.
     const holder = asset ? attributeSource(asset, "status") : null;
-    const st = ch["attributes.status"] && (holder === null || holder === e.source) ? ch["attributes.status"] : undefined;
+    // --- state (LIVEOPS-116): with `_attached` the server records the attached source's own status change ---
+    const ownChange = attachedOf(asset).some((g) => g.source_id === e.source);
+    const st = ch["attributes.status"] && (ownChange || holder === null || holder === e.source) ? ch["attributes.status"] : undefined;
+    // --- end state ---
     if (keys.every((k) => k === "attributes.status" ? !st || st[1] === null : ch[k][1] === null || ch[k][1] === undefined)) return `${what} finished`;
     if (keys.every((k) => ch[k][0] === null || ch[k][0] === undefined) && !st) return `${what} added`;
     if (st && str(st[1])) return `${what} ${statusPhrase(str(st[1])!, null)}`;

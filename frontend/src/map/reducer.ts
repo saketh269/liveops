@@ -35,7 +35,7 @@ export function initialMapState(): MapState {
   return { assets: new Map(), feed: [], serverEvents: false, snapshotReceived: false, lastTs: null, seq: 0 };
 }
 
-const META = new Set(["site_id", "asset_id", "updated_ts", "_sources", "attributes"]);
+const META = new Set(["site_id", "asset_id", "updated_ts", "_sources", "attributes", "_attached"]); // --- state: _attached (LIVEOPS-116) ---
 
 export function assetName(a: Pick<Asset, "asset_id" | "label">): string {
   return typeof a.label === "string" && a.label ? a.label : a.asset_id;
