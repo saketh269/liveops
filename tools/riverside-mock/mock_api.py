@@ -227,7 +227,7 @@ class Hospital:
                 self._new_task(old["bed_id"], "queued")
                 b.update(status="occupied", status_since=t, patient_id=p["patient_id"], updated_at=t)
                 p.update(status="admitted", unit_id=b["unit_id"], bed_id=b["bed_id"], current_location=b["bed_id"], encounter_class="inpatient", updated_at=t)
-            if r.random() < 0.3:
+            if r.random() < 0.3 and len([p for p in self.patients.values() if p["status"] == "waiting_room"]) < 12:
                 self._new_patient("ED", None, "waiting_room")
             # staff move between beds and stations
             for s in r.sample(list(self.staff.values()), k=6):
@@ -247,7 +247,8 @@ class Hospital:
                     a.update(eta_minutes=eta, updated_at=t)
                     if eta == 0:
                         a.update(status="at_hospital_offloading", speed_mph=0, updated_at=t)
-                        self._new_patient("ED", None, "waiting_room")
+                        if len([p for p in self.patients.values() if p["status"] == "waiting_room"]) < 14:
+                            self._new_patient("ED", None, "waiting_room")
                 elif a["status"] == "at_hospital_offloading" and r.random() < 0.15:
                     a.update(status="available", destination=None, eta_minutes=None, updated_at=t)
                 if a["speed_mph"]:
