@@ -1,6 +1,6 @@
 import type {
-  AppHealth, ConnectorSpec, Dataset, Mapping, MappingConfig, MappingHealth, Site, SiteLayout, Source,
-  SourceRecord, StreamMessage, TestReport, UploadResult,
+  AppHealth, ConnectorSpec, Dataset, LayoutImportRequest, LayoutImportResult, Mapping, MappingConfig, MappingHealth, Site, SiteLayout, Source,
+  PlanUpload, SourceRecord, StreamMessage, Suggestion, TestReport, UploadResult,
 } from "./types";
 
 export class ApiError extends Error {
@@ -63,6 +63,8 @@ export const api = {
   datasets: (id: string) => req<Dataset[]>("GET", `/api/sources/${id}/datasets`),
   preview: (id: string, dataset: string, limit = 20) =>
     req<SourceRecord[]>("GET", `/api/sources/${id}/preview?dataset=${encodeURIComponent(dataset)}&limit=${limit}`),
+  suggestions: (id: string, siteId?: string) =>
+    req<Suggestion[]>("GET", `/api/sources/${id}/suggestions${siteId ? `?site_id=${encodeURIComponent(siteId)}` : ""}`),
 
   sites: () => req<Site[]>("GET", "/api/sites"),
   site: (id: string) => req<Site>("GET", `/api/sites/${id}`),
@@ -70,6 +72,22 @@ export const api = {
   updateSite: (id: string, b: { name?: string; template?: string; layout?: SiteLayout }) =>
     req<Site>("PUT", `/api/sites/${id}`, b),
   deleteSite: (id: string) => req<void>("DELETE", `/api/sites/${id}`),
+  uploadPlan: async (siteId: string, file: File): Promise<PlanUpload> => {
+    const body = new FormData();
+    body.append("file", file, file.name);
+    const res = await fetch(`/api/sites/${encodeURIComponent(siteId)}/plans`, { method: "POST", body });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const d = data?.detail ?? {};
+      const msg = typeof d === "string" ? d : d.message ?? (res.status === 413 ? "The file is too large" : `Upload failed (${res.status})`);
+      throw new ApiError(res.status, msg, d.hint);
+    }
+    return data as PlanUpload;
+  },
+  deletePlan: (siteId: string, assetId: string) =>
+    req<void>("DELETE", `/api/sites/${encodeURIComponent(siteId)}/plans/${encodeURIComponent(assetId)}`),
+  importLayout: (siteId: string, b: LayoutImportRequest) =>
+    req<LayoutImportResult>("POST", `/api/sites/${encodeURIComponent(siteId)}/layout/import`, b),
 
   mappings: (siteId?: string) => req<Mapping[]>("GET", `/api/mappings${siteId ? `?site_id=${siteId}` : ""}`),
   createMapping: (b: { site_id: string; source_id: string; dataset: string; config: MappingConfig; options?: Record<string, unknown>; active?: boolean }) =>

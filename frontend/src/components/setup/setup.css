@@ -1,0 +1,15 @@
+/* Set up from a source. Tokens only. */
+.setup-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 12px; }
+.setup-item { display: grid; gap: 8px; border-left: 4px solid var(--line); }
+.setup-item.selected { border-left-color: var(--accent); }
+.setup-item-head { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 8px; }
+.setup-pick { font-size: 0.95rem; font-weight: 600; min-width: 0; }
+.setup-pick .mono { overflow-wrap: anywhere; }
+.setup-pick input { width: 18px; height: 18px; flex: none; }
+.setup-reason, .setup-filter { margin: 0; overflow-wrap: anywhere; }
+.setup-filter { font-size: 0.85rem; }
+.setup-edit { border-top: 1px solid var(--line); padding-top: 10px; }
+.setup-row-out td { color: var(--faint); text-decoration: line-through; }
+.setup-skipped summary { cursor: pointer; font-weight: 600; }
+.setup-skipped ul { margin: 8px 0 0; padding-left: 20px; display: grid; gap: 4px; color: var(--muted); overflow-wrap: anywhere; }
+.setup-actions { position: sticky; bottom: 0; z-index: 1; }

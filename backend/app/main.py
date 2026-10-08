@@ -14,7 +14,7 @@ from sqlalchemy import select
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from app import __version__
-from app.api import mappings, sites, sources, stream, system, uploads, webhooks
+from app.api import layout_import, mappings, plans, sites, sources, stream, system, uploads, webhooks
 from app.api.deps import mapping_spec
 from app.config import get_settings
 from app.core.runner import MappingSpec, RunnerManager
@@ -117,7 +117,7 @@ def create_app() -> FastAPI:
     )
     for r in (system.router, sources.router, sites.router, mappings.router, stream.router):
         app.include_router(r)
-    for r in (webhooks.router, uploads.router):
+    for r in (webhooks.router, uploads.router, plans.router, layout_import.router):  # layout_import: ADR 0007
         app.include_router(r)
     return app
 

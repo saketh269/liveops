@@ -4,12 +4,15 @@ import type { ConnectorSpec, Dataset, Mapping, MappingConfig, Site, Source, Sour
 import { cellText, humanize } from "../format";
 import { ErrorNotice, Loading } from "../ui";
 import { useLoad } from "../useLoad";
+import { FilterEditor, draftsToFilter } from "./FilterEditor";
+import { draftProblem, toDraft, type FilterDraft } from "./filters";
 
 /** States the live map colors (see --state-* tokens). Anything else shows as "unknown". */
 export const MAP_STATES = ["free", "in_use", "cleaning", "alert"];
 /** Mirrors MIN_POLL_INTERVAL_S in backend/app/connectors/base.py. */
 export const MIN_POLL_S = 0.5;
-const MAIN_FIELDS = ["zone", "state", "label"] as const;
+const MAIN_FIELDS = ["zone", "state", "label", "anchor"] as const;
+type MainField = (typeof MAIN_FIELDS)[number];
 type ExtraField = { name: string; column: string };
 
 type Props = {
@@ -59,8 +62,8 @@ export function MappingWizard({ sites, sources, connectors, existing, initialSit
   const [sourceId, setSourceId] = useState(existing?.source_id ?? initialSourceId ?? (sources.length === 1 ? sources[0].id : ""));
   const [dataset, setDataset] = useState(existing?.dataset ?? "");
   const [idField, setIdField] = useState(cfg?.id_field ?? "");
-  const [fields, setFields] = useState<Record<"zone" | "state" | "label", string>>({
-    zone: cfg?.fields.zone ?? "", state: cfg?.fields.state ?? "", label: cfg?.fields.label ?? "",
+  const [fields, setFields] = useState<Record<MainField, string>>({
+    zone: cfg?.fields.zone ?? "", state: cfg?.fields.state ?? "", label: cfg?.fields.label ?? "", anchor: cfg?.fields.anchor ?? "",
   });
   // Any other asset field the config maps (e.g. x, y, cleaning) is kept and editable (LIVEOPS-32).
   const [extraFields, setExtraFields] = useState<ExtraField[]>(() =>
@@ -72,6 +75,7 @@ export function MappingWizard({ sites, sources, connectors, existing, initialSit
   const [stateMap, setStateMap] = useState<Record<string, string>>(cfg?.state_map ?? {});
   const [matchMode, setMatchMode] = useState<"id" | "other">(cfg?.match_key && cfg.match_key !== cfg.id_field ? "other" : "id");
   const [matchKey, setMatchKey] = useState(cfg?.match_key ?? "");
+  const [filters, setFilters] = useState<FilterDraft[]>(() => (cfg?.filter ?? []).map(toDraft));
   const [poll, setPoll] = useState(String(existing?.options?.poll_interval_s ?? 3));
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [serverError, setServerError] = useState<unknown>(null);
@@ -105,12 +109,13 @@ export function MappingWizard({ sites, sources, connectors, existing, initialSit
     const cols = d?.columns.map((c) => c.name) ?? [];
     setIdField(d?.primary_key[0] ?? "");
     const guess = (re: RegExp) => cols.find((c) => re.test(c)) ?? "";
-    setFields({ zone: guess(GUESS.zone), state: guess(GUESS.state), label: guess(GUESS.label) });
+    setFields({ zone: guess(GUESS.zone), state: guess(GUESS.state), label: guess(GUESS.label), anchor: "" });
     setExtraFields([]);
     setAttributes([]);
     setStateMap({});
     setMatchMode("id");
     setMatchKey("");
+    setFilters([]);
   };
 
   const pickSource = (id: string) => {
@@ -131,10 +136,11 @@ export function MappingWizard({ sites, sources, connectors, existing, initialSit
     if (poll.trim() === "" || !(pollN >= MIN_POLL_S && pollN <= 3600)) errs.poll = `Enter a number of seconds between ${MIN_POLL_S} and 3600.`;
     const names = extraFields.filter((f) => f.name.trim() || f.column).map((f) => f.name.trim());
     if (extraFields.some((f) => (f.name.trim() === "") !== (f.column === ""))) errs.extra = "Each extra field needs both a name and a column.";
-    else if (names.some((n) => (MAIN_FIELDS as readonly string[]).includes(n))) errs.extra = "Zone, state and label are set above; use another name.";
+    else if (names.some((n) => (MAIN_FIELDS as readonly string[]).includes(n))) errs.extra = "Zone, state, label and anchor are set above; use another name.";
     // "kind" may come from a column (an extra field) or be one fixed value above, not both (LIVEOPS-32).
     else if (names.includes("kind") && kind.trim()) errs.extra = "Kind is set to a fixed value above; clear it there to read kind from a column.";
     else if (new Set(names).size !== names.length) errs.extra = "Each extra field name can be used only once.";
+    if (filters.some((f) => draftProblem(f, columns))) errs.filter = "Finish or remove the highlighted conditions.";
     setErrors(errs);
     setServerError(null);
     if (Object.keys(errs).length) return;
@@ -157,6 +163,9 @@ export function MappingWizard({ sites, sources, connectors, existing, initialSit
       attributes,
       kind: kind.trim() || null,
     };
+    // Send the filter when there is one, or to clear one that was saved.
+    const filter = draftsToFilter(filters, columns);
+    if (filter.length > 0 || cfg?.filter) config.filter = filter;
     const options = { ...(existing?.options ?? {}), poll_interval_s: pollN };
     setBusy(true);
     try {
@@ -261,7 +270,7 @@ export function MappingWizard({ sites, sources, connectors, existing, initialSit
             <div className="field">
               <label htmlFor="m-zone">Zone</label>
               <ColumnSelect id="m-zone" value={fields.zone} onChange={(v) => setFields({ ...fields, zone: v })} columns={columns} noneLabel="Not mapped" describedBy="m-zone-help" />
-              <span className="help" id="m-zone-help">Which area of the site the asset is in. Values should match zone names in the layout.</span>
+              <span className="help" id="m-zone-help">Which area of the site the asset is in, such as a unit or ward. The live map creates a zone for each value it finds.</span>
             </div>
             <div className="field">
               <label htmlFor="m-state">State</label>
@@ -272,6 +281,11 @@ export function MappingWizard({ sites, sources, connectors, existing, initialSit
               <label htmlFor="m-label">Label</label>
               <ColumnSelect id="m-label" value={fields.label} onChange={(v) => setFields({ ...fields, label: v })} columns={columns} noneLabel="Not mapped" describedBy="m-label-help" />
               <span className="help" id="m-label-help">The name shown next to the asset.</span>
+            </div>
+            <div className="field">
+              <label htmlFor="m-anchor">Anchor</label>
+              <ColumnSelect id="m-anchor" value={fields.anchor} onChange={(v) => setFields({ ...fields, anchor: v })} columns={columns} noneLabel="Not mapped" describedBy="m-anchor-help" />
+              <span className="help" id="m-anchor-help">The ID of another asset this one is drawn at, such as a patient's bed_id.</span>
             </div>
             <div className="field">
               <label htmlFor="m-kind">Kind</label>
@@ -341,6 +355,16 @@ export function MappingWizard({ sites, sources, connectors, existing, initialSit
               </div>
             ))}
           </div>
+        </Step>
+
+        <Step title="Which rows" locked={!hasDataset} lockedText={lockedText}>
+          <p className="muted" style={{ margin: 0 }}>
+            Show only some rows, for example visits that haven't ended or tasks that aren't done. A row that stops
+            matching leaves the map, as if it were deleted.
+          </p>
+          <FilterEditor idPrefix="m" columns={columns} drafts={filters} onChange={setFilters} sample={pv.data ?? undefined}
+            showErrors={!!errors.filter} />
+          {errors.filter && <span className="err" role="alert">{errors.filter}</span>}
         </Step>
 
         <Step title="Match key" locked={!hasDataset} lockedText={lockedText}>

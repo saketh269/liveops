@@ -34,6 +34,12 @@ export function fieldKind(p: JSONSchema): Kind {
 }
 
 const ENUM_LABELS: Record<string, Record<string, string>> = {
+  auth: {
+    none: "None",
+    api_key: "API key (sent as a header)",
+    bearer: "Bearer token",
+    oauth2_client_credentials: "OAuth2 client credentials",
+  },
   encryption: {
     required: "Required (recommended)",
     verify: "Required and verify the server certificate",

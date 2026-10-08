@@ -27,6 +27,10 @@
   --state-alert: #c2392b;
   --state-unknown: #8d9ba2;
 
+  /* Floor plan images: multiplied onto the floor in light; inverted and screened in dark */
+  --plan-invert: 0;
+  --plan-blend: multiply;
+
   --f-display: "Archivo", "Helvetica Neue", Arial, sans-serif;
   --f-body: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
   --f-mono: "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace;
@@ -43,6 +47,7 @@
     --ok-soft: #123326; --warn: #e4ad4f; --warn-soft: #3a2c12; --bad: #f07a6c; --bad-soft: #3d1b18;
     --info: #7aa6f0; --info-soft: #18284a; --state-free: #4cc584; --state-in-use: #7aa6f0;
     --state-cleaning: #e4ad4f; --state-alert: #f07a6c; --state-unknown: #6b7d85; color-scheme: dark;
+    --plan-invert: 1; --plan-blend: screen;
   }
 }
 :root[data-theme="dark"] {
@@ -51,6 +56,7 @@
   --ok-soft: #123326; --warn: #e4ad4f; --warn-soft: #3a2c12; --bad: #f07a6c; --bad-soft: #3d1b18;
   --info: #7aa6f0; --info-soft: #18284a; --state-free: #4cc584; --state-in-use: #7aa6f0;
   --state-cleaning: #e4ad4f; --state-alert: #f07a6c; --state-unknown: #6b7d85; color-scheme: dark;
+  --plan-invert: 1; --plan-blend: screen;
 }
 
 * { box-sizing: border-box; }

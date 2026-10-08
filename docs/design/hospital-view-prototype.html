@@ -1,0 +1,730 @@
+<title>Live Ops Hospital View</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,700&family=Plus+Jakarta+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@500;600&display=swap">
+<style>
+/* Layout: the hospital is the page; glass cards float over it (KPIs top, unit card right, journey bottom). */
+:root {
+  --ground: #e9eef3;
+  --sky-top: #f6f9fc;
+  --ink: #142231;
+  --ink-2: #4a5b6c;
+  --ink-3: #7d8d9c;
+  --glass: rgba(255,255,255,0.86);
+  --glass-line: rgba(20,34,49,0.08);
+  --accent: #0b7a83;
+  --accent-soft: #e0f1f2;
+  --ok: #1f9d68;
+  --ok-soft: #e1f5ec;
+  --warn: #d98b1c;
+  --warn-soft: #fbf0dc;
+  --bad: #e0444b;
+  --bad-soft: #fde6e6;
+  --calm: #6f86a8;
+  --calm-soft: #e8edf5;
+  --f-display: "Bricolage Grotesque", "Segoe UI", system-ui, sans-serif;
+  --f-body: "Plus Jakarta Sans", "Segoe UI", system-ui, sans-serif;
+  --f-data: "IBM Plex Mono", ui-monospace, Menlo, Consolas, monospace;
+  --shadow: 0 10px 30px -12px rgba(20,34,49,0.28), 0 2px 6px rgba(20,34,49,0.06);
+  --r: 14px;
+  color-scheme: light;
+}
+html, body { height: 100%; }
+body { margin: 0; background: radial-gradient(1200px 700px at 30% 0%, var(--sky-top), var(--ground)); color: var(--ink);
+  font: 13px/1.45 var(--f-body); overflow: hidden; }
+#stage { position: fixed; inset: 0; }
+#stage canvas { display: block; outline: none; }
+.mono { font-family: var(--f-data); font-variant-numeric: tabular-nums; }
+.card { background: var(--glass); backdrop-filter: blur(14px) saturate(1.2); -webkit-backdrop-filter: blur(14px) saturate(1.2);
+  border: 1px solid var(--glass-line); border-radius: var(--r); box-shadow: var(--shadow); }
+.ui { position: fixed; z-index: 2; }
+
+/* Top bar */
+#top { top: calc(14px + env(safe-area-inset-top, 0px)); left: 16px; right: 16px; display: flex; gap: 10px; align-items: stretch; pointer-events: none; }
+#top > * { pointer-events: auto; }
+.brand { display: flex; align-items: center; gap: 12px; padding: 10px 14px; flex: none; }
+.mark { width: 30px; height: 30px; border-radius: 9px; background: var(--accent); display: grid; place-items: center; box-shadow: inset 0 -3px 0 rgba(0,0,0,0.15); }
+.mark svg { width: 18px; height: 18px; }
+.brand h1 { font: 700 15px/1.1 var(--f-display); margin: 0; letter-spacing: -0.01em; }
+.brand p { margin: 2px 0 0; color: var(--ink-2); font-size: 11.5px; }
+.live { display: inline-flex; align-items: center; gap: 6px; font: 600 10.5px var(--f-data); color: var(--ok); background: var(--ok-soft); padding: 3px 8px; border-radius: 99px; letter-spacing: 0.04em; }
+.live::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--ok); animation: blink 1.6s infinite; }
+@keyframes blink { 50% { opacity: 0.25; } }
+.kpis { display: flex; gap: 10px; overflow-x: auto; scrollbar-width: none; min-width: 0; flex: 1; }
+.kpi { padding: 9px 14px 10px; min-width: 132px; flex: none; display: grid; gap: 1px; cursor: pointer; text-align: left; font: inherit; color: inherit; }
+.kpi:focus-visible, button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.kpi .lbl { font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.07em; color: var(--ink-3); font-weight: 600; }
+.kpi .val { font: 700 24px/1.05 var(--f-display); letter-spacing: -0.02em; display: flex; align-items: baseline; gap: 6px; }
+.kpi .val small { font: 600 11px var(--f-data); }
+.kpi .sub { font-size: 11px; color: var(--ink-2); white-space: nowrap; }
+.up { color: var(--bad); } .down { color: var(--ok); }
+.kpi.alert { box-shadow: var(--shadow), inset 0 0 0 1.5px color-mix(in srgb, var(--bad) 55%, transparent); }
+.kpi.alert .val { color: var(--bad); }
+.kpi.warn .val { color: var(--warn); }
+
+/* Floor rail */
+#floors { left: 16px; top: 50%; transform: translateY(-50%); padding: 6px; display: grid; gap: 4px; }
+#floors button { width: 40px; height: 34px; border: 0; border-radius: 9px; background: transparent; font: 600 12px var(--f-data); color: var(--ink-2); cursor: pointer; }
+#floors button[aria-pressed="true"] { background: var(--accent); color: #fff; }
+#floors button:disabled { color: var(--ink-3); opacity: 0.55; cursor: not-allowed; }
+#floors .cap { font-size: 9px; text-align: center; color: var(--ink-3); letter-spacing: 0.08em; padding: 2px 0 0; }
+
+/* Right card */
+#side { right: 16px; top: calc(104px + env(safe-area-inset-top, 0px)); width: 318px; max-height: calc(100% - 250px); display: flex; flex-direction: column; }
+#side header { padding: 14px 16px 10px; border-bottom: 1px solid var(--glass-line); }
+#side .eyebrow { font: 600 10px var(--f-data); letter-spacing: 0.09em; color: var(--accent); text-transform: uppercase; }
+#side h2 { font: 700 18px/1.2 var(--f-display); margin: 3px 0 2px; letter-spacing: -0.01em; text-wrap: balance; }
+#side .meta { color: var(--ink-2); font-size: 12px; }
+#sideBody { padding: 12px 16px 14px; overflow-y: auto; display: grid; gap: 14px; }
+.occ { display: grid; gap: 6px; }
+.occ-row { display: flex; justify-content: space-between; font-size: 12px; color: var(--ink-2); }
+.bar { height: 8px; border-radius: 99px; background: var(--calm-soft); display: flex; overflow: hidden; }
+.bar span { height: 100%; }
+.beds { display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px; }
+.bed { border: 0; border-radius: 9px; padding: 6px 4px 5px; font: 600 10.5px var(--f-data); cursor: pointer; display: grid; gap: 1px; text-align: center; color: var(--ink); background: var(--calm-soft); }
+.bed small { font: 500 9.5px var(--f-data); color: var(--ink-2); }
+.bed.available { background: var(--ok-soft); color: var(--ok); }
+.bed.dirty, .bed.cleaning { background: var(--warn-soft); color: #9a5f0c; }
+.bed.boarding { background: var(--bad-soft); color: var(--bad); }
+.bed[aria-pressed="true"] { box-shadow: inset 0 0 0 2px var(--ink); }
+.sec-title { font: 600 10.5px var(--f-body); text-transform: uppercase; letter-spacing: 0.08em; color: var(--ink-3); margin: 0 0 6px; }
+.facts { display: grid; grid-template-columns: auto 1fr; gap: 5px 12px; font-size: 12px; margin: 0; }
+.facts dt { color: var(--ink-3); } .facts dd { margin: 0; font-weight: 600; }
+.chip { display: inline-flex; align-items: center; gap: 6px; padding: 3px 9px; border-radius: 99px; font: 600 11px var(--f-body); }
+.chip::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+.chip.available { background: var(--ok-soft); color: var(--ok); }
+.chip.occupied { background: var(--calm-soft); color: var(--calm); }
+.chip.dirty, .chip.cleaning { background: var(--warn-soft); color: #9a5f0c; }
+.chip.boarding { background: var(--bad-soft); color: var(--bad); }
+.feed { list-style: none; margin: 0; padding: 0; display: grid; gap: 7px; }
+.feed li { display: grid; grid-template-columns: 44px 1fr; gap: 8px; font-size: 12px; animation: slide 0.4s ease-out; }
+.feed time { font: 500 11px var(--f-data); color: var(--ink-3); padding-top: 1px; }
+.feed b { font-weight: 600; }
+@keyframes slide { from { opacity: 0; transform: translateY(-4px); } }
+.btn { border: 1px solid var(--glass-line); background: #fff; border-radius: 9px; padding: 7px 12px; font: 600 12px var(--f-body); cursor: pointer; color: var(--ink); }
+.btn.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+.row { display: flex; gap: 8px; flex-wrap: wrap; }
+
+/* Journey tracker */
+#journey { left: 50%; transform: translateX(-50%); bottom: calc(16px + env(safe-area-inset-bottom, 0px)); width: min(760px, calc(100% - 32px)); padding: 12px 18px 14px; }
+#journey .head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; margin-bottom: 10px; flex-wrap: wrap; }
+#journey .head b { font: 700 14px var(--f-display); }
+#journey .head span { color: var(--ink-2); font-size: 12px; }
+.steps { display: grid; grid-template-columns: repeat(6, 1fr); position: relative; }
+.steps::before { content: ""; position: absolute; left: 8%; right: 8%; top: 13px; height: 3px; background: var(--calm-soft); border-radius: 3px; }
+.steps .fill { position: absolute; left: 8%; top: 13px; height: 3px; background: var(--accent); border-radius: 3px; transition: width 0.6s; }
+.step { display: grid; justify-items: center; gap: 4px; position: relative; text-align: center; }
+.dot { width: 28px; height: 28px; border-radius: 50%; display: grid; place-items: center; background: #fff; border: 2px solid var(--calm-soft); color: var(--ink-3); font: 600 11px var(--f-data); }
+.step.done .dot { background: var(--accent); border-color: var(--accent); color: #fff; }
+.step.now .dot { border-color: var(--accent); color: var(--accent); box-shadow: 0 0 0 5px var(--accent-soft); }
+.step.stuck .dot { border-color: var(--bad); color: var(--bad); box-shadow: 0 0 0 5px var(--bad-soft); }
+.step .t { font: 600 11px var(--f-body); }
+.step .w { font: 500 10.5px var(--f-data); color: var(--ink-3); }
+.step.stuck .w { color: var(--bad); font-weight: 600; }
+
+/* Pins over the 3D world */
+#pins { position: fixed; inset: 0; pointer-events: none; z-index: 1; }
+.pin { position: absolute; transform: translate(-50%, -100%); pointer-events: auto; cursor: pointer; display: grid; justify-items: center; }
+.pin .tag { display: flex; align-items: center; gap: 6px; padding: 4px 9px 4px 6px; border-radius: 99px; font: 600 11px var(--f-body); color: #fff; white-space: nowrap; box-shadow: 0 6px 14px -6px rgba(0,0,0,0.45); }
+.pin .tag i { width: 16px; height: 16px; border-radius: 50%; background: rgba(255,255,255,0.25); display: grid; place-items: center; font: 700 10px var(--f-data); font-style: normal; }
+.pin .stem { width: 2px; height: 14px; }
+.pin.bad .tag, .pin.bad .stem { background: var(--bad); }
+.pin.warn .tag, .pin.warn .stem { background: var(--warn); }
+.pin.info .tag, .pin.info .stem { background: var(--accent); }
+.pin.bad .tag { animation: pulse 2s infinite; }
+@keyframes pulse { 50% { box-shadow: 0 0 0 7px color-mix(in srgb, var(--bad) 22%, transparent); } }
+
+#note { left: 16px; bottom: calc(16px + env(safe-area-inset-bottom, 0px)); padding: 7px 11px; font-size: 11px; color: var(--ink-2); max-width: 230px; }
+#note b { color: var(--ink); }
+
+@media (max-width: 1100px) { #note { display: none; } }
+@media (max-width: 860px) {
+  #side { top: auto; bottom: calc(150px + env(safe-area-inset-bottom, 0px)); right: 16px; left: 16px; width: auto; max-height: 34%; }
+  #floors { top: calc(120px + env(safe-area-inset-top, 0px)); transform: none; }
+  #side header { cursor: pointer; }
+  #side:not(.open) #sideBody { display: none; }
+  #side header::after { content: "Tap for rooms and events"; display: block; font-size: 11px; color: var(--ink-3); margin-top: 2px; }
+  #side.open header::after { content: "Tap to close"; }
+  .brand p { display: none; }
+}
+@media (max-width: 560px) {
+  #top { flex-direction: column; }
+  .brand { align-self: flex-start; }
+  .kpi { min-width: 112px; padding: 7px 11px; }
+  .kpi .val { font-size: 20px; }
+  .steps .t { font-size: 10px; }
+  .step .w { display: none; }
+  #floors { display: none; }
+}
+@media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
+</style>
+
+<div id="stage" aria-label="3D view of the Emergency Department, Floor 1"></div>
+<div id="pins" aria-hidden="true"></div>
+
+<div id="top" class="ui">
+  <div class="brand card">
+    <div class="mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.4" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg></div>
+    <div>
+      <h1>Riverside General</h1>
+      <p>Emergency Department · Floor 1 <span class="live" style="margin-left:6px">LIVE <span id="clock" class="mono"></span></span></p>
+    </div>
+  </div>
+  <div class="kpis" id="kpis"></div>
+</div>
+
+<nav id="floors" class="ui card" aria-label="Floors">
+  <button disabled title="Floor 5 · L&amp;D and Pediatrics">5</button>
+  <button disabled title="Floor 4 · 4 East">4</button>
+  <button disabled title="Floor 3 · 3 West">3</button>
+  <button disabled title="Floor 2 · ICU and Cardiac">2</button>
+  <button aria-pressed="true" title="Floor 1 · Emergency">1</button>
+  <button disabled title="Basement B1">B1</button>
+  <div class="cap">FLOOR</div>
+</nav>
+
+<aside id="side" class="ui card" aria-live="polite">
+  <header>
+    <div class="eyebrow" id="sideEyebrow">Unit</div>
+    <h2 id="sideTitle">Emergency Department</h2>
+    <div class="meta" id="sideMeta"></div>
+  </header>
+  <div id="sideBody"></div>
+</aside>
+
+<section id="journey" class="ui card" aria-label="Patient journey">
+  <div class="head"><b id="jTitle">Patient journey</b><span id="jSub"></span></div>
+  <div class="steps" id="steps"></div>
+</section>
+
+<div id="note" class="ui card"><b>Design prototype.</b> Real Floor 1 layout from your API; activity is simulated to show the look. The full build runs on your live data.</div>
+
+<script src="https://cdn.jsdelivr.net/npm/three@0.147.0/build/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.147.0/examples/js/controls/OrbitControls.js"></script>
+<script>
+(() => {
+"use strict";
+const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
+const C = {
+  slab: 0xf7f9fb, wall: 0xfbfcfd, wallTop: 0x9fb4c8, ground: 0xc9d6cf, road: 0x5b6672, line: 0xf4f6f8,
+  accent: 0x0b7a83, ok: 0x1f9d68, warn: 0xd98b1c, bad: 0xe0444b, calm: 0x8fa3c2,
+  scrubs: 0x2aa3a6, coat: 0xf3f5f8, pants: 0x34507a, gown: 0xa9c6e8, skin: [0xf1c8a8, 0xd9a57f, 0xa8714e, 0x7a4b31, 0xf5d7bd],
+  evs: 0xe6a636, medic: 0xd7463f, bedFrame: 0xb8c4d1, mattress: 0xffffff, sheet: 0xdbe7f5, chair: 0x9bb3c9,
+  tree: 0x6bb38a, trunk: 0x9a7b5f, desk: 0xe8eef4
+};
+
+// ---------- world layout (metres, from /api/floor-layout: ED unit 54 x 26, 20 single rooms) ----------
+const ROOMS = [];
+for (let k = 0; k < 10; k++) ROOMS.push({ id: `ED-${String(k + 1).padStart(2, "0")}`, x: 2 + 5 * k, y: 2, top: true });
+for (let k = 0; k < 10; k++) ROOMS.push({ id: `ED-${String(k + 11).padStart(2, "0")}`, x: 2 + 5 * k, y: 16, top: false });
+const RW = 4.5, RH = 5;
+const CX = 27, CZ = 16; // scene centre
+const P = (x, y, h = 0) => new THREE.Vector3(x - CX, h, y - CZ);
+const LANE_TOP = 8.7, LANE_BOT = 14.3, STATION = { x0: 23.4, x1: 30.6 };
+const roomDoor = (r) => ({ x: r.x + RW - 1, y: r.top ? r.y + RH + 0.4 : r.y - 0.4 });
+const roomBedside = (r) => ({ x: r.x + 0.9, y: r.top ? r.y + 2.6 : r.y + 2.4 });
+const roomBed = (r) => ({ x: r.x + RW / 2 + 0.35, y: r.top ? r.y + 2.3 : r.y + RH - 2.3 });
+const WAIT = { x0: 60, y0: 5, x1: 76, y1: 21 };
+const ELEV = { x: 27, y: 24.2 };
+
+// ---------- three setup ----------
+const stage = document.getElementById("stage");
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.outputEncoding = THREE.sRGBEncoding;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 0.92;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+stage.appendChild(renderer.domElement);
+const scene = new THREE.Scene();
+const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, -200, 400);
+camera.position.set(-16, 44, 52);
+const controls = new THREE.OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true; controls.dampingFactor = 0.08;
+controls.minPolarAngle = 0.35; controls.maxPolarAngle = 1.12;
+controls.minZoom = 0.7; controls.maxZoom = 4;
+controls.screenSpacePanning = true;
+controls.target.set(5, 0, 1); camera.position.add(new THREE.Vector3(5, 0, 1));
+
+scene.add(new THREE.HemisphereLight(0xffffff, 0xaab7c4, 0.62));
+const sun = new THREE.DirectionalLight(0xfff1df, 1.15);
+sun.position.set(-30, 60, 25); sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048);
+Object.assign(sun.shadow.camera, { left: -70, right: 70, top: 50, bottom: -50, near: 1, far: 160 });
+sun.shadow.bias = -0.0006; sun.shadow.radius = 4;
+scene.add(sun);
+
+const mats = new Map();
+const mat = (c, o = {}) => { const k = c + JSON.stringify(o); if (!mats.has(k)) mats.set(k, new THREE.MeshStandardMaterial({ color: c, roughness: 0.75, metalness: 0.02, ...o })); return mats.get(k); };
+const box = (w, h, d, c, x, y, z, o) => { const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat(c, o)); m.position.set(x, y, z); m.castShadow = true; m.receiveShadow = true; scene.add(m); return m; };
+function rounded(w, d, r, h) { const s = new THREE.Shape(); const x = -w / 2, y = -d / 2; s.moveTo(x + r, y); s.lineTo(x + w - r, y); s.quadraticCurveTo(x + w, y, x + w, y + r); s.lineTo(x + w, y + d - r); s.quadraticCurveTo(x + w, y + d, x + w - r, y + d); s.lineTo(x + r, y + d); s.quadraticCurveTo(x, y + d, x, y + d - r); s.lineTo(x, y + r); s.quadraticCurveTo(x, y, x + r, y); const g = new THREE.ExtrudeGeometry(s, { depth: h, bevelEnabled: true, bevelThickness: 0.06, bevelSize: 0.06, bevelSegments: 2 }); g.rotateX(-Math.PI / 2); return g; }
+
+// ground, road, parking
+const ground = new THREE.Mesh(new THREE.PlaneGeometry(400, 300), mat(C.ground));
+ground.rotation.x = -Math.PI / 2; ground.position.y = -0.36; ground.receiveShadow = true; scene.add(ground);
+const road = box(220, 0.06, 6, C.road, 0, -0.32, 36 - CZ); road.castShadow = false;
+for (let x = -100; x < 110; x += 6) { const m = box(2.6, 0.02, 0.22, C.line, x, -0.27, 36 - CZ); m.castShadow = false; }
+const drive = box(7, 0.06, 13, C.road, -11 - CX, -0.32, 27 - CZ); drive.castShadow = false;
+const bayPad = new THREE.Mesh(rounded(14, 13, 0.6, 0.05), mat(0xdfe5ea)); bayPad.position.set(-9.5 - CX, -0.33, 13 - CZ); bayPad.receiveShadow = true; scene.add(bayPad);
+// canopy over ambulance bay
+const canopy = new THREE.Mesh(rounded(12.5, 9, 0.5, 0.25), mat(0xffffff, { transparent: true, opacity: 0.55 })); canopy.position.set(-9.5 - CX, 4.1, 12.5 - CZ); scene.add(canopy);
+[[-15, 8.5], [-4, 8.5], [-15, 16.5], [-4, 16.5]].forEach(([x, y]) => box(0.25, 4.2, 0.25, 0xcfd8e1, x - CX, 2, y - CZ));
+
+// floor slab with painted floor texture
+function floorTexture() {
+  const s = 24, cv = document.createElement("canvas"); cv.width = 54 * s; cv.height = 26 * s;
+  const g = cv.getContext("2d");
+  g.fillStyle = "#eef2f6"; g.fillRect(0, 0, cv.width, cv.height);
+  g.fillStyle = "#dcebee"; g.fillRect(0, 7 * s, 54 * s, 9 * s); // corridor
+  g.strokeStyle = "rgba(20,34,49,0.05)"; g.lineWidth = 1;
+  for (let x = 0; x <= 54; x += 1) { g.beginPath(); g.moveTo(x * s, 0); g.lineTo(x * s, cv.height); g.stroke(); }
+  for (let y = 0; y <= 26; y += 1) { g.beginPath(); g.moveTo(0, y * s); g.lineTo(cv.width, y * s); g.stroke(); }
+  g.strokeStyle = "rgba(11,122,131,0.35)"; g.setLineDash([14, 10]); g.lineWidth = 3;
+  g.beginPath(); g.moveTo(0, 11.5 * s); g.lineTo(23 * s, 11.5 * s); g.moveTo(31 * s, 11.5 * s); g.lineTo(54 * s, 11.5 * s); g.stroke(); g.setLineDash([]);
+  g.font = `600 ${0.62 * s}px IBM Plex Mono, monospace`; g.fillStyle = "rgba(20,34,49,0.55)"; g.textAlign = "center";
+  for (const r of ROOMS) g.fillText(r.id, (r.x + RW / 2) * s, (r.top ? r.y + RH - 0.45 : r.y + 0.95) * s);
+  g.font = `700 ${0.55 * s}px Plus Jakarta Sans, sans-serif`; g.fillStyle = "rgba(11,122,131,0.6)";
+  g.fillText("EMERGENCY DEPARTMENT", 12 * s, 23.6 * s); g.fillText("ELEVATORS", ELEV.x * s, 22.6 * s);
+  const t = new THREE.CanvasTexture(cv); t.encoding = THREE.sRGBEncoding; t.anisotropy = 8; return t;
+}
+const slab = new THREE.Mesh(rounded(55, 27, 0.8, 0.35), mat(0xffffff)); slab.position.set(0, -0.36, 0); slab.receiveShadow = true; scene.add(slab);
+const floorPlane = new THREE.Mesh(new THREE.PlaneGeometry(54, 26), new THREE.MeshStandardMaterial({ map: floorTexture(), roughness: 0.9 }));
+floorPlane.rotation.x = -Math.PI / 2; floorPlane.position.set(0, 0.06, 0); floorPlane.receiveShadow = true; scene.add(floorPlane);
+
+// walls (cut-away height), door gaps on the corridor side
+const WALL_H = 1.55, T = 0.2;
+const wallTopMat = mat(C.wallTop);
+function wall(x0, y0, x1, y1, outer) {
+  const len = Math.hypot(x1 - x0, y1 - y0); if (len < 0.05) return;
+  const m = new THREE.Mesh(new THREE.BoxGeometry(len, WALL_H, T), [mat(C.wall), mat(C.wall), outer ? mat(C.accent) : wallTopMat, mat(C.wall), mat(C.wall), mat(C.wall)]);
+  m.position.copy(P((x0 + x1) / 2, (y0 + y1) / 2, WALL_H / 2)); m.rotation.y = -Math.atan2(y1 - y0, x1 - x0);
+  m.castShadow = true; m.receiveShadow = true; scene.add(m);
+}
+for (const r of ROOMS) {
+  const back = r.top ? r.y : r.y + RH, front = r.top ? r.y + RH : r.y;
+  wall(r.x, back, r.x + RW, back); wall(r.x, r.y, r.x, r.y + RH); wall(r.x + RW, r.y, r.x + RW, r.y + RH);
+  wall(r.x, front, r.x + RW - 1.8, front); // door gap 1.8 m on the right
+}
+// building outline with entrances at both corridor ends and the elevator lobby
+const OUTER = true; wall(0, 0, 54, 0, OUTER); wall(0, 26, 25, 26, OUTER); wall(29, 26, 54, 26, true);
+wall(0, 0, 0, 9.5, true); wall(0, 13.5, 0, 26, true); wall(54, 0, 54, 9.5, true); wall(54, 13.5, 54, 26, true);
+// elevator core
+box(4.2, 2.4, 1.6, 0xdde6ee, ELEV.x - CX, 1.2, 25 - CZ);
+box(1.5, 2, 0.1, 0x9fb3c6, ELEV.x - 1 - CX, 1, 24.15 - CZ); box(1.5, 2, 0.1, 0x9fb3c6, ELEV.x + 1 - CX, 1, 24.15 - CZ);
+
+// nurse station
+const desk = new THREE.Mesh(rounded(6.4, 1.6, 0.7, 0.95), mat(C.desk)); desk.position.copy(P(27, 11.5, 0.06)); desk.castShadow = true; scene.add(desk);
+const deskTop = new THREE.Mesh(rounded(6.8, 2, 0.8, 0.08), mat(C.accent)); deskTop.position.copy(P(27, 11.5, 1.05)); scene.add(deskTop);
+for (const dx of [-2, 0, 2]) { const s = box(0.9, 0.55, 0.06, 0x24384c, dx, 1.55, 11.2 - CZ); s.rotation.x = -0.15; }
+
+// waiting room (separate wing, glass front) + walkway
+const wpad = new THREE.Mesh(rounded(16.5, 16.5, 0.8, 0.3), mat(0xffffff)); wpad.position.copy(P(68, 13, -0.33)); wpad.receiveShadow = true; scene.add(wpad);
+box(6.5, 0.04, 4, 0xdfe7ee, 57 - CX, 0.02, 11.5 - CZ);
+wall(WAIT.x0, WAIT.y0, WAIT.x1, WAIT.y0); wall(WAIT.x1, WAIT.y0, WAIT.x1, WAIT.y1); wall(WAIT.x0, WAIT.y1, WAIT.x1, WAIT.y1);
+wall(WAIT.x0, WAIT.y0, WAIT.x0, 10); wall(WAIT.x0, 13, WAIT.x0, WAIT.y1);
+const SEATS = [];
+for (let row = 0; row < 3; row++) for (let c = 0; c < 6; c++) {
+  const x = 63 + c * 2, y = 9 + row * 3.6; SEATS.push({ x, y, taken: false });
+  box(1.2, 0.45, 1, C.chair, x - CX, 0.3, y - CZ); box(1.2, 0.7, 0.18, C.chair, x - CX, 0.75, y + 0.5 - CZ);
+}
+// trees and planters
+const treeGeo = new THREE.IcosahedronGeometry(1.4, 0), trunkGeo = new THREE.CylinderGeometry(0.16, 0.2, 1.2, 6);
+function tree(x, y, s = 1) { const t = new THREE.Mesh(trunkGeo, mat(C.trunk)); t.position.copy(P(x, y, 0.3)); t.castShadow = true; scene.add(t);
+  const f = new THREE.Mesh(treeGeo, mat(C.tree, { flatShading: true })); f.position.copy(P(x, y, 1.9 * s)); f.scale.setScalar(s); f.castShadow = true; scene.add(f); }
+[[-22, 2], [-20, 24], [-26, 14], [80, 3], [82, 16], [79, 26], [10, 31], [44, 31], [60, 31], [-2, 31]].forEach(([x, y], i) => tree(x, y, 0.8 + (i % 3) * 0.15));
+
+// ---------- models ----------
+const bedGroup = (status) => {
+  const g = new THREE.Group();
+  const pad = new THREE.Mesh(new THREE.BoxGeometry(RW - 0.25, 0.04, RH - 0.25), new THREE.MeshStandardMaterial({ color: C.calm, transparent: true, opacity: 0.35, roughness: 1 }));
+  pad.position.set(-0.35, 0.03, 0); pad.receiveShadow = true; g.add(pad); g.userData.pad = pad;
+  const frame = new THREE.Mesh(rounded(1.2, 2.2, 0.15, 0.32), mat(C.bedFrame)); frame.position.y = 0.32; frame.castShadow = true; g.add(frame);
+  const mattress = new THREE.Mesh(rounded(1.05, 2, 0.2, 0.18), mat(C.mattress)); mattress.position.y = 0.72; mattress.castShadow = true; g.add(mattress);
+  const sheet = new THREE.Mesh(rounded(1.08, 1.15, 0.15, 0.06), mat(C.sheet)); sheet.position.set(0, 0.92, 0.38); g.add(sheet); g.userData.sheet = sheet;
+  const pillow = new THREE.Mesh(rounded(0.75, 0.38, 0.15, 0.12), mat(0xffffff)); pillow.position.set(0, 0.93, -0.72); g.add(pillow);
+  const head = new THREE.Mesh(rounded(1.2, 0.12, 0.05, 0.75), mat(C.bedFrame)); head.position.set(0, 0.32, -1.06); g.add(head);
+  const light = new THREE.Mesh(new THREE.SphereGeometry(0.13, 12, 8), new THREE.MeshStandardMaterial({ color: C.calm, emissive: C.calm, emissiveIntensity: 0.6 }));
+  light.position.set(0.52, 1.2, -1.06); g.add(light); g.userData.light = light;
+  const mon = new THREE.Mesh(rounded(0.55, 0.12, 0.05, 0.4), mat(0x24384c)); mon.position.set(-0.8, 1.15, -0.9); g.add(mon);
+  return g;
+};
+const STATUS_COLOR = { available: C.ok, occupied: C.calm, boarding: C.bad, dirty: C.warn, cleaning: C.warn };
+function paintBed(b) {
+  const c = STATUS_COLOR[b.status]; const { pad, light, sheet } = b.mesh.userData;
+  pad.material.color.setHex(c); pad.material.opacity = b.status === "occupied" ? 0.28 : 0.62;
+  light.material.color.setHex(c); light.material.emissive.setHex(c);
+  sheet.material = mat(b.status === "dirty" ? 0xe9dcc2 : C.sheet);
+}
+
+const cap = new THREE.CapsuleGeometry(0.26, 0.55, 4, 10), headGeo = new THREE.SphereGeometry(0.21, 14, 10), legGeo = new THREE.CapsuleGeometry(0.11, 0.42, 3, 8);
+function person(kind, skinIx = 0) {
+  const g = new THREE.Group();
+  const top = { nurse: C.scrubs, doctor: C.coat, patient: C.gown, evs: C.evs, medic: C.medic }[kind];
+  const legs = { nurse: C.scrubs, doctor: C.pants, patient: C.gown, evs: 0x4a5a6c, medic: 0x2c3442 }[kind];
+  const body = new THREE.Mesh(cap, mat(top)); body.position.y = 0.98; body.castShadow = true; g.add(body);
+  const head = new THREE.Mesh(headGeo, mat(C.skin[skinIx % C.skin.length])); head.position.y = 1.62; head.castShadow = true; g.add(head);
+  const l1 = new THREE.Mesh(legGeo, mat(legs)), l2 = l1.clone(); l1.position.set(-0.11, 0.36, 0); l2.position.set(0.11, 0.36, 0); g.add(l1, l2);
+  g.userData.legs = [l1, l2];
+  if (kind === "doctor") { const st = new THREE.Mesh(new THREE.TorusGeometry(0.17, 0.03, 6, 12, Math.PI), mat(0x24384c)); st.position.set(0, 1.28, 0.2); g.add(st); }
+  if (kind === "nurse") { const cap2 = new THREE.Mesh(new THREE.CylinderGeometry(0.2, 0.22, 0.1, 12), mat(0xffffff)); cap2.position.y = 1.83; g.add(cap2); }
+  if (kind === "evs") { const cart = box(0.6, 0.6, 0.9, 0xf2b84b, 0, 0, 0); scene.remove(cart); cart.position.set(0.55, 0.45, 0.35); g.add(cart); }
+  g.scale.setScalar(1.3);
+  scene.add(g); return g;
+}
+function lyingPatient(skinIx) {
+  const g = new THREE.Group();
+  const body = new THREE.Mesh(cap, mat(C.gown)); body.rotation.x = Math.PI / 2; body.position.set(0, 1.08, 0.1); g.add(body);
+  const head = new THREE.Mesh(headGeo, mat(C.skin[skinIx % C.skin.length])); head.position.set(0, 1.1, -0.65); g.add(head);
+  return g;
+}
+function ambulance() {
+  const g = new THREE.Group();
+  const bodyM = new THREE.Mesh(rounded(2.2, 4.4, 0.25, 1.9), mat(0xffffff)); bodyM.position.set(0, 0.45, 0.4); bodyM.castShadow = true; g.add(bodyM);
+  const cab = new THREE.Mesh(rounded(2.1, 1.6, 0.3, 1.3), mat(0xffffff)); cab.position.set(0, 0.45, -2.3); cab.castShadow = true; g.add(cab);
+  const glass = new THREE.Mesh(rounded(1.9, 0.12, 0.05, 0.6), mat(0x2b3f55, { roughness: 0.2 })); glass.position.set(0, 1.12, -3.12); g.add(glass);
+  const stripe = new THREE.Mesh(new THREE.BoxGeometry(2.24, 0.28, 4.3), mat(C.medic)); stripe.position.set(0, 1.25, 0.4); g.add(stripe);
+  const wheelG = new THREE.CylinderGeometry(0.42, 0.42, 0.3, 14); wheelG.rotateZ(Math.PI / 2);
+  [[-1.05, -2.3], [1.05, -2.3], [-1.05, 1.6], [1.05, 1.6]].forEach(([x, z]) => { const w = new THREE.Mesh(wheelG, mat(0x222a33)); w.position.set(x, 0.42, z); g.add(w); });
+  const lr = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.2, 0.3), new THREE.MeshStandardMaterial({ color: 0xff3b3b, emissive: 0xff2020, emissiveIntensity: 0 }));
+  const lb = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.2, 0.3), new THREE.MeshStandardMaterial({ color: 0x3b7bff, emissive: 0x2060ff, emissiveIntensity: 0 }));
+  lr.position.set(-0.35, 2.45, -1.6); lb.position.set(0.35, 2.45, -1.6); g.add(lr, lb); g.userData.lights = [lr, lb];
+  const cross = new THREE.Mesh(new THREE.BoxGeometry(0.6, 0.02, 0.18), mat(C.medic)); cross.position.set(0, 2.36, 0.9); const cross2 = cross.clone(); cross2.rotation.y = Math.PI / 2; g.add(cross, cross2);
+  scene.add(g); return g;
+}
+
+// ---------- simulation state (prototype only) ----------
+const now = () => performance.now() / 1000;
+const MIN = 60; // displayed minutes per real second is 1 → timers read as minutes:seconds of a compressed clock
+let simT = 0; const clockStart = new Date(); clockStart.setHours(14, 36, 0, 0);
+const fmtClock = (t) => { const d = new Date(clockStart.getTime() + t * 60000); return d.toTimeString().slice(0, 5); };
+const fmtDur = (mins) => mins >= 60 ? `${Math.floor(mins / 60)}h ${String(Math.floor(mins % 60)).padStart(2, "0")}m` : `${Math.floor(mins)}m`;
+
+let pidSeq = 7400180;
+const newPid = () => `P${pidSeq++}`;
+const init = ["occupied","boarding","occupied","boarding","occupied","dirty","occupied","occupied","available","occupied","occupied","dirty","occupied","boarding","occupied","occupied","dirty","occupied","occupied","occupied"];
+const initAge = [42, 312, 95, 236, 18, 52, 130, 64, 0, 21, 88, 37, 156, 187, 9, 71, 24, 112, 49, 33];
+const NURSES = ["Nurse Patel", "Nurse Kim", "Nurse Alvarez", "Nurse Okoro"];
+const beds = ROOMS.map((r, i) => {
+  const b = { room: r, id: r.id, status: init[i], since: -initAge[i], pid: null, esi: 1 + (i * 7) % 5, nurse: NURSES[i % 4] };
+  b.mesh = bedGroup(); const bp = roomBed(r); b.mesh.position.copy(P(bp.x, bp.y, 0.06)); if (!r.top) b.mesh.rotation.y = Math.PI; scene.add(b.mesh);
+  b.mesh.traverse((o) => { o.userData.bedId = b.id; });
+  if (b.status === "occupied" || b.status === "boarding") { b.pid = newPid(); b.lying = lyingPatient(i); b.mesh.add(b.lying); b.journey = journeyFor(b, -initAge[i]); }
+  paintBed(b); return b;
+});
+function journeyFor(b, bedT) {
+  const arrived = bedT - 25 - (b.esi * 6), triage = arrived + 9;
+  const j = { pid: b.pid, arrived, triage, bed: bedT, treat: bedT + 6, admit: b.status === "boarding" ? bedT + 50 : null, left: null };
+  return j;
+}
+
+// agents
+const agents = [];
+class Agent {
+  constructor(mesh, at) { this.mesh = mesh; this.pos = { ...at }; this.path = []; this.speed = 1.45; this.cb = null; this.phase = Math.random() * 6; mesh.position.copy(P(at.x, at.y)); }
+  go(points, cb, speed) { this.path = points.slice(); this.cb = cb || null; if (speed) this.speed = speed; }
+  update(dt) {
+    if (!this.path.length) { this.mesh.userData.legs?.forEach((l) => (l.rotation.x = 0)); return; }
+    const tgt = this.path[0]; const dx = tgt.x - this.pos.x, dy = tgt.y - this.pos.y; const d = Math.hypot(dx, dy);
+    const step = this.speed * dt * (reduced ? 50 : 1);
+    if (d <= step) { this.pos = { ...tgt }; this.path.shift(); if (!this.path.length && this.cb) { const cb = this.cb; this.cb = null; cb(); } }
+    else { this.pos.x += (dx / d) * step; this.pos.y += (dy / d) * step; this.mesh.rotation.y = Math.atan2(dx, dy); }
+    this.phase += dt * 9; const s = Math.sin(this.phase) * 0.5;
+    this.mesh.userData.legs?.forEach((l, i) => (l.rotation.x = i ? s : -s));
+    this.mesh.position.copy(P(this.pos.x, this.pos.y, Math.abs(Math.sin(this.phase)) * 0.05));
+  }
+}
+const laneFor = (y) => (y < 11.5 ? LANE_TOP : LANE_BOT);
+function corridorRoute(from, to) {
+  // from/to are corridor-side points; travel along lanes, switching lanes away from the nurse station
+  const a = laneFor(from.y), b = laneFor(to.y), pts = [{ x: from.x, y: a }];
+  if (a !== b) { const sx = from.x > STATION.x0 && from.x < STATION.x1 ? (from.x < 27 ? STATION.x0 - 0.8 : STATION.x1 + 0.8) : from.x; pts.push({ x: sx, y: a }, { x: sx, y: b }); }
+  pts.push({ x: to.x, y: b }); return pts;
+}
+const LOC = {
+  room: (r) => ({ inside: roomBedside(r), door: roomDoor(r) }),
+  station: (i) => ({ inside: { x: 24.6 + (i % 4) * 1.6, y: i % 2 ? 13.2 : 9.8 }, door: { x: 24.6 + (i % 4) * 1.6, y: i % 2 ? LANE_BOT : LANE_TOP } }),
+  east: { inside: { x: 53.2, y: 11.5 }, door: { x: 52.6, y: 11.5 } },
+  west: { inside: { x: 0.8, y: 11.5 }, door: { x: 1.4, y: 11.5 } },
+  elev: { inside: { x: ELEV.x, y: 23.6 }, door: { x: ELEV.x - 3, y: LANE_BOT } },
+};
+function route(from, to) { return [from.door, ...corridorRoute(from.door, to.door), to.door, to.inside]; }
+const viaEastToWait = (seat) => [{ x: 55, y: 11.5 }, { x: 59, y: 11.5 }, { x: 61.5, y: 11.5 }, { x: 61.5, y: seat.y + 1.4 }, { x: seat.x, y: seat.y + 1.4 }, { x: seat.x, y: seat.y + 0.2 }];
+const waitToEast = (seat) => [{ x: seat.x, y: seat.y + 1.4 }, { x: 61.5, y: seat.y + 1.4 }, { x: 61.5, y: 11.5 }, { x: 55, y: 11.5 }, LOC.east.inside];
+
+// staff
+const staff = [];
+NURSES.forEach((n, i) => { const a = new Agent(person("nurse", i), LOC.station(i).inside); a.name = n; a.home = LOC.station(i); a.kind = "nurse"; a.busyUntil = 2 + i * 3; staff.push(a); agents.push(a); });
+["Dr. Okafor", "Dr. Rao"].forEach((n, i) => { const a = new Agent(person("doctor", i + 2), LOC.station(i + 4).inside); a.name = n; a.home = LOC.station(i + 4); a.kind = "doctor"; a.busyUntil = 5 + i * 6; staff.push(a); agents.push(a); });
+const cleaner = new Agent(person("evs", 1), { x: 51.5, y: 23 }); cleaner.name = "EVS · Marco"; cleaner.homeLoc = { inside: { x: 51.5, y: 23 }, door: { x: 51.5, y: LANE_BOT } }; cleaner.busy = false; agents.push(cleaner);
+const evsCleaner = cleaner;
+
+// waiting patients
+const waiting = [];
+function seatFree() { return SEATS.find((s) => !s.taken); }
+function addWaiting(sitNow, ambulance) {
+  const seat = seatFree(); if (!seat) return null; seat.taken = true;
+  const w = { pid: newPid(), seat, arrived: simT, esi: 2 + Math.floor(Math.random() * 3), ambulance: !!ambulance };
+  w.agent = new Agent(person("patient", Math.floor(Math.random() * 5)), sitNow ? { x: seat.x, y: seat.y + 0.2 } : { x: 59, y: 30 });
+  agents.push(w.agent); waiting.push(w);
+  if (!sitNow) w.agent.go([{ x: 59, y: 24 }, { x: 59, y: 11.5 }, ...viaEastToWait(seat).slice(2)], () => (w.agent.mesh.rotation.y = Math.PI));
+  return w;
+}
+for (let i = 0; i < 7; i++) { const w = addWaiting(true); w.arrived = -(8 + i * 11); }
+
+// events
+const feed = [];
+function event(html) { feed.unshift({ t: simT, html }); if (feed.length > 6) feed.pop(); renderSide(); }
+
+// ---------- behaviours ----------
+function setBed(b, status) { b.status = status; b.since = simT; paintBed(b); if (b.flash !== undefined) b.flash = 1; renderAll(); }
+function cleanNext() {
+  if (evsCleaner.busy) return;
+  const dirty = beds.filter((b) => b.status === "dirty").sort((a, c) => a.since - c.since)[0]; if (!dirty) return;
+  evsCleaner.busy = true; const loc = LOC.room(dirty.room);
+  event(`<b>${evsCleaner.name}</b> heading to <b>${dirty.id}</b> (dirty ${fmtDur(simT - dirty.since)})`);
+  evsCleaner.go(route(evsCleaner.homeLoc, loc), () => {
+    const dirtyFor = simT - dirty.since; setBed(dirty, "cleaning");
+    setTimeout(() => {
+      setBed(dirty, "available"); dirty.flashUntil = now() + 2.5;
+      event(`<b>${dirty.id}</b> is clean · dirty-to-clean <b>${fmtDur(dirtyFor + 6)}</b>`);
+      evsCleaner.go(route(loc, evsCleaner.homeLoc), () => { evsCleaner.busy = false; });
+      setTimeout(() => assignFromWaiting(dirty), 2200);
+    }, 6000);
+  });
+}
+function assignFromWaiting(b) {
+  if (b.status !== "available") return;
+  const w = waiting.sort((a, c) => a.esi - c.esi || a.arrived - c.arrived)[0]; if (!w) return;
+  waiting.splice(waiting.indexOf(w), 1); w.seat.taken = false; b.status = "reserved"; b.pid = w.pid;
+  event(`<b>${w.pid}</b> (ESI ${w.esi}) assigned to <b>${b.id}</b> after ${fmtDur(simT - w.arrived)} waiting`);
+  const loc = LOC.room(b.room);
+  w.agent.go([...waitToEast(w.seat), ...route(LOC.east, loc).slice(1)], () => {
+    scene.remove(w.agent.mesh); agents.splice(agents.indexOf(w.agent), 1);
+    b.esi = w.esi; b.lying = lyingPatient(3); b.mesh.add(b.lying); b.journey = { pid: w.pid, arrived: w.arrived, triage: w.arrived + 9, bed: simT, treat: simT + 6, admit: null, left: null };
+    setBed(b, "occupied"); if (selected?.id === b.id || followPid === w.pid) select(b);
+  });
+  renderAll();
+}
+function dischargeOne() {
+  const occ = beds.filter((b) => b.status === "occupied" && simT - b.since > 40); if (!occ.length) return;
+  const b = occ[Math.floor(Math.random() * occ.length)]; leaveBed(b, LOC.east, `<b>${b.pid}</b> discharged home from <b>${b.id}</b>`);
+}
+function boardUp() {
+  const bd = beds.filter((b) => b.status === "boarding").sort((a, c) => a.since - c.since)[0]; if (!bd) return;
+  leaveBed(bd, LOC.elev, `<b>${bd.pid}</b> went upstairs to <b>3W-305B</b> after boarding <b>${fmtDur(simT - bd.since)}</b>`);
+}
+function admitDecision() {
+  const occ = beds.filter((b) => b.status === "occupied" && simT - b.since > 30); if (!occ.length) return;
+  const b = occ[0]; b.journey && (b.journey.admit = simT); setBed(b, "boarding");
+  event(`<b>${b.pid}</b> in <b>${b.id}</b>: admit decision · waiting for an inpatient bed`);
+}
+function leaveBed(b, dest, msg) {
+  if (b.lying) { b.mesh.remove(b.lying); b.lying = null; }
+  const loc = LOC.room(b.room); const a = new Agent(person("patient", 2), loc.inside); agents.push(a);
+  const pid = b.pid; b.pid = null; b.journey && (b.journey.left = simT); setBed(b, "dirty"); event(msg);
+  a.go(route(loc, dest), () => { scene.remove(a.mesh); agents.splice(agents.indexOf(a), 1); });
+  if (dest === LOC.east) a.go([...route(loc, dest), { x: 59, y: 11.5 }, { x: 59, y: 32 }], () => { scene.remove(a.mesh); agents.splice(agents.indexOf(a), 1); });
+  setTimeout(cleanNext, 1500); return pid;
+}
+function staffTick() {
+  for (const s of staff) {
+    if (s.path.length || simT < s.busyUntil) continue;
+    if (s.atRoom) { const from = LOC.room(s.atRoom.room); s.go(route(from, s.home)); s.atRoom = null; s.busyUntil = simT + 4 + Math.random() * 5; continue; }
+    const pool = beds.filter((b) => b.status === "occupied" || b.status === "boarding");
+    const b = pool[Math.floor(Math.random() * pool.length)]; if (!b) continue;
+    s.go(route(s.home, LOC.room(b.room)), () => { s.mesh.rotation.y = 0; }); s.atRoom = b; s.busyUntil = simT + 14 + Math.random() * 8;
+  }
+}
+
+// ambulance
+const amb = ambulance(); let ambState = { phase: "away", t: 0, eta: 9 };
+amb.position.copy(P(-120, 34.5)); amb.rotation.y = Math.PI / 2;
+function ambulanceTick(dt) {
+  const s = ambState; s.t += dt;
+  const lights = amb.userData.lights; const on = s.phase === "inbound" || s.phase === "arrive";
+  lights[0].material.emissiveIntensity = on ? (Math.sin(now() * 14) > 0 ? 2.2 : 0) : 0; lights[1].material.emissiveIntensity = on ? (Math.sin(now() * 14) > 0 ? 0 : 2.2) : 0;
+  if (s.phase === "away" && s.t > 22) { s.phase = "inbound"; s.t = 0; s.eta = 9; event(`<b>Medic 7</b> inbound · chest pain · ETA <b>9 min</b>`); }
+  if (s.phase === "inbound") {
+    s.eta = Math.max(0, 9 - s.t); const k = Math.min(1, s.t / 9);
+    if (k < 0.75) { const x = -120 + (-11 + 120) * (k / 0.75); amb.position.copy(P(x, 34.5)); amb.rotation.y = Math.PI / 2; }
+    else { const k2 = (k - 0.75) / 0.25; amb.position.copy(P(-11, 34.5 - (34.5 - 14) * k2)); amb.rotation.y = Math.PI; }
+    if (k >= 1) { s.phase = "arrive"; s.t = 0; event(`<b>Medic 7</b> arrived at the ambulance bay · handover started`); unloadAmbulance(); }
+  }
+  if (s.phase === "arrive" && s.t > 16) { s.phase = "leave"; s.t = 0; event(`<b>Medic 7</b> handover done in <b>16 min</b> · back in service`); }
+  if (s.phase === "leave") { const k = Math.min(1, s.t / 6); amb.position.copy(P(-11, 14 + (34.5 - 14) * Math.min(1, k * 2))); if (k > 0.5) { amb.rotation.y = -Math.PI / 2; amb.position.copy(P(-11 - (k - 0.5) * 2 * 110, 34.5)); } if (k >= 1) { s.phase = "away"; s.t = 0; } }
+}
+function unloadAmbulance() {
+  const medic = new Agent(person("medic", 1), { x: -9, y: 12 }); const pt = new Agent(person("patient", 4), { x: -10, y: 12.4 }); agents.push(medic, pt);
+  const free = beds.find((b) => b.status === "available");
+  const path = [{ x: -4, y: 11.5 }, LOC.west.inside, ...(free ? route(LOC.west, LOC.room(free.room)).slice(1) : [LOC.west.door, { x: 3, y: LANE_TOP }])];
+  if (free) { free.status = "reserved"; }
+  pt.go(path, () => {
+    scene.remove(pt.mesh); agents.splice(agents.indexOf(pt), 1);
+    if (free) { free.pid = newPid(); free.esi = 2; free.lying = lyingPatient(4); free.mesh.add(free.lying); free.journey = { pid: free.pid, arrived: simT - 2, triage: simT - 1, bed: simT, treat: simT + 4, admit: null, left: null }; setBed(free, "occupied"); }
+    else { hallway += 1; event(`No free ED bed: Medic 7 patient on a <b>hallway stretcher</b>`); renderAll(); }
+  }, 1.2);
+  medic.go([{ x: -4, y: 11.5 }, LOC.west.inside, { x: 3, y: LANE_TOP }], () => setTimeout(() => medic.go([LOC.west.inside, { x: -9, y: 12 }], () => { scene.remove(medic.mesh); agents.splice(agents.indexOf(medic), 1); }), 3000), 1.2);
+}
+let hallway = 0;
+
+// ---------- selection, pins, UI ----------
+let selected = null, followPid = null;
+const raycaster = new THREE.Raycaster(), mouse = new THREE.Vector2();
+renderer.domElement.addEventListener("pointerup", (e) => {
+  if (e.button !== 0 || dragMoved) return;
+  const r = renderer.domElement.getBoundingClientRect(); mouse.set(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
+  raycaster.setFromCamera(mouse, camera);
+  const hit = raycaster.intersectObjects(beds.map((b) => b.mesh), true)[0];
+  if (hit) select(beds.find((b) => b.id === hit.object.userData.bedId)); else select(null);
+});
+let dragMoved = false, downAt = null;
+renderer.domElement.addEventListener("pointerdown", (e) => { downAt = [e.clientX, e.clientY]; dragMoved = false; });
+renderer.domElement.addEventListener("pointermove", (e) => { if (downAt && Math.hypot(e.clientX - downAt[0], e.clientY - downAt[1]) > 5) dragMoved = true; });
+
+let flyTo = null;
+function select(b) {
+  selected = b; followPid = b?.pid ?? null;
+  if (b) { const p = P(roomBed(b.room).x, roomBed(b.room).y); flyTo = { target: p, zoom: 2.2 }; }
+  renderAll();
+}
+
+const $ = (id) => document.getElementById(id);
+const pinsEl = $("pins");
+function pinList() {
+  const out = [];
+  for (const b of beds) {
+    const mins = simT - b.since;
+    if (b.status === "boarding" && mins > 120) out.push({ key: b.id, cls: "bad", icon: "!", text: `${b.id} boarding ${fmtDur(mins)}`, at: P(roomBed(b.room).x, roomBed(b.room).y, 2.6), bed: b });
+    else if (b.status === "dirty" && mins > 30) out.push({ key: b.id, cls: "warn", icon: "◷", text: `${b.id} dirty ${fmtDur(mins)}`, at: P(roomBed(b.room).x, roomBed(b.room).y, 2.4), bed: b });
+  }
+  if (waiting.length >= 8) out.push({ key: "wait", cls: "bad", icon: waiting.length, text: `Waiting room · longest ${fmtDur(Math.max(...waiting.map((w) => simT - w.arrived)))}`, at: P(68, 6, 3.2) });
+  else out.push({ key: "wait", cls: "info", icon: waiting.length, text: `Waiting room · longest ${waiting.length ? fmtDur(Math.max(...waiting.map((w) => simT - w.arrived))) : "—"}`, at: P(68, 6, 3.2) });
+  if (ambState.phase === "inbound") out.push({ key: "amb", cls: "bad", icon: "+", text: `Medic 7 · ETA ${Math.ceil(ambState.eta)} min`, at: amb.position.clone().add(new THREE.Vector3(0, 3.6, 0)) });
+  if (ambState.phase === "arrive") out.push({ key: "amb", cls: "warn", icon: "◷", text: `Handover ${Math.floor(ambState.t)} min`, at: amb.position.clone().add(new THREE.Vector3(0, 3.6, 0)) });
+  return out;
+}
+const pinEls = new Map();
+function drawPins() {
+  const list = pinList(), seen = new Set(), w = innerWidth, h = innerHeight;
+  for (const p of list) {
+    seen.add(p.key); let el = pinEls.get(p.key);
+    if (!el) { el = document.createElement("div"); el.className = "pin"; el.innerHTML = `<div class="tag"><i></i><span></span></div><div class="stem"></div>`; pinsEl.appendChild(el); pinEls.set(p.key, el);
+      el.addEventListener("click", () => { const b = beds.find((x) => x.id === el.dataset.bed); if (b) select(b); else if (el.dataset.key === "amb") flyTo = { target: amb.position.clone(), zoom: 2 }; else flyTo = { target: P(68, 13), zoom: 2 }; }); }
+    el.className = `pin ${p.cls}`; el.dataset.bed = p.bed?.id ?? ""; el.dataset.key = p.key;
+    el.querySelector("i").textContent = p.icon; el.querySelector("span").textContent = p.text;
+    const v = p.at.clone().project(camera); el.style.left = `${((v.x + 1) / 2) * w}px`; el.style.top = `${((1 - v.y) / 2) * h}px`;
+  }
+  for (const [k, el] of pinEls) if (!seen.has(k)) { el.remove(); pinEls.delete(k); }
+}
+
+let lastKpi = "";
+function kpis() {
+  const boarding = beds.filter((b) => b.status === "boarding"), dirty = beds.filter((b) => b.status === "dirty" || b.status === "cleaning");
+  const occ = beds.filter((b) => ["occupied", "boarding", "reserved"].includes(b.status)).length + hallway;
+  const longestB = boarding.length ? Math.max(...boarding.map((b) => simT - b.since)) : 0;
+  const longestD = dirty.length ? Math.max(...dirty.map((b) => simT - b.since)) : 0;
+  const lw = waiting.length ? Math.max(...waiting.map((w) => simT - w.arrived)) : 0;
+  const tiles = [
+    { k: "wait", lbl: "ED waiting", val: waiting.length, sub: `longest ${fmtDur(lw)}`, cls: waiting.length >= 8 ? "alert" : "" },
+    { k: "board", lbl: "Boarding", val: boarding.length, sub: `longest ${fmtDur(longestB)}`, cls: longestB > 240 ? "alert" : boarding.length ? "warn" : "" },
+    { k: "dirty", lbl: "Dirty beds", val: dirty.length, sub: dirty.length ? `oldest ${fmtDur(longestD)}` : "all clean", cls: longestD > 45 ? "warn" : "" },
+    { k: "amb", lbl: "Ambulances", val: ambState.phase === "inbound" ? 1 : 0, sub: ambState.phase === "inbound" ? `ETA ${Math.ceil(ambState.eta)} min` : ambState.phase === "arrive" ? "1 at the bay" : "none inbound", cls: ambState.phase === "inbound" ? "alert" : "" },
+    { k: "occ", lbl: "ED beds used", val: `${occ}<small class="mono">/ 20</small>`, sub: hallway ? `${hallway} on hallway stretchers` : `${Math.round((occ / 20) * 100)}% full`, cls: occ >= 20 ? "alert" : "" },
+  ];
+  const html = tiles.map((t) => `<button class="kpi card ${t.cls}" data-k="${t.k}"><span class="lbl">${t.lbl}</span><span class="val">${t.val}</span><span class="sub">${t.sub}</span></button>`).join("");
+  if (html !== lastKpi) { $("kpis").innerHTML = html; lastKpi = html; }
+}
+$("kpis").addEventListener("click", (e) => {
+  const k = e.target.closest(".kpi")?.dataset.k;
+  if (k === "board") select(beds.filter((b) => b.status === "boarding").sort((a, c) => a.since - c.since)[0] ?? null);
+  if (k === "dirty") select(beds.filter((b) => b.status === "dirty").sort((a, c) => a.since - c.since)[0] ?? null);
+  if (k === "wait") flyTo = { target: P(68, 13), zoom: 2 };
+  if (k === "amb") flyTo = { target: amb.position.clone(), zoom: 1.8 };
+  if (k === "occ") { select(null); flyTo = { target: new THREE.Vector3(5, 0, 1), zoom: 1.08 }; }
+});
+
+const LABEL = { available: "Ready", occupied: "Occupied", boarding: "Boarding", dirty: "Dirty", cleaning: "Cleaning", reserved: "Assigned" };
+function renderSide() {
+  const body = $("sideBody");
+  const feedHtml = `<div><h3 class="sec-title">Live events</h3><ol class="feed">${feed.map((f) => `<li><time>${fmtClock(f.t)}</time><span>${f.html}</span></li>`).join("")}</ol></div>`;
+  if (!selected) {
+    const c = (s) => beds.filter((b) => b.status === s).length;
+    const occ = c("occupied") + c("reserved"), bo = c("boarding"), di = c("dirty") + c("cleaning"), av = c("available");
+    $("sideEyebrow").textContent = "Unit · Floor 1"; $("sideTitle").textContent = "Emergency Department";
+    $("sideMeta").textContent = `20 rooms · ${NURSES.length} nurses, 2 physicians on shift`;
+    body.innerHTML = `<div class="occ"><div class="occ-row"><span>Bed status</span><span class="mono">${occ + bo}/20 in use</span></div>
+      <div class="bar" role="img" aria-label="${occ} occupied, ${bo} boarding, ${di} dirty or cleaning, ${av} ready">
+      <span style="width:${occ * 5}%;background:var(--calm)"></span><span style="width:${bo * 5}%;background:var(--bad)"></span><span style="width:${di * 5}%;background:var(--warn)"></span><span style="width:${av * 5}%;background:var(--ok)"></span></div></div>
+      <div><h3 class="sec-title">Rooms</h3><div class="beds">${beds.map((b) => `<button class="bed ${b.status === "reserved" ? "available" : b.status}" data-bed="${b.id}" aria-pressed="false">${b.id.slice(3)}<small>${["dirty", "boarding", "cleaning"].includes(b.status) ? fmtDur(simT - b.since) : LABEL[b.status]}</small></button>`).join("")}</div></div>${feedHtml}`;
+  } else {
+    const b = selected; const mins = simT - b.since;
+    $("sideEyebrow").textContent = "Room · Emergency"; $("sideTitle").textContent = b.id;
+    $("sideMeta").innerHTML = `<span class="chip ${b.status === "reserved" ? "available" : b.status}">${LABEL[b.status]} · ${fmtDur(mins)}</span>`;
+    body.innerHTML = `<dl class="facts">
+      <dt>Patient</dt><dd class="mono">${b.pid ?? "—"}</dd>
+      <dt>Acuity</dt><dd>${b.pid ? `ESI ${b.esi}` : "—"}</dd>
+      <dt>Nurse</dt><dd>${b.nurse}</dd>
+      <dt>Cleaning</dt><dd>${b.status === "cleaning" ? "In progress · Marco" : b.status === "dirty" ? (evsCleaner.busy ? "Queued" : "Assigned · Marco") : "—"}</dd>
+      <dt>Source</dt><dd>Beds · Patients · EVS</dd></dl>
+      <div class="row"><button class="btn primary" id="followBtn">Follow patient</button><button class="btn" id="backBtn">Back to unit</button></div>${feedHtml}`;
+    $("backBtn").onclick = () => { select(null); flyTo = { target: new THREE.Vector3(5, 0, 1), zoom: 1.08 }; };
+    $("followBtn").onclick = () => { followPid = b.pid; flyTo = { target: P(roomBed(b.room).x, roomBed(b.room).y), zoom: 2.6 }; };
+  }
+}
+document.querySelector("#side header").addEventListener("click", () => $("side").classList.toggle("open"));
+$("sideBody").addEventListener("click", (e) => { const id = e.target.closest(".bed")?.dataset.bed; if (id) select(beds.find((b) => b.id === id)); });
+
+function renderJourney() {
+  const b = selected?.journey ? selected : beds.filter((x) => x.status === "boarding").sort((a, c) => a.since - c.since)[0];
+  if (!b || !b.journey) { $("jTitle").textContent = "Patient journey"; $("jSub").textContent = "Select a room to follow a patient"; $("steps").innerHTML = ""; return; }
+  const j = b.journey;
+  $("jTitle").innerHTML = `Patient journey · <span class="mono">${j.pid}</span>`;
+  $("jSub").textContent = `${b.id} · ESI ${b.esi} · ${selected ? "selected" : "longest boarder"}`;
+  const st = [
+    { t: "Arrived", at: j.arrived }, { t: "Triage", at: j.triage }, { t: "ED bed", at: j.bed },
+    { t: "In treatment", at: simT >= j.treat ? j.treat : null }, { t: "Admit decision", at: j.admit }, { t: "Inpatient bed", at: j.left },
+  ];
+  let cur = st.findIndex((s) => s.at === null); if (cur < 0) cur = st.length;
+  const stuck = b.status === "boarding" && cur === 5 && simT - b.since > 120;
+  const fillPct = cur === 0 ? 0 : (84 * Math.min(cur, st.length - 1)) / (st.length - 1);
+  $("steps").innerHTML = `<div class="fill" style="width:${fillPct}%"></div>` + st.map((s, i) => {
+    const cls = i < cur ? "done" : i === cur ? (stuck ? "stuck" : "now") : "";
+    const when = s.at !== null ? fmtClock(s.at) : i === cur ? (stuck ? `waiting ${fmtDur(simT - b.since)}` : "next") : "";
+    return `<div class="step ${cls}"><div class="dot">${i < cur ? "✓" : i + 1}</div><div class="t">${s.t}</div><div class="w">${when}</div></div>`;
+  }).join("");
+}
+function renderAll() { kpis(); renderSide(); renderJourney(); }
+
+// ---------- loop ----------
+function resize() {
+  const w = innerWidth, h = innerHeight, aspect = w / h; renderer.setSize(w, h);
+  let halfH = 24, halfW = halfH * aspect;
+  if (aspect < 1.2) { halfW = 34; halfH = halfW / aspect; }
+  camera.left = -halfW; camera.right = halfW; camera.top = halfH; camera.bottom = -halfH; camera.updateProjectionMatrix();
+}
+addEventListener("resize", resize); resize();
+camera.zoom = 1.08; camera.updateProjectionMatrix();
+
+let last = now(), uiAcc = 0, timers = { clean: 4, dis: 11, board: 37, admit: 26, walkin: 9 };
+function tick() {
+  const t = now(), dt = Math.min(0.25, t - last); last = t; simT += dt; // 1 real second = 1 simulated minute
+  timers.clean -= dt; timers.dis -= dt; timers.board -= dt; timers.admit -= dt; timers.walkin -= dt;
+  if (timers.clean <= 0) { cleanNext(); timers.clean = 8; }
+  if (timers.dis <= 0) { dischargeOne(); timers.dis = 24 + Math.random() * 10; }
+  if (timers.board <= 0) { boardUp(); timers.board = 55 + Math.random() * 15; }
+  if (timers.admit <= 0) { admitDecision(); timers.admit = 40 + Math.random() * 12; }
+  if (timers.walkin <= 0) { const w = addWaiting(false); if (w) event(`<b>${w.pid}</b> walked in · triage ESI ${w.esi}`); timers.walkin = 14 + Math.random() * 10; }
+  for (const b of beds) { if (b.status === "available") { const k = b.flashUntil && t < b.flashUntil ? 0.5 + 0.4 * Math.sin(t * 10) : 0.45; b.mesh.userData.pad.material.opacity = k + 0.15; }
+    if (b.status === "boarding") b.mesh.userData.light.material.emissiveIntensity = 0.6 + 0.6 * Math.abs(Math.sin(t * 3)); }
+  staffTick(); ambulanceTick(dt);
+  for (const a of agents) a.update(dt);
+  if (flyTo) { const before = controls.target.clone(); controls.target.lerp(flyTo.target, 0.08); camera.position.add(controls.target.clone().sub(before)); camera.zoom += (flyTo.zoom - camera.zoom) * 0.08; camera.updateProjectionMatrix(); if (controls.target.distanceTo(flyTo.target) < 0.05 && Math.abs(camera.zoom - flyTo.zoom) < 0.01) flyTo = null; }
+  controls.update(); renderer.render(scene, camera); drawPins();
+  uiAcc += dt; if (uiAcc > 0.5) { uiAcc = 0; $("clock").textContent = fmtClock(simT); kpis(); renderJourney(); if (!document.activeElement?.closest?.("#side")) renderSide(); }
+  requestAnimationFrame(tick);
+}
+event(`Showing <b>Floor 1 · Emergency</b> · 20 rooms, live`);
+renderAll(); requestAnimationFrame(tick);
+})();
+</script>

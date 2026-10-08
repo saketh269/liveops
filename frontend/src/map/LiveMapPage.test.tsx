@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import type { Site, StreamMessage } from "../api/types";
 
@@ -9,6 +9,7 @@ const site: Site = {
 let push: ((m: StreamMessage) => void) | null = null;
 let status: ((s: "open" | "closed") => void) | undefined;
 const updateSite = vi.fn();
+let mappingsList: unknown[] = [];
 
 vi.mock("../api/client", () => ({
   ApiError: class extends Error { status = 500; },
@@ -16,6 +17,7 @@ vi.mock("../api/client", () => ({
     sites: () => Promise.resolve([site]),
     site: () => Promise.resolve(site),
     sources: () => Promise.resolve([{ id: "src", name: "Hospital EHR" }]),
+    mappings: () => Promise.resolve(mappingsList),
     updateSite: (...args: unknown[]) => updateSite(...args),
   },
   openSiteStream: (_id: string, onMessage: (m: StreamMessage) => void, onStatus?: (s: "open" | "closed") => void) => {
@@ -51,7 +53,7 @@ test("site picker lists sites when no id is given", async () => {
   expect((await screen.findByRole("link", { name: /General Hospital/ })).getAttribute("href")).toBe("/map/s1");
 });
 
-test("stream drives the 2D fallback, KPIs, and the event feed", async () => {
+test("stream drives the 2D fallback, KPI tiles, the side card and its events", async () => {
   renderAt("/map/s1");
   expect(await screen.findByRole("heading", { level: 1, name: "General Hospital" })).toBeTruthy();
   expect(screen.getByRole("status").textContent).toBe("Connecting");
@@ -60,24 +62,52 @@ test("stream drives the 2D fallback, KPIs, and the event feed", async () => {
   expect(screen.getByText(/2D view: .*WebGL is not available/)).toBeTruthy();
 
   await send({ type: "snapshot", site_id: "s1", ts: 1, event: null, assets: [bed("B1", "free"), bed("B2", "occupied"), bed("B3", "free", "Mars")] });
-  const kpi = screen.getByRole("region", { name: /Status/ });
-  expect(within(kpi).getByText("3 assets")).toBeTruthy();
-  expect(kpi.querySelector('[data-state="free"]')!.textContent).toBe("2");
-  expect(kpi.querySelector('[data-state="in-use"]')!.textContent).toBe("1");
-  expect(within(kpi).getByRole("rowheader", { name: "Unassigned" })).toBeTruthy();
+  const kpis = screen.getByRole("group", { name: "Key figures" });
+  const tile = (id: string) => kpis.querySelector(`[data-kpi="${id}"]`)!;
+  expect(tile("beds").textContent).toContain("Beds used1/ 3");
+  expect(tile("alerts").querySelector("[data-value]")!.textContent).toBe("0");
   expect(document.querySelector('[data-asset="B1"]')!.getAttribute("class")).toContain("lm-s-free");
+  // Overview card: one chip per bed on the floor
+  const side = screen.getByRole("complementary", { name: "Main floor" });
+  expect(within(side).getAllByRole("button", { name: /^B\d: / }).map((b) => b.textContent)).toEqual(["B1Free", "B2In use", "B3Free"]);
 
   await send({ type: "upsert", site_id: "s1", ts: 2, event: null, assets: [bed("B1", "alert")] });
   expect(document.querySelector('[data-asset="B1"]')!.getAttribute("class")).toContain("lm-s-alert");
-  const feed = screen.getByRole("log");
-  expect(within(feed).getByText(/B1: state free → alert/)).toBeTruthy();
-  expect(within(feed).getByText("ehr")).toBeTruthy();
+  expect(tile("alerts").querySelector("[data-value]")!.textContent).toBe("1");
+  expect(tile("alerts").className).toContain("lm-hud-kpi--alert");
+  expect(within(within(side).getByRole("log")).getByText(/state free → alert/)).toBeTruthy();
 
-  fireEvent.click(document.querySelector('[data-asset="B1"]')!);
-  const details = screen.getByRole("region", { name: /B1/ });
-  expect(within(details).getByText("alert")).toBeTruthy();
+  // The tile selects the worst record; the card shows it with the source that set each field.
+  fireEvent.click(tile("alerts"));
+  const card = screen.getByRole("complementary", { name: "B1" });
+  expect(card.querySelector(".lm-hud-chip--alert")!.textContent).toBe("alert");
+  expect(within(within(card).getByRole("region", { name: "From ehr" })).getByText("State")).toBeTruthy();
+  expect(screen.getByRole("region", { name: /Journey/ }).textContent).toContain("No journey to show for B1 yet.");
+  fireEvent.click(within(card).getByRole("button", { name: "Back" }));
+  expect(screen.getByRole("complementary", { name: "Main floor" })).toBeTruthy();
   act(() => status?.("closed"));
   expect(screen.getByRole("status").textContent).toBe("Reconnecting");
+});
+
+test("demo mode hides setup notices and editing chrome but keeps the live cards", async () => {
+  renderAt("/map/s1");
+  await screen.findByRole("heading", { level: 1, name: "General Hospital" });
+  await send({ type: "snapshot", site_id: "s1", ts: 1, event: null, assets: [bed("B1", "free"), bed("B3", "free", "Mars")] });
+  expect(await screen.findByRole("region", { name: "Setup" })).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Edit layout" })).toBeTruthy();
+  cleanup();
+
+  renderAt("/map/s1?demo=1");
+  await screen.findByRole("heading", { level: 1, name: "General Hospital" });
+  await send({ type: "snapshot", site_id: "s1", ts: 1, event: null, assets: [bed("B1", "free"), bed("B3", "free", "Mars")] });
+  expect(screen.queryByRole("region", { name: "Setup" })).toBeNull();
+  expect(screen.queryByText(/zones that aren't on the map yet/)).toBeNull();
+  expect(screen.queryByRole("button", { name: "Edit layout" })).toBeNull();
+  expect(screen.getByRole("region", { name: /Live map of/ }).className).toContain("lm-live--demo");
+  expect(document.body.classList.contains("lm-demo")).toBe(true);
+  expect(screen.getByRole("group", { name: "Key figures" })).toBeTruthy();
+  cleanup();
+  expect(document.body.classList.contains("lm-demo")).toBe(false);
 });
 
 test("layout editor adds a zone and saves via updateSite; validation blocks bad layouts", async () => {
@@ -97,4 +127,27 @@ test("layout editor adds a zone and saves via updateSite; validation blocks bad 
   fireEvent.click(screen.getByRole("button", { name: "Save layout" }));
   expect(await screen.findByText(/2 zones are named "icu"/)).toBeTruthy();
   expect(updateSite).toHaveBeenCalledTimes(1);
+});
+
+test("zones are created from the data when the layout matches none of it", async () => {
+  updateSite.mockReset();
+  updateSite.mockImplementation((_id: string, b: { layout: Site["layout"] }) => Promise.resolve({ ...site, layout: b.layout }));
+  renderAt("/map/s1");
+  await screen.findByRole("heading", { level: 1, name: "General Hospital" });
+  await send({ type: "snapshot", site_id: "s1", assets: [bed("B1", "free", "ER"), bed("B2", "occupied", "General")], event: null, ts: 1 });
+  await waitFor(() => expect(updateSite).toHaveBeenCalledTimes(1));
+  const zones = updateSite.mock.calls[0][1].layout.zones.map((z: { name: string }) => z.name);
+  expect(zones).toEqual(["ER", "General"]);
+  expect(await screen.findByText(/Created 2 zones from your data: ER, General/)).toBeTruthy();
+});
+
+test("records with no zone or state point at the mapping that needs fixing", async () => {
+  mappingsList = [{ id: "m9", site_id: "s1", source_id: "src", dataset: "epic.triage_queue", active: true, config: { id_field: "id", fields: {} } }];
+  renderAt("/map/s1");
+  await screen.findByRole("heading", { level: 1, name: "General Hospital" });
+  await send({ type: "snapshot", site_id: "s1", assets: [{ site_id: "s1", asset_id: "1", updated_ts: 1, _sources: {} }], event: null, ts: 1 });
+  expect(await screen.findByText(/epic\.triage_queue/)).toBeTruthy();
+  expect(screen.getByText(/Zone and State not set/)).toBeTruthy();
+  expect(screen.getByRole("link", { name: "Fix this mapping" }).getAttribute("href")).toBe("/mapping/m9/edit");
+  mappingsList = [];
 });

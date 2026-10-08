@@ -49,8 +49,21 @@ export type Column = { name: string; type: string; nullable: boolean };
 export type Dataset = { name: string; columns: Column[]; primary_key: string[]; supports_cdc: boolean };
 export type SourceRecord = Record<string, unknown>;
 
-export type Zone = { id: string; name: string; polygon: [number, number][]; color?: string };
-export type SiteLayout = { zones?: Zone[]; width?: number; depth?: number };
+// Layout v2: see docs/adr/0006-hospital-map.md. Old layouts (no floors) stay valid.
+export type ZoneKind = "unit" | "room" | "bay" | "corridor" | "waiting" | "entrance";
+export type Zone = {
+  id: string;
+  name: string;
+  polygon: [number, number][];
+  color?: string;
+  floor_id?: string;
+  kind?: ZoneKind;
+  doors?: [number, number][];
+};
+export type FloorPlan = { asset_id: string; x: number; y: number; w: number; h: number; opacity?: number };
+export type Floor = { id: string; name: string; level: number; width: number; depth: number; plan?: FloorPlan };
+export type Entrance = { id: string; name: string; floor_id?: string; point: [number, number]; kind: "walk" | "ambulance" };
+export type SiteLayout = { zones?: Zone[]; width?: number; depth?: number; floors?: Floor[]; entrances?: Entrance[] };
 export type Site = {
   id: string;
   name: string;
@@ -67,6 +80,28 @@ export type MappingConfig = {
   state_map?: Record<string, string>;
   attributes?: string[];
   kind?: string | null;
+  filter?: RowFilter[];
+};
+
+export type RowFilter = {
+  column: string;
+  op: "eq" | "ne" | "in" | "not_in" | "is_null" | "not_null" | "gt" | "gte" | "lt" | "lte" | "contains";
+  value?: unknown;
+};
+
+// GET /api/sources/{id}/suggestions?site_id= (docs/adr/0006-hospital-map.md)
+export type AttachTarget = {
+  dataset: string; // another suggestion in the list, or the dataset of mapping_id
+  mapping_id: string | null; // an existing mapping on the site
+  match_key: string;
+};
+export type Suggestion = {
+  dataset: string;
+  config: MappingConfig | null; // null: not suggested (reason says why)
+  filter?: RowFilter[] | null; // same as config.filter
+  reason: string;
+  confidence: number; // 0..1
+  attach_to?: AttachTarget | null;
 };
 
 export type Mapping = {
@@ -121,5 +156,31 @@ export type StreamMessage = {
 // GET /api/health
 export type AppHealth = { ok: boolean; version: string; portal_db?: "ok" | "unreachable" };
 
+// POST /api/sites/{id}/plans (floor plan image; ADR 0006)
+export type PlanUpload = { asset_id: string; width_px: number; height_px: number; content_type: string };
+
 // POST /api/sources/{id}/upload
 export type UploadResult = { dataset: string; bytes: number; rows: number; columns: string[] };
+
+// POST /api/sites/{id}/layout/import (docs/adr/0007-hospital-view.md, "Layout import")
+export type LayoutImportFormat = "auto" | "riverside" | "geojson-lite";
+export type LayoutImportRequest = {
+  source_id: string;
+  path?: string;
+  format: LayoutImportFormat;
+  mode: "replace" | "merge";
+  dry_run: boolean;
+  options?: { root?: string };
+};
+export type LayoutImportSummary = {
+  format: "riverside" | "geojson-lite";
+  floors: number;
+  zones: number;
+  zones_by_kind: Record<string, number>;
+  beds: number;
+  kept_zones: number;
+  removed_zones: number;
+  warnings: string[];
+  problems: string[]; // block saving; same rules as the layout editor
+};
+export type LayoutImportResult = { layout: SiteLayout; summary: LayoutImportSummary; saved: boolean };

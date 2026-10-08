@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -7,6 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.api.deps import runner
+from app.api.plans import remove_site_plans
 from app.api.schemas import SiteIn, SiteOut, SiteUpdate
 from app.core.runner import RunnerManager
 from app.db import Mapping, Site, get_session
@@ -71,5 +73,7 @@ async def delete_site(
     s = _get(session, site_id)
     for m in session.scalars(select(Mapping).where(Mapping.site_id == s.id)):
         await rm.stop(m.id, site_id=s.id)
+    site_key = s.id
     session.delete(s)
     session.commit()
+    await asyncio.to_thread(remove_site_plans, site_key)  # floor plan images go with the site
