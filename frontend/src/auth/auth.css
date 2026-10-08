@@ -110,7 +110,10 @@
   border: 0; border-radius: 6px; padding: 8px 10px; cursor: pointer; text-decoration: none; }
 .au-menu [role="menuitem"]:hover, .au-menu [role="menuitem"]:focus-visible { background: var(--accent-soft); color: var(--accent); outline: none; }
 @media (max-width: 760px) {
-  .au-user { padding: 0; margin-left: auto; }
+  /* The top bar scrolls sideways on phones: keep the account button next to the brand, before the links. */
+  .nav > .au-user { order: 1; }
+  .nav > nav { order: 2; }
+  .au-user { padding: 0; }
   .au-user-btn { width: auto; }
   .au-user-name { max-width: 10em; }
   .au-menu { position: fixed; top: 52px; left: auto; right: 16px; }
@@ -151,7 +154,8 @@ table.au-users select { font: inherit; color: var(--fg); background: var(--panel
   table.au-users tr { padding: 10px 12px; border-bottom: 1px solid var(--line); }
   table.au-users td { border: 0; padding: 4px 0; display: grid; grid-template-columns: 7.5em minmax(0, 1fr); gap: 8px; align-items: center; }
   table.au-users td::before { content: attr(data-label); color: var(--muted); font-size: 0.78rem; }
-  table.au-users td.au-cell-user { grid-template-columns: minmax(0, 1fr); }
+  table.au-users td.au-cell-user { display: block; font-size: 0.95rem; }
+  table.au-users td > * { justify-self: start; max-width: 100%; }
   table.au-users td.au-cell-user::before, table.au-users td.au-cell-actions::before { content: none; }
   table.au-users td.au-cell-actions { grid-template-columns: minmax(0, 1fr); padding-top: 8px; }
   .au-row-note td { display: block; }
