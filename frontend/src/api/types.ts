@@ -184,3 +184,57 @@ export type LayoutImportSummary = {
   problems: string[]; // block saving; same rules as the layout editor
 };
 export type LayoutImportResult = { layout: SiteLayout; summary: LayoutImportSummary; saved: boolean };
+
+// GET /api/sites/{id}/assets/{asset_id}/history (backend/app/api/history.py)
+export type HistoryPlace = { zone_id: string | null; zone: string | null; bed: string | null; floor_id: string | null; floor: string | null };
+export type HistoryKind = "arrived" | "move" | "status" | "task" | "left" | "update";
+export type HistoryEntry = HistoryPlace & {
+  ts: number;
+  kind: HistoryKind;
+  text: string;
+  source: string | null;
+  status: string | null; // plain words ("Waiting for provider")
+  status_raw: unknown;
+  changes: Record<string, [unknown, unknown]>;
+  duration_s?: number;
+  duration_text?: string; // "in ED-02 for 42 min"
+  ongoing?: boolean;
+  floor_change?: { from: string; to: string };
+  task?: string; // attached record's label ("Cleaning task")
+  task_status?: string | null;
+};
+export type HistoryMilestone = { key: string; label: string; ts: number; value: unknown; status: unknown; seen_ts: number };
+export type AssetHistory = {
+  site_id: string;
+  asset_id: string;
+  present: boolean;
+  current: HistoryPlace | null;
+  history_since: number | null; // Live Ops knows history from when it started watching
+  retention_days: number;
+  truncated: boolean;
+  entries: HistoryEntry[];
+  milestones: HistoryMilestone[];
+  now: number;
+};
+
+// --- auth-ui --- Accounts and sign-in (ADR 0008). Timestamps arrive as ISO strings (or epoch seconds).
+export type Role = "admin" | "manager" | "viewer" | "wallboard";
+export type UserStatus = "invited" | "active" | "disabled";
+/** SSO is LIVEOPS-163; the list is empty until then. A provider may be a bare id or {id, name, url}. */
+export type SsoProvider = string | { id: string; name?: string; url?: string };
+export type AuthState = { setup_required: boolean; signup_open: boolean; sso: SsoProvider[] };
+export type Me = { id: string; email: string; name: string; role: Role; org: { id: string; name: string }; email_verified: boolean };
+export type AccountUser = {
+  id: string; email: string; name: string; role: Role; status: UserStatus;
+  last_sign_in_at: string | number | null; created_at: string | number;
+};
+export type AuthSession = {
+  id: string; created_at: string | number; last_seen_at: string | number | null;
+  user_agent: string | null; ip: string | null; current: boolean;
+};
+export type ApiToken = { id: string; name: string; created_at: string | number; last_used_at: string | number | null };
+/** POST /api/auth/tokens: the token record plus the plain token, shown once. */
+export type NewApiToken = ApiToken & { token: string };
+export type OrgSettings = { name: string; signup_open: boolean };
+export type CreateUserResult = { user: AccountUser; invite_link?: string | null };
+// --- end auth-ui ---

@@ -1,0 +1,109 @@
+/* History, journey and tracking (map/track). Tokens from styles/tokens.css and the HUD (.lm-live). */
+
+/* Route and trail over the 3D map */
+.lm-track-overlay { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; z-index: 1; overflow: visible; }
+.lm-track-leg { fill: none; stroke: var(--accent); stroke-width: 4; stroke-linecap: round; stroke-linejoin: round;
+  filter: drop-shadow(0 1px 1px color-mix(in srgb, var(--hud-shade, #000) 35%, transparent)); }
+.lm-track-arrowhead { fill: var(--accent); }
+.lm-track-stop circle { fill: var(--panel); stroke: var(--accent); stroke-width: 2.5; }
+.lm-track-mark rect { fill: var(--accent); }
+.lm-track-mark text { fill: var(--accent-fg); font: 600 11px var(--f-body); }
+.lm-track-trail { fill: none; stroke: var(--warn); stroke-width: 3; stroke-dasharray: 1 6; stroke-linecap: round; stroke-linejoin: round; opacity: 0.95; }
+
+/* Short notices ("moved to Floor 3, following") */
+.lm-track-notice { position: absolute; left: 50%; top: calc(150px + env(safe-area-inset-top, 0px)); transform: translateX(-50%);
+  padding: 8px 14px; font: 600 12.5px var(--f-body); max-width: min(520px, calc(100% - 32px)); text-align: center; z-index: 3;
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent); pointer-events: none; }
+.lm-track-notice--off { opacity: 0; transform: translate(-50%, -6px); transition: opacity 0.3s, transform 0.3s; }
+@media (prefers-reduced-motion: reduce) { .lm-track-notice--off { transition: none; } }
+
+/* Track button row in the card header */
+.lm-track-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 8px; }
+.lm-track-actions .btn { padding: 6px 14px; font-size: 0.8rem; border-radius: 9px; }
+.lm-track-actions .btn.primary { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
+.lm-track-live { font-size: 11px; color: var(--accent); font-weight: 600; }
+.lm-track-live::before { content: ""; display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: currentColor;
+  margin-right: 5px; vertical-align: 1px; animation: lm-track-blink 1.6s infinite; }
+@keyframes lm-track-blink { 50% { opacity: 0.25; } }
+@media (prefers-reduced-motion: reduce) { .lm-track-live::before { animation: none; } }
+.lm-track-gone { font-size: 11px; color: var(--ink-warn, var(--warn)); font-weight: 600; }
+
+/* History panel */
+.lm-track-history { display: grid; gap: 12px; }
+.lm-track-history-head { display: grid; gap: 8px; }
+.lm-track-since { margin: 0; display: grid; gap: 2px; font-size: 12px; }
+.lm-track-since span { color: var(--muted); font-size: 11.5px; }
+.lm-track-tools { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.lm-track-tools .btn { padding: 5px 11px; font-size: 0.78rem; border-radius: 9px; }
+.lm-track-tools .btn[aria-pressed="true"] { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
+.lm-track-seg { display: inline-flex; border: 1px solid var(--glass-line, var(--line)); border-radius: 9px; overflow: hidden; }
+.lm-track-seg button { border: 0; background: transparent; color: var(--muted); font: 600 11.5px var(--f-body); padding: 5px 10px; cursor: pointer; }
+.lm-track-seg button + button { border-left: 1px solid var(--glass-line, var(--line)); }
+.lm-track-seg button[aria-pressed="true"] { background: var(--accent); color: var(--accent-fg); }
+.lm-track-seg button:focus-visible, .lm-track-tools .btn:focus-visible, .lm-track-actions .btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.lm-track-milestones { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: 11.5px; }
+.lm-track-milestones span { color: var(--faint); }
+.lm-track-timeline { list-style: none; margin: 0; padding: 0 0 0 4px; display: grid; gap: 0; }
+.lm-track-step { display: grid; grid-template-columns: 74px 1fr; gap: 10px; position: relative; padding: 0 0 10px; font-size: 12px; }
+.lm-track-step::before { content: ""; position: absolute; left: 80px; top: 5px; width: 9px; height: 9px; border-radius: 50%;
+  background: var(--panel); border: 2px solid var(--accent); }
+.lm-track-step::after { content: ""; position: absolute; left: 85px; top: 17px; bottom: -3px; width: 2px; background: var(--glass-line, var(--line)); }
+.lm-track-step:last-child::after { display: none; }
+.lm-track-step > div { padding-left: 20px; min-width: 0; }
+.lm-track-step time { font-size: 10.5px; color: var(--faint); padding-top: 2px; text-align: right; }
+.lm-track-step p { margin: 0; overflow-wrap: anywhere; }
+.lm-track-step-meta { color: var(--muted); font-size: 11px; display: flex; flex-wrap: wrap; gap: 2px 8px; }
+.lm-track-dur { font-family: var(--f-mono); font-size: 10.5px; }
+.lm-track-step--now::before { background: var(--accent); box-shadow: 0 0 0 4px var(--accent-soft); }
+.lm-track-step--status::before, .lm-track-step--task::before { border-color: var(--info); border-radius: 3px; }
+.lm-track-step--left::before { border-color: var(--muted); background: var(--muted); }
+
+/* Journey card (bottom) */
+.lm-track-steps-wrap { position: relative; }
+.lm-track-steps-wrap::before { content: ""; position: absolute; left: 7%; right: 7%; top: 13px; height: 3px; border-radius: 3px; background: var(--accent-soft); }
+.lm-track-steps-fill { position: absolute; left: 7%; top: 13px; height: 3px; border-radius: 3px; background: var(--accent); transition: width 0.6s; }
+.lm-track-steps { list-style: none; margin: 0; padding: 0; display: grid; position: relative; }
+.lm-track-jstep { display: grid; justify-items: center; gap: 4px; text-align: center; min-width: 0; padding: 0 2px; }
+.lm-track-dot { width: 28px; height: 28px; border-radius: 50%; display: grid; place-items: center; background: var(--panel);
+  border: 2px solid var(--accent-soft); color: var(--faint); font: 600 11px var(--f-mono); }
+.lm-track-jstep--done .lm-track-dot { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); }
+.lm-track-jstep--now .lm-track-dot { border-color: var(--accent); color: var(--accent); box-shadow: 0 0 0 5px var(--accent-soft); }
+.lm-track-jstep--stuck .lm-track-dot { border-color: var(--bad); color: var(--bad); box-shadow: 0 0 0 5px var(--bad-soft); }
+.lm-track-jstep--skipped .lm-track-dot { border-style: dashed; }
+.lm-track-jlabel { font: 600 11px/1.2 var(--f-body); }
+.lm-track-jwhen { font-size: 10.5px; color: var(--faint); }
+.lm-track-jstep--stuck .lm-track-jwhen { color: var(--ink-bad, var(--bad)); font-weight: 700; }
+.lm-track-jstep--skipped .lm-track-jlabel { color: var(--faint); font-weight: 500; }
+.lm-track-note { margin: 8px 0 0; font-size: 12px; color: var(--muted); }
+.lm-track-strip { list-style: none; margin: 0; padding: 0 0 2px; display: flex; gap: 6px; overflow-x: auto; scrollbar-width: thin; }
+.lm-track-strip li { flex: none; display: grid; gap: 1px; padding: 6px 10px; border-radius: 10px; background: var(--panel-2); font-size: 12px; max-width: 220px; }
+.lm-track-strip li b { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lm-track-strip time, .lm-track-strip small { font-size: 10.5px; color: var(--faint); }
+.lm-track-strip-now { box-shadow: inset 0 0 0 1.5px var(--accent); }
+.lm-hud-journey-sub { color: var(--muted); font-size: 11.5px; }
+
+/* Tabs in the side card */
+.lm-track-tabs { display: flex; gap: 2px; border-bottom: 1px solid var(--glass-line, var(--line)); margin: -4px 0 0; }
+.lm-track-tabs button { border: 0; background: none; padding: 6px 10px 7px; font: 600 12px var(--f-body); color: var(--muted); cursor: pointer;
+  border-bottom: 2px solid transparent; margin-bottom: -1px; }
+.lm-track-tabs button[aria-selected="true"] { color: var(--accent); border-bottom-color: var(--accent); }
+.lm-track-tabs button:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; border-radius: 6px; }
+
+@media (max-width: 860px) {
+  .lm-track-notice { top: auto; bottom: calc(50% + 10px); }
+  .lm-track-jlabel { font-size: 10px; }
+  .lm-track-dot { width: 24px; height: 24px; }
+  .lm-track-steps-wrap::before, .lm-track-steps-fill { top: 11px; }
+}
+@media (max-width: 560px) {
+  .lm-track-jwhen { font-size: 9.5px; }
+  .lm-track-step { grid-template-columns: 58px 1fr; }
+  .lm-track-step::before { left: 64px; }
+  .lm-track-step::after { left: 69px; }
+}
+.lm-hud-side-tab { display: grid; gap: 14px; align-content: start; min-width: 0; }
+
+/* Tracking paused while the user looks at another floor; where an off-plan record is (LIVEOPS-112). */
+.lm-track-actions .btn.lm-track-return { border-color: var(--accent); color: var(--accent); font-weight: 600; }
+.lm-track-where { flex-basis: 100%; font-size: 0.78rem; color: var(--fg); background: var(--warn-soft); border: 1px solid var(--warn);
+  border-radius: 9px; padding: 4px 10px; }

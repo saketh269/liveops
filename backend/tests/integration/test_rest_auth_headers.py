@@ -43,9 +43,9 @@ class Recorder:
 
             def do_GET(self) -> None:  # noqa: N802
                 rec.seen.append({k.lower(): v for k, v in self.headers.items()})
-                ok = (
-                    self.headers.get("X-API-Key") == KEY
-                    or self.headers.get("Authorization") in (f"Bearer {KEY}", "Bearer tok-from-oauth")
+                ok = self.headers.get("X-API-Key") == KEY or self.headers.get("Authorization") in (
+                    f"Bearer {KEY}",
+                    "Bearer tok-from-oauth",
                 )
                 if not ok:
                     return self._send(401, {"detail": "Missing or invalid API key"})
@@ -129,7 +129,10 @@ def test_bearer_header_is_sent(client: TestClient, api: Recorder) -> None:
 
 def test_oauth2_token_is_sent(client: TestClient, api: Recorder) -> None:
     sid = make_source(
-        client, api, "oauth2_client_credentials", {"client_id": "cid", "client_secret": "cs"},
+        client,
+        api,
+        "oauth2_client_credentials",
+        {"client_id": "cid", "client_secret": "cs"},
         token_url=f"{api.base}/oauth/token",
     )
     check_and_preview(client, sid)

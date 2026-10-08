@@ -21,11 +21,19 @@ import asyncio
 import contextlib
 import time
 from collections import defaultdict
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Callable
 from typing import Any
 
 from app.core.eventlog import EventEntry, InMemoryEventLog, feed_item
-from app.core.events import Asset, AssetEvent, AssetOp, FieldValue, StreamMessage, expand_attributes
+from app.core.events import (
+    Asset,
+    AssetEvent,
+    AssetOp,
+    AttachedRecord,
+    FieldValue,
+    StreamMessage,
+    expand_attributes,
+)
 
 RESYNC = "resync"  # internal marker: subscriber fell behind, send a fresh snapshot
 
@@ -121,9 +129,20 @@ def event_messages(site_id: str, entry: EventEntry | None) -> list[StreamMessage
     return [StreamMessage(type="event", site_id=site_id, event=feed_item(entry), ts=entry["ts"])]
 
 
+# Called with every event-log entry this process writes and the asset's flat
+# view after the change (None on a removal). Must not block: the durable
+# history (app.core.history) only queues it.
+HistorySink = Callable[[EventEntry, dict[str, Any] | None], None]
+
+
 class StateStore(abc.ABC):
     def __init__(self, queue_size: int = 1000) -> None:
         self._fanout = Fanout(queue_size)
+        self.history_sink: HistorySink | None = None
+
+    def _record(self, entry: EventEntry | None, asset: dict[str, Any] | None) -> None:
+        if entry is not None and self.history_sink is not None:
+            self.history_sink(entry, asset)
 
     @abc.abstractmethod
     async def apply(self, event: AssetEvent) -> StreamMessage | None:
@@ -197,24 +216,53 @@ class StateStore(abc.ABC):
 
 Contribution = tuple[FieldValue, int]  # (value from one mapping, apply sequence number)
 
+_MISSING: Any = object()  # "no value" in change records, unlike a value of None
 
-def _best(per_mapping: dict[str, Contribution]) -> FieldValue | None:
-    """The visible value of a field: the newest contribution (ties: applied last)."""
+
+def _rank(mapping_id: str, attached: set[str]) -> int:
+    """Own mappings (1) beat attached ones (0) on every field (LIVEOPS-116)."""
+    return 0 if mapping_id in attached else 1
+
+
+def _best(per_mapping: dict[str, Contribution], attached: set[str] | None = None) -> FieldValue | None:
+    """The visible value of a field: an own mapping's over an attached one's,
+    then the newest contribution (ties: applied last)."""
     if not per_mapping:
         return None
-    return max(per_mapping.values(), key=lambda c: (c[0].updated_ts, c[1]))[0]
+    att = attached or set()
+    return max(per_mapping.items(), key=lambda mc: (_rank(mc[0], att), mc[1][0].updated_ts, mc[1][1]))[1][0]
+
+
+def _own_view(fv: FieldValue | None, attached: set[str]) -> Any:
+    """The value the asset's own mappings show for a field (attached values don't count)."""
+    return fv.value if fv is not None and _rank(fv.mapping_id, attached) == 1 else _MISSING
+
+
+def _change(old: Any, new: Any) -> list[Any] | None:
+    if old is _MISSING and new is _MISSING:
+        return None
+    if old is not _MISSING and new is not _MISSING and old == new:
+        return None
+    return [None if old is _MISSING else old, None if new is _MISSING else new]
 
 
 class InMemoryStateStore(StateStore):
     """Reference store. Every field keeps one contribution per mapping; the
-    newest is visible. When a mapping leaves, the field falls back to the next
-    newest remaining contribution (LIVEOPS-92)."""
+    visible one is an own mapping's over an attached mapping's (LIVEOPS-116),
+    then the newest. When a mapping leaves, the field falls back to the next
+    best remaining contribution (LIVEOPS-92).
+
+    Event-log ``changes``: for an own mapping, what the asset's own mappings
+    show before/after (an attached value is never the "old" status: LIVEOPS-115);
+    for an attached mapping, its own values before/after."""
 
     def __init__(self, queue_size: int = 1000, eventlog_maxlen: int | None = None) -> None:
         super().__init__(queue_size)
         self._assets: dict[str, dict[str, Asset]] = defaultdict(dict)
         # site -> asset -> field -> mapping -> contribution
         self._contrib: dict[str, dict[str, dict[str, dict[str, Contribution]]]] = defaultdict(dict)
+        # site -> asset -> attached mappings contributing to it
+        self._attached: dict[str, dict[str, set[str]]] = defaultdict(dict)
         self._seq = 0
         self._lock = asyncio.Lock()
         self._log = InMemoryEventLog() if eventlog_maxlen is None else InMemoryEventLog(eventlog_maxlen)
@@ -226,81 +274,126 @@ class InMemoryStateStore(StateStore):
                 return None
             if entry is not None:
                 self._log.append(entry)
+                self._record(entry, msg.assets[0] if msg.type == "upsert" else None)
             # Publish under the lock so every subscriber sees changes in apply order.
             self._fanout.publish(msg)
             for m in event_messages(event.site_id, entry):
                 self._fanout.publish(m)
         return msg
 
+    @staticmethod
+    def _attached_view(contrib: dict[str, dict[str, Contribution]], attached: set[str]) -> dict[str, AttachedRecord]:
+        out: dict[str, AttachedRecord] = {}
+        newest: dict[str, int] = {}
+        for name, per in contrib.items():
+            for m, (fv, seq) in per.items():
+                if m not in attached:
+                    continue
+                rec = out.setdefault(m, AttachedRecord(source_id=fv.source_id))
+                rec.fields[name] = fv.value
+                if seq > newest.get(m, -1):
+                    newest[m] = seq
+                    rec.source_id = fv.source_id  # source of the mapping's newest contribution
+        return out
+
     def _apply_locked(self, event: AssetEvent) -> tuple[StreamMessage | None, EventEntry | None]:
         site = self._assets[event.site_id]
         contribs = self._contrib[event.site_id]
+        attached_by_asset = self._attached[event.site_id]
         asset = site.get(event.asset_id)
         changes: dict[str, list[Any]] = {}
         removed = False
         visible_changed = False
+        mapping = event.mapping_id
         if event.op == AssetOp.REMOVE:
             contrib = contribs.get(event.asset_id)
             if asset is None or contrib is None:
                 return None, None
-            affected = [f for f, per in contrib.items() if event.mapping_id in per]
+            affected = [f for f, per in contrib.items() if mapping in per]
             if not affected:
                 return None, None  # this mapping contributed nothing to the asset
+            attached = attached_by_asset.setdefault(event.asset_id, set())
+            was_attached = mapping in attached
             for f in affected:
-                del contrib[f][event.mapping_id]
+                gone = contrib[f].pop(mapping)[0]
                 if not contrib[f]:
                     del contrib[f]
-                cur, new = asset.fields.get(f), _best(contrib.get(f, {}))
+                cur, new = asset.fields.get(f), _best(contrib.get(f, {}), attached)
+                if was_attached:
+                    changes[f] = [gone.value, None]  # its own value left (LIVEOPS-116)
+                    visible_changed = True
+                else:
+                    ch = _change(_own_view(cur, attached), _own_view(new, attached))
+                    if ch is not None:
+                        changes[f] = ch
                 if new is None:
                     if cur is not None:
-                        changes[f] = [cur.value, None]
                         visible_changed = True
                         del asset.fields[f]
                     continue
-                if cur is None or cur.value != new.value:
-                    changes[f] = [None if cur is None else cur.value, new.value]
                 if cur is None or cur.value != new.value or cur.source_id != new.source_id:
                     visible_changed = True
                 asset.fields[f] = new
+            attached.discard(mapping)
             if not contrib:
                 del site[event.asset_id]
                 del contribs[event.asset_id]
+                attached_by_asset.pop(event.asset_id, None)
                 removed = True
                 msg = StreamMessage(type="remove", site_id=event.site_id, assets=[{"asset_id": event.asset_id}])
             elif not visible_changed:
                 return None, None  # only hidden (overridden) values left
             else:
+                asset.attached = self._attached_view(contrib, attached)
                 asset.updated_ts = event.received_ts
                 msg = StreamMessage(type="upsert", site_id=event.site_id, assets=[asset.flat()])
         else:
+            fields = expand_attributes(event.fields)
+            if not fields:
+                return None, None  # an empty upsert must not leave a ghost asset
             if asset is None:
                 asset = Asset(site_id=event.site_id, asset_id=event.asset_id)
             contrib = contribs.get(event.asset_id, {})
+            attached = attached_by_asset.get(event.asset_id, set())
+            if (mapping in attached) != event.attached:
+                visible_changed = True  # it moved in or out of _attached
+                if event.attached:
+                    attached.add(mapping)
+                else:
+                    attached.discard(mapping)
             self._seq += 1
-            for k, v in expand_attributes(event.fields).items():
+            for k, v in fields.items():
                 per = contrib.setdefault(k, {})
-                own = per.get(event.mapping_id)
+                own = per.get(mapping)
                 if own is not None and own[0].updated_ts > event.received_ts:
                     continue  # this mapping already sent something newer
-                per[event.mapping_id] = (
-                    FieldValue(
-                        value=v, source_id=event.source_id, mapping_id=event.mapping_id, updated_ts=event.received_ts
-                    ),
+                per[mapping] = (
+                    FieldValue(value=v, source_id=event.source_id, mapping_id=mapping, updated_ts=event.received_ts),
                     self._seq,
                 )
-                cur, new = asset.fields.get(k), _best(per)
+                cur, new = asset.fields.get(k), _best(per, attached)
                 assert new is not None
-                if cur is None or cur.value != new.value:
-                    changes[k] = [None if cur is None else cur.value, new.value]
+                if event.attached:
+                    old = own[0].value if own is not None else _MISSING
+                    ch = _change(old, v)
+                    if ch is not None or own is None or own[0].source_id != event.source_id:
+                        visible_changed = True  # its _attached values changed
+                else:
+                    ch = _change(_own_view(cur, attached), _own_view(new, attached))
+                if ch is not None:
+                    changes[k] = ch
                 if cur is None or cur.value != new.value or cur.source_id != new.source_id:
                     visible_changed = True
                 asset.fields[k] = new
-            if not contrib:
-                return None, None  # an empty upsert must not leave a ghost asset
             site[event.asset_id] = asset
             contribs[event.asset_id] = contrib
+            if attached:
+                attached_by_asset[event.asset_id] = attached
+            else:
+                attached_by_asset.pop(event.asset_id, None)
             if not visible_changed:
                 return None, None
+            asset.attached = self._attached_view(contrib, attached)
             asset.updated_ts = event.received_ts
             msg = StreamMessage(type="upsert", site_id=event.site_id, assets=[asset.flat()])
         entry: EventEntry | None = None

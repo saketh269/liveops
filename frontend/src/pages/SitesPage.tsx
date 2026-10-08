@@ -7,6 +7,7 @@ import { LayoutImport } from "../components/setup/LayoutImport";
 import { SetupFromSource } from "../components/setup/SetupFromSource";
 import { ConfirmDelete, EmptyState, ErrorNotice, Loading } from "../components/ui";
 import { useLoad } from "../components/useLoad";
+import { CanEdit } from "../auth/AuthProvider"; // auth-ui: hide edit controls for viewer/wallboard
 
 export const TEMPLATES: { id: string; label: string; help: string }[] = [
   { id: "hospital", label: "Hospital", help: "Wards and beds" },
@@ -92,17 +93,21 @@ function SiteCard({ site, mappings, onChanged }: { site: Site; mappings: Mapping
           {zones === 0 && <p className="muted" style={{ margin: 0 }}>No zones yet. Use “Edit layout” to draw them.</p>}
           <div className="row-actions">
             <Link className="btn primary" to={`/map/${site.id}`}>Open live map</Link>
+            <CanEdit>
             <Link className="btn" to={`/map/${site.id}?edit=1`}>Edit layout</Link>
             <Link className="btn" to={`/sites/${site.id}/setup`}>Set up from a source</Link>
+            </CanEdit>
             <Link className="btn" to={`/mapping?site=${site.id}`}>Mappings</Link>
-            <button type="button" className="btn" onClick={() => setEditing(true)}>Rename or change template</button>
+            <CanEdit><button type="button" className="btn" onClick={() => setEditing(true)}>Rename or change template</button></CanEdit>
           </div>
+          <CanEdit>
           <ConfirmDelete
             label="Delete site"
             what={`“${site.name}”`}
             consequence={`Its layout and ${mappings.length === 1 ? "1 mapping" : `${mappings.length} mappings`} are removed and the live map stops. Your source data is not touched.`}
             onConfirm={async () => { await api.deleteSite(site.id); onChanged(); }}
           />
+          </CanEdit>
         </>
       )}
     </li>
@@ -164,7 +169,7 @@ function SitesList() {
           <h1>Sites</h1>
           <p className="lead">A site is one place you watch live: a hospital, a warehouse, a farm or a delivery area.</p>
         </div>
-        {!creating && <button type="button" className="btn primary" onClick={() => setCreating(true)}>New site</button>}
+        <CanEdit>{!creating && <button type="button" className="btn primary" onClick={() => setCreating(true)}>New site</button>}</CanEdit>
       </div>
       {creating && (
         <div className="panel">
@@ -174,7 +179,7 @@ function SitesList() {
       {loading && !data && <Loading label="Loading sites…" />}
       {error !== null && <ErrorNotice error={error} title="Couldn't load sites" onRetry={reload} />}
       {data && sites.length === 0 && !creating && (
-        <EmptyState title="No sites yet" action={<button type="button" className="btn primary" onClick={() => setCreating(true)}>Create your first site</button>}>
+        <EmptyState title="No sites yet" action={<CanEdit><button type="button" className="btn primary" onClick={() => setCreating(true)}>Create your first site</button></CanEdit>}>
           Create a site, then map a source to it in the Mapping studio to see its assets on the live map.
         </EmptyState>
       )}

@@ -5,6 +5,7 @@ import type { Mapping, MappingHealth, Site, Source } from "../api/types";
 import { MappingWizard } from "../components/mapping/MappingWizard";
 import { timeAgo } from "../components/format";
 import { ConfirmDelete, EmptyState, ErrorNotice, Loading, StatusPill } from "../components/ui";
+import { CanEdit } from "../auth/AuthProvider"; // auth-ui: hide edit controls for viewer/wallboard
 import { useLoad } from "../components/useLoad";
 
 export default function MappingPage() {
@@ -63,6 +64,7 @@ function MappingRow({ m, source, health, onChanged }: { m: Mapping; source?: Sou
         </div>
       )}
       {error !== null && <ErrorNotice error={error} title={m.active ? "Couldn't pause" : "Couldn't resume"} />}
+      <CanEdit>
       <div className="row-actions">
         <button type="button" className="btn" onClick={toggle} disabled={busy}>
           {busy ? "Saving…" : m.active ? "Pause" : "Resume"}
@@ -75,6 +77,7 @@ function MappingRow({ m, source, health, onChanged }: { m: Mapping; source?: Sou
         consequence="Its assets disappear from the live map. The source and its data are not changed."
         onConfirm={async () => { await api.deleteMapping(m.id); onChanged(); }}
       />
+      </CanEdit>
     </li>
   );
 }
@@ -104,7 +107,7 @@ function MappingList() {
           <h1>Mapping studio</h1>
           <p className="lead">A mapping turns the records of one table into assets on a site's live map.</p>
         </div>
-        {sites.length > 0 && sources.length > 0 && <Link className="btn primary" to={newLink}>New mapping</Link>}
+        <CanEdit>{sites.length > 0 && sources.length > 0 && <Link className="btn primary" to={newLink}>New mapping</Link>}</CanEdit>
       </div>
       {error !== null && <ErrorNotice error={error} title="Couldn't refresh" onRetry={reload} />}
       {saved && (
@@ -140,7 +143,7 @@ function MappingList() {
               <h2>{site.name}</h2>
               <div className="row-actions">
                 <Link className="btn link" to={`/map/${site.id}`}>Live map</Link>
-                <Link className="btn" to={`/mapping/new?site=${site.id}`}>Add mapping</Link>
+                <CanEdit><Link className="btn" to={`/mapping/new?site=${site.id}`}>Add mapping</Link></CanEdit>
               </div>
             </div>
             {ms.length === 0 ? (

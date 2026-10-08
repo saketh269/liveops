@@ -1,4 +1,5 @@
 import type { Asset, SiteLayout } from "../../api/types";
+import { resetOwnStatus } from "../labels";
 import { MAX_PINS, problemPins, problemsByFloor } from "./pins";
 
 const NOW = 1_800_000_000;
@@ -24,8 +25,24 @@ test("pins stand on alert, boarding and long-cleaning records; worst first; a cl
     ["B1", "B1", "warn", 1],
   ]);
   expect(pins[0].text).toBe("ED Waiting Room · 2 alerts");
-  expect(pins[1].text).toBe("P3 boarding");
-  expect(pins[2].text).toBe("B1 dirty 45m");
+  expect(pins[1].text).toBe("P3 · Boarding");
+  expect(pins[2].text).toBe("B1 · Dirty 45 min");
+});
+
+test("a pin says the record's own status, never an attached source's (a transport request's \"in progress\")", () => {
+  resetOwnStatus();
+  const own = { state: "pat", zone: "pat", label: "pat", kind: "pat" };
+  const patient = (status: string, statusSrc: string): Asset => ({
+    site_id: "hs", asset_id: "P7401859", updated_ts: NOW, kind: "patient", state: "alert", zone: "ED Waiting Room",
+    attributes: { status, waiting_since: ago(12), to: "Radiology – MRI" },
+    _sources: { ...own, "attributes.status": statusSrc, "attributes.waiting_since": "pat", "attributes.to": "transport" },
+  });
+  // Seen first with its own status, then the transport request's status overwrote the shared key.
+  expect(problemPins(layout, [patient("waiting_for_provider", "pat")], NOW)[0].text).toBe("P7401859 · Waiting for provider 12 min");
+  expect(problemPins(layout, [patient("in_progress", "transport")], NOW)[0].text).toBe("P7401859 · Waiting for provider 12 min");
+  // Never seen with its own status: the mapped state, not the attached value.
+  resetOwnStatus();
+  expect(problemPins(layout, [patient("in_progress", "transport")], NOW)[0].text).toBe("P7401859 · Alert 12 min");
 });
 
 test("at most MAX_PINS pins, alerts before warnings", () => {

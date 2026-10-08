@@ -4,6 +4,7 @@ import { api } from "../api/client";
 import type { AppHealth, Mapping, MappingHealth, Site, Source } from "../api/types";
 import { formatMs, timeAgo } from "../components/format";
 import { EmptyState, ErrorNotice, Loading, StatusPill } from "../components/ui";
+import { CanEdit } from "../auth/AuthProvider"; // auth-ui: hide edit controls for viewer/wallboard
 
 export const HEALTH_POLL_MS = 5000;
 
@@ -75,7 +76,7 @@ export default function HealthPage() {
       )}
 
       {snap && rows.length === 0 && (
-        <EmptyState title="No mappings yet" action={<Link className="btn primary" to="/mapping/new">Create a mapping</Link>}>
+        <EmptyState title="No mappings yet" action={<CanEdit><Link className="btn primary" to="/mapping/new">Create a mapping</Link></CanEdit>}>
           Health shows each mapping once it exists. Create one in the Mapping studio to start reading data.
         </EmptyState>
       )}
@@ -116,8 +117,8 @@ export default function HealthPage() {
                 )}
                 {m && (
                   <div className="row-actions">
-                    <Link className="btn link" to={`/mapping/${m.id}/edit`}>Edit mapping</Link>
-                    <Link className="btn link" to={`/sources/${h.source_id}`}>Test source</Link>
+                    <CanEdit><Link className="btn link" to={`/mapping/${m.id}/edit`}>Edit mapping</Link>
+                    <Link className="btn link" to={`/sources/${h.source_id}`}>Test source</Link></CanEdit>
                     <Link className="btn link" to={`/map/${m.site_id}`}>Live map</Link>
                   </div>
                 )}

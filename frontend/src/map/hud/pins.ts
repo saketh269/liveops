@@ -1,8 +1,14 @@
 // Which problem pins float over the 3D scene. Pure: the component projects them.
 import type { Asset, SiteLayout } from "../../api/types";
 import { assetName } from "../reducer";
-import { byAgeDesc, plural, problemTone, rawStatus, zoneOf } from "./model";
-import { ageOf, fmtDur } from "./time";
+import { durWords, statusText, zoneLabel } from "../labels";
+import { byAgeDesc, plural, problemTone, zoneOf } from "./model";
+import { ageOf } from "./time";
+
+/** "P7401887 · Waiting for provider", "ED-11 · Dirty 47 min": the record's own status, never an attached source's. */
+export function pinText(a: Asset, age: number | null): string {
+  return `${assetName(a)} · ${statusText(a)}${age !== null ? ` ${durWords(age)}` : ""}`;
+}
 
 export type Pin = {
   key: string;
@@ -28,11 +34,11 @@ export function problemPins(layout: SiteLayout, assets: Iterable<Asset>, now: nu
     const tone = problemTone(a, now);
     if (tone === "warn") {
       const age = ageOf(a, now);
-      out.push({ key: a.asset_id, assetId: a.asset_id, tone, count: 1, age, text: `${assetName(a)} ${rawStatus(a)}${age !== null ? ` ${fmtDur(age)}` : ""}` });
+      out.push({ key: a.asset_id, assetId: a.asset_id, tone, count: 1, age, text: pinText(a, age) });
     } else if (tone === "bad") {
       const z = zoneOf(layout, a);
       const key = z ? `zone:${z.id}` : a.asset_id;
-      const g = alerts.get(key) ?? { zone: z ? z.name || z.id : null, list: [] };
+      const g = alerts.get(key) ?? { zone: z ? zoneLabel(z.name || z.id) : null, list: [] };
       g.list.push(a);
       alerts.set(key, g);
     }
@@ -42,7 +48,7 @@ export function problemPins(layout: SiteLayout, assets: Iterable<Asset>, now: nu
     const first = list[0];
     const age = ageOf(first, now);
     const text = list.length === 1
-      ? `${assetName(first)} ${rawStatus(first)}${age !== null ? ` ${fmtDur(age)}` : ""}`
+      ? pinText(first, age)
       : `${g.zone ?? "Unassigned"} · ${plural(list.length, "alert")}`;
     out.push({ key, assetId: first.asset_id, tone: "bad", count: list.length, age, text });
   }

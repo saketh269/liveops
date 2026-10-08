@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { ApiError, api } from "../api/client";
 import type { Asset, Site } from "../api/types";
@@ -19,7 +19,9 @@ import { Legend } from "../map/panels";
 import { assetName } from "../map/reducer";
 import { webglAvailable } from "../map/webgl";
 import { useLiveSite, type LinkStatus } from "../map/useLiveSite";
+import { useTrack } from "../map/track/useTrack"; // track fix
 import "../map/map.css";
+import { useCanEdit } from "../auth/AuthProvider"; // auth-ui
 
 function errorText(e: unknown, what: string): string {
   if (e instanceof ApiError) {
@@ -97,7 +99,8 @@ function useBodyClass(cls: string, on: boolean) {
 function SiteMap({ siteId }: { siteId: string }) {
   const [params, setParams] = useSearchParams();
   const navigate = useNavigate();
-  const editing = params.get("edit") === "1";
+  const mayEdit = useCanEdit(); // auth-ui: viewer/wallboard never get the layout editor
+  const editing = params.get("edit") === "1" && mayEdit;
   const debug = params.get("debug") === "1";
   const force2d = params.get("view") === "2d";
   const motion = params.get("motion") !== "off";
@@ -112,6 +115,7 @@ function SiteMap({ siteId }: { siteId: string }) {
   const [frame, setFrame] = useState(0);
   const [project, setProject] = useState<Projector | null>(null);
   const [find, setFind] = useState("");
+  const [camHost, setCamHost] = useState<HTMLDivElement | null>(null); // camera fix: HUD slot for the camera controls
   const [sourceNames, setSourceNames] = useState<Record<string, string>>({});
   // Removed records still walking out keep their last data in the card.
   const [departing, setDeparting] = useState<ReadonlyMap<string, Asset>>(() => new Map());
@@ -128,8 +132,11 @@ function SiteMap({ siteId }: { siteId: string }) {
     api.sources().then((list) => setSourceNames(Object.fromEntries(list.map((s) => [s.id, s.name]))), () => {});
   }, [siteId]);
 
+  // --- track fix: Esc stops tracking first, then clears the selection ---
+  const trackEscape = useRef<() => boolean>(() => false);
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setSelected(null); };
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape" && !trackEscape.current()) setSelected(null); };
+  // --- end track fix ---
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, []);
@@ -168,6 +175,10 @@ function SiteMap({ siteId }: { siteId: string }) {
     }
   };
   /** Select and bring into view (KPI tiles, room chips, events, Find). */
+  // --- track fix: history, route and live tracking of the selected record ---
+  const track = useTrack({ siteId, layout, floors, floorId, assets: ui.assets, selectedId: selected, selectedAsset, setFloor, now });
+  trackEscape.current = track.escape;
+  // --- end track fix ---
   const show = (id: string) => {
     select(id);
     setGlide((g) => ({ id, seq: (g?.seq ?? 0) + 1 }));
@@ -229,6 +240,12 @@ function SiteMap({ siteId }: { siteId: string }) {
             ready={ui.snapshotReceived}
             onDeparting={setDeparting}
             reason={force2d ? "selected with ?view=2d." : `${glError} Showing a top view instead.`}
+            controlsHost={camHost}
+            // --- track2: route, trail and follow in the 2D view (LIVEOPS-112/117) ---
+            follow={track.following}
+            onFollow={track.toggle}
+            onTrackHost={track.setHost}
+            // --- end track2 ---
           />
         ) : (
           <MapView3D
@@ -247,10 +264,16 @@ function SiteMap({ siteId }: { siteId: string }) {
             onDeparting={setDeparting}
             onProject={(p) => setProject(() => p)}
             glide={glide}
+            track={track.following /* track fix */}
+            onTrackHost={track.setHost}
+            onFollow={track.toggle /* --- track2: the camera's Follow button tracks across floors (LIVEOPS-112) --- */}
+            refocus={track.refocus /* track2 */}
+            controlsHost={camHost}
           />
         )}
       </div>
       {!use2d && <ProblemPins pins={pins} project={project} onSelect={select} />}
+      {track.layer /* track fix: route, trail and notices */}
 
       <div className="lm-hud">
         <div className="lm-hud-top">
@@ -301,12 +324,13 @@ function SiteMap({ siteId }: { siteId: string }) {
             }}>{force2d ? "3D" : "2D"}<span className="lm-sr"> view</span></button>
           )}
           <Legend assets={ui.assets} />
-          {!demo && <button type="button" className="btn" onClick={() => setEdit(true)}>Edit layout</button>}
+          {!demo && mayEdit && <button type="button" className="btn" onClick={() => setEdit(true)}>Edit layout</button>}
         </div>
 
         {floors.length > 1 && <FloorRail floors={floors} current={floorId} counts={floorCounts} problems={floorProblems} onChange={setFloor} />}
-        {!demo && <SetupHints site={site} assets={ui.assets} ready={ui.snapshotReceived} onSite={setSite} onEditLayout={() => setEdit(true)} floorId={floorId} />}
+        {!demo && mayEdit && <SetupHints site={site} assets={ui.assets} ready={ui.snapshotReceived} onSite={setSite} onEditLayout={() => setEdit(true)} floorId={floorId} />}
 
+        <div className="lm-hud-camera" ref={setCamHost} />{/* camera fix: camera controls render here */}
         <div className="lm-hud-dock">
           <SideCard
             layout={layout}
@@ -314,13 +338,15 @@ function SiteMap({ siteId }: { siteId: string }) {
             floorAssets={floorAssets}
             assets={ui.assets}
             feed={ui.feed}
-            selected={selectedAsset}
+            selected={track.asset /* track fix: stays open after the record leaves */}
             sourceNames={sourceNames}
             now={now}
             onSelect={show}
             onBack={() => { select(null); setFind(""); }}
+            actions={track.actions}
+            history={track.history}
           />
-          <JourneyCard asset={selectedAsset} />
+          <JourneyCard asset={track.asset} sub={track.journeySub}>{track.journey}</JourneyCard>
         </div>
       </div>
     </section>

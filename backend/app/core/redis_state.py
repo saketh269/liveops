@@ -10,10 +10,14 @@ a site's keys live in one slot)::
                                 t:<field> -> its received ts (float as text)
                                 c:<mapping>\x1f<field> -> that mapping's own
                                     contribution "ts\x1fseq\x1fsource\x1fvalue"
+                                a:<mapping> -> "1" when that mapping is attached
+                                    (adds details to another mapping's asset)
                                 #seq -> apply counter (tie-break for equal ts)
 
-    Visible = newest contribution (ties: applied last). When a mapping leaves,
-    each field falls back to the next newest contribution (LIVEOPS-92).
+    Visible = an own mapping's contribution over an attached one's (LIVEOPS-116),
+    then the newest (ties: applied last). When a mapping leaves, each field falls
+    back to the next best contribution (LIVEOPS-92). Attached mappings' own values
+    are also sent as ``_attached``; event-log changes follow ``InMemoryStateStore``.
     P:{S}:idx            zset   asset_id -> asset updated_ts
     P:{S}:log            stream event log, field "e" = entry JSON, MAXLEN ~
     P:{S}:ch             pub/sub channel for the site
@@ -41,7 +45,16 @@ import redis.asyncio as aioredis
 from redis.exceptions import RedisError
 
 from app.core.eventlog import DEFAULT_MAXLEN, EventEntry, RedisEventLog
-from app.core.events import Asset, AssetEvent, AssetOp, FieldValue, StreamMessage, expand_attributes, fold_attributes
+from app.core.events import (
+    Asset,
+    AssetEvent,
+    AssetOp,
+    AttachedRecord,
+    FieldValue,
+    StreamMessage,
+    expand_attributes,
+    fold_view,
+)
 from app.core.state import StateStore, event_messages
 
 log = logging.getLogger("liveops.state.redis")
@@ -61,48 +74,88 @@ local function parse_c(v)
   return tonumber(ts_s), tonumber(string.sub(v, a + 1, b - 1)), ts_s, string.sub(v, b + 1, c - 1), string.sub(v, c + 1)
 end
 
--- Drop one mapping's contributions to one asset; fields it was showing fall
--- back to the newest remaining contribution. Returns (changes, empty,
--- visible_changed) or nil when the mapping contributed nothing.
-local function remove_mapping(akey, mapping)
+-- Candidates are {rank, ts, seq, ts text, source, mapping, value}. Own mappings
+-- (rank 1) beat attached ones (rank 0), then newest ts, then applied last.
+local function better(x, y)
+  if not x then return false end
+  if not y then return true end
+  if x[1] ~= y[1] then return x[1] > y[1] end
+  if x[2] ~= y[2] then return x[2] > y[2] end
+  return x[3] > y[3]
+end
+
+local function hash_of(akey)
   local all = redis.call('HGETALL', akey)
-  if #all == 0 then return nil end
   local h = {}
   for i = 1, #all, 2 do h[all[i]] = all[i + 1] end
+  return h
+end
+
+-- 'c:<mapping>\31<name>' -> mapping, name
+local function split_c(k)
+  local sep = string.find(k, US, 3, true)
+  return string.sub(k, 3, sep - 1), string.sub(k, sep + 1)
+end
+
+local function change(old, new)
+  if old == new then return nil end
+  return '[' .. (old or 'null') .. ',' .. (new or 'null') .. ']'
+end
+
+-- Drop one mapping's contributions to one asset; fields it was showing fall
+-- back to the best remaining contribution. Returns (changes, empty,
+-- visible_changed) or nil when the mapping contributed nothing.
+local function remove_mapping(akey, mapping)
+  local h = hash_of(akey)
+  if next(h) == nil then return nil end
+  local function rank(m) if h['a:' .. m] then return 0 end return 1 end
+  local was_attached = h['a:' .. mapping] ~= nil
   local pre = 'c:' .. mapping .. US
   local affected, best, any = {}, {}, false
   for k, v in pairs(h) do
     local p = string.sub(k, 1, 2)
     if p == 'c:' then
-      if string.sub(k, 1, #pre) == pre then
-        affected[string.sub(k, #pre + 1)] = true
+      local m, name = split_c(k)
+      local ts, seq, ts_s, src, val = parse_c(v)
+      if m == mapping then
+        affected[name] = {val}
         redis.call('HDEL', akey, k)
       else
-        local sep = string.find(k, US, 3, true)
-        local m, name = string.sub(k, 3, sep - 1), string.sub(k, sep + 1)
-        local ts, seq, ts_s, src, val = parse_c(v)
-        local b = best[name]
-        if (not b) or ts > b[1] or (ts == b[1] and seq > b[2]) then best[name] = {ts, seq, ts_s, src, m, val} end
+        local cand = {rank(m), ts, seq, ts_s, src, m, val}
+        if better(cand, best[name]) then best[name] = cand end
       end
     elseif p == 'm:' and v == mapping then
-      affected[string.sub(k, 3)] = true  -- value written before contributions were kept
+      local name = string.sub(k, 3)
+      if not affected[name] then affected[name] = {h['f:' .. name]} end  -- written before contributions were kept
     end
   end
   if next(affected) == nil then return nil end
+  redis.call('HDEL', akey, 'a:' .. mapping)
   local changes, visible = {}, false
-  for name, _ in pairs(affected) do
-    if h['m:' .. name] == mapping then
-      local old, b = h['f:' .. name], best[name]
+  for name, own in pairs(affected) do
+    local cur_v, cur_s, cur_m = h['f:' .. name], h['s:' .. name], h['m:' .. name]
+    local own_before = (cur_v and rank(cur_m) == 1) and cur_v or nil
+    local after_v, after_m = cur_v, cur_m
+    if cur_m == mapping then
+      local b = best[name]
       if b then
-        redis.call('HSET', akey, 'f:' .. name, b[6], 's:' .. name, b[4], 'm:' .. name, b[5], 't:' .. name, b[3])
-        if b[6] ~= old then table.insert(changes, enc(name) .. ':[' .. old .. ',' .. b[6] .. ']') end
-        if b[6] ~= old or b[4] ~= h['s:' .. name] then visible = true end
+        redis.call('HSET', akey, 'f:' .. name, b[7], 's:' .. name, b[5], 'm:' .. name, b[6], 't:' .. name, b[4])
+        if b[7] ~= cur_v or b[5] ~= cur_s then visible = true end
+        after_v, after_m = b[7], b[6]
       else
         redis.call('HDEL', akey, 'f:' .. name, 's:' .. name, 'm:' .. name, 't:' .. name)
-        table.insert(changes, enc(name) .. ':[' .. old .. ',null]')
         visible = true
+        after_v, after_m = nil, nil
       end
     end
+    local c
+    if was_attached then
+      c = '[' .. (own[1] or 'null') .. ',null]'  -- its own value left (LIVEOPS-116)
+      visible = true
+    else
+      c = change(own_before, (after_v and rank(after_m) == 1) and after_v or nil)
+    end
+    if c then table.insert(changes, enc(name) .. ':' .. c) end
   end
   for k, _ in pairs(h) do
     if string.sub(k, 1, 2) == 'f:' and redis.call('HEXISTS', akey, k) == 1 then any = true break end
@@ -112,6 +165,33 @@ local function remove_mapping(akey, mapping)
   end
   if not any then redis.call('DEL', akey) end
   return changes, not any, visible
+end
+
+-- The asset as JSON: visible values, their sources, and each attached
+-- mapping's own values ("_attached": {mapping: [source, {field: value}]}).
+local function asset_body(h)
+  local vals, srcs, att, att_src = {}, {}, {}, {}
+  for k, v in pairs(h) do
+    local p, name = string.sub(k, 1, 2), string.sub(k, 3)
+    if p == 'f:' then
+      table.insert(vals, enc(name) .. ':' .. v)
+    elseif p == 's:' then
+      table.insert(srcs, enc(name) .. ':' .. enc(v))
+    elseif p == 'c:' then
+      local m, field = split_c(k)
+      if h['a:' .. m] then
+        local _, seq, _, src, val = parse_c(v)
+        att[m] = att[m] or {}
+        table.insert(att[m], enc(field) .. ':' .. val)
+        if (not att_src[m]) or seq > att_src[m][1] then att_src[m] = {seq, src} end
+      end
+    end
+  end
+  local groups = {}
+  for m, parts in pairs(att) do
+    table.insert(groups, enc(m) .. ':[' .. enc(att_src[m][2]) .. ',{' .. table.concat(parts, ',') .. '}]')
+  end
+  return vals, srcs, groups
 end
 
 -- After a visible change: update the site index, append to the event log,
@@ -125,18 +205,10 @@ local function emit(akey, ikey, lkey, chan, site, asset, op, src, mapping, ts_s,
   else
     kind = 'upsert'
     redis.call('ZADD', ikey, tonumber(ts_s), asset)
-    local all = redis.call('HGETALL', akey)
-    local vals, srcs = {}, {}
-    for i = 1, #all, 2 do
-      local p, name = string.sub(all[i], 1, 2), string.sub(all[i], 3)
-      if p == 'f:' then
-        table.insert(vals, enc(name) .. ':' .. all[i + 1])
-      elseif p == 's:' then
-        table.insert(srcs, enc(name) .. ':' .. enc(all[i + 1]))
-      end
-    end
+    local vals, srcs, groups = asset_body(hash_of(akey))
     local body = '"site_id":' .. enc(site) .. ',"asset_id":' .. enc(asset) .. ',"updated_ts":' .. ts_s
     if #vals > 0 then body = body .. ',' .. table.concat(vals, ',') end
+    if #groups > 0 then body = body .. ',"_attached":{' .. table.concat(groups, ',') .. '}' end
     asset_json = '{' .. body .. ',"_sources":{' .. table.concat(srcs, ',') .. '}}'
   end
   local entry = 'null'
@@ -157,13 +229,15 @@ end
 
 # KEYS: 1 asset hash, 2 site index, 3 event stream, 4 channel
 # ARGV: 1 op, 2 site_id, 3 asset_id, 4 source_id, 5 mapping_id, 6 received_ts,
-#       7 log maxlen, then pairs of (field name, value JSON) for upserts.
+#       7 log maxlen, 8 "1" when the mapping is attached, then pairs of
+#       (field name, value JSON) for upserts.
 # Returns the published payload (JSON text) or false when nothing visible changed.
 _APPLY_LUA = (
     _LUA_LIB
     + r"""
 local akey, ikey, lkey, chan = KEYS[1], KEYS[2], KEYS[3], KEYS[4]
 local op, site, asset, src, mapping, ts_s, maxlen = ARGV[1], ARGV[2], ARGV[3], ARGV[4], ARGV[5], ARGV[6], ARGV[7]
+local attached = ARGV[8] == '1'
 local ts = tonumber(ts_s)
 
 if op == 'remove' then
@@ -172,25 +246,61 @@ if op == 'remove' then
   return emit(akey, ikey, lkey, chan, site, asset, op, src, mapping, ts_s, maxlen, changes, empty)
 end
 
-local changes = {}
+local h = hash_of(akey)
 local changed = false
+if (h['a:' .. mapping] ~= nil) ~= attached then
+  changed = true  -- it moved in or out of _attached
+  if attached then redis.call('HSET', akey, 'a:' .. mapping, '1') else redis.call('HDEL', akey, 'a:' .. mapping) end
+end
+local function rank(m)
+  if m == mapping then return attached and 0 or 1 end
+  if h['a:' .. m] then return 0 end
+  return 1
+end
+-- Best contribution of every other mapping, per field.
+local others = {}
+for k, v in pairs(h) do
+  if string.sub(k, 1, 2) == 'c:' then
+    local m, name = split_c(k)
+    if m ~= mapping then
+      local cts, cseq, cts_s, csrc, cval = parse_c(v)
+      local cand = {rank(m), cts, cseq, cts_s, csrc, m, cval}
+      if better(cand, others[name]) then others[name] = cand end
+    end
+  end
+end
+
+local changes = {}
 local seq = nil
-for i = 8, #ARGV, 2 do
+for i = 9, #ARGV, 2 do
   local name, val = ARGV[i], ARGV[i + 1]
   local ck = 'c:' .. mapping .. US .. name
-  local own = redis.call('HGET', akey, ck)
-  if not (own and parse_c(own) > ts) then
+  local own = h[ck]
+  local own_ts, own_src, own_val
+  if own then
+    local _a, _b
+    own_ts, _a, _b, own_src, own_val = parse_c(own)
+  end
+  if not (own and own_ts > ts) then
     if not seq then seq = redis.call('HINCRBY', akey, '#seq', 1) end
     redis.call('HSET', akey, ck, ts_s .. US .. seq .. US .. src .. US .. val)
-    -- The new contribution has the highest seq: it is visible unless a newer ts is.
-    local cur = redis.call('HMGET', akey, 'f:' .. name, 's:' .. name, 't:' .. name)
-    if not (cur[3] and tonumber(cur[3]) > ts) then
-      if (not cur[1]) or cur[1] ~= val then
-        table.insert(changes, enc(name) .. ':[' .. (cur[1] or 'null') .. ',' .. val .. ']')
-      end
-      if (not cur[1]) or cur[1] ~= val or cur[2] ~= src then changed = true end
-      redis.call('HSET', akey, 'f:' .. name, val, 's:' .. name, src, 'm:' .. name, mapping, 't:' .. name, ts_s)
+    local best = {rank(mapping), ts, seq, ts_s, src, mapping, val}
+    local other = others[name]
+    local cur_v, cur_s, cur_m, cur_t = h['f:' .. name], h['s:' .. name], h['m:' .. name], h['t:' .. name]
+    if (not other) and cur_v and cur_m ~= mapping and not h['c:' .. cur_m .. US .. name] then
+      other = {rank(cur_m), tonumber(cur_t), 0, cur_t, cur_s, cur_m, cur_v}  -- written before contributions were kept
     end
+    if better(other, best) then best = other end
+    local c
+    if attached then
+      c = change(own_val, val)
+      if c or (not own) or own_src ~= src then changed = true end  -- its _attached values changed
+    else
+      c = change((cur_v and rank(cur_m) == 1) and cur_v or nil, best[1] == 1 and best[7] or nil)
+    end
+    if c then table.insert(changes, enc(name) .. ':' .. c) end
+    if (not cur_v) or cur_v ~= best[7] or cur_s ~= best[5] then changed = true end
+    redis.call('HSET', akey, 'f:' .. name, best[7], 's:' .. name, best[5], 'm:' .. name, best[6], 't:' .. name, best[4])
   end
 end
 if not changed then return false end
@@ -203,7 +313,7 @@ return emit(akey, ikey, lkey, chan, site, asset, op, src, mapping, ts_s, maxlen,
 # site's hash tag, so they live in the same cluster slot as KEYS.
 # KEYS: 1 site index, 2 event stream, 3 channel
 # ARGV: 1 asset key prefix, 2 site_id, 3 mapping_id, 4 ts, 5 log maxlen, 6.. asset ids to keep
-# Returns how many assets were touched.
+# Returns the published payloads as one JSON array (one per touched asset).
 _RECONCILE_LUA = (
     _LUA_LIB
     + r"""
@@ -211,35 +321,34 @@ local ikey, lkey, chan = KEYS[1], KEYS[2], KEYS[3]
 local prefix, site, mapping, ts_s, maxlen = ARGV[1], ARGV[2], ARGV[3], ARGV[4], ARGV[5]
 local keep = {}
 for i = 6, #ARGV do keep[ARGV[i]] = true end
-local touched = 0
+local out = {}
 for _, asset in ipairs(redis.call('ZRANGE', ikey, 0, -1)) do
   if not keep[asset] then
     local akey = prefix .. asset
     local changes, empty, visible = remove_mapping(akey, mapping)
     if changes and (empty or visible) then
-      emit(akey, ikey, lkey, chan, site, asset, 'remove', '', mapping, ts_s, maxlen, changes, empty)
-      touched = touched + 1
+      table.insert(out, emit(akey, ikey, lkey, chan, site, asset, 'remove', '', mapping, ts_s, maxlen, changes, empty))
     end
   end
 end
-return touched
+return '[' .. table.concat(out, ',') .. ']'
 """
 )
 
 
 # One consistent read of a whole site, returned as a single JSON document
-# ([[asset_id, updated_ts, {field: [value, source, mapping, ts]}], ...]) so a
-# 2,000-asset snapshot is one reply instead of 2,000.
+# ([[asset_id, updated_ts, {field: [value, source, mapping, ts]}, {mapping: [source, {field: value}]}], ...])
+# so a 2,000-asset snapshot is one reply instead of 2,000. The last element holds
+# the attached mappings' own values (LIVEOPS-116).
 # KEYS: 1 site index. ARGV: 1 asset key prefix.
-_SNAPSHOT_LUA = r"""
-local enc = cjson.encode
+_SNAPSHOT_LUA = (
+    _LUA_LIB
+    + r"""
 local ids = redis.call('ZRANGE', KEYS[1], 0, -1, 'WITHSCORES')
 local out = {}
 for i = 1, #ids, 2 do
-  local all = redis.call('HGETALL', ARGV[1] .. ids[i])
-  if #all > 0 then
-    local h = {}
-    for j = 1, #all, 2 do h[all[j]] = all[j + 1] end
+  local h = hash_of(ARGV[1] .. ids[i])
+  if next(h) ~= nil then
     local fields = {}
     for k, v in pairs(h) do
       if string.sub(k, 1, 2) == 'f:' then
@@ -248,11 +357,14 @@ for i = 1, #ids, 2 do
           .. enc(h['m:' .. name] or '') .. ',' .. (h['t:' .. name] or '0') .. ']')
       end
     end
-    table.insert(out, '[' .. enc(ids[i]) .. ',' .. ids[i + 1] .. ',{' .. table.concat(fields, ',') .. '}]')
+    local _, _, groups = asset_body(h)
+    table.insert(out, '[' .. enc(ids[i]) .. ',' .. ids[i + 1] .. ',{' .. table.concat(fields, ',') .. '},{'
+      .. table.concat(groups, ',') .. '}]')
   end
 end
 return '[' .. table.concat(out, ',') .. ']'
 """
+)
 
 
 def _dumps(value: Any) -> str:
@@ -263,7 +375,7 @@ def _dumps(value: Any) -> str:
 def _messages(site_id: str, payload: dict[str, Any]) -> list[StreamMessage]:
     asset = payload["asset"]
     if payload["kind"] == "upsert":
-        asset = fold_attributes(asset)
+        asset = fold_view(asset)
     first = StreamMessage(type=payload["kind"], site_id=site_id, assets=[asset])
     return [first, *event_messages(site_id, payload["event"])]
 
@@ -336,6 +448,7 @@ class RedisStateStore(StateStore):
             event.mapping_id,
             repr(float(event.received_ts)),
             str(self._maxlen),
+            "1" if event.attached else "0",
         ]
         if event.op == AssetOp.UPSERT:
             if not event.fields:
@@ -349,18 +462,35 @@ class RedisStateStore(StateStore):
         raw = await self._apply_script(keys=keys, args=args)
         if not raw:
             return None
+        payload = json.loads(raw)
+        self._record_payload(payload)
         # Subscribers in every process (this one included) get it via pub/sub.
-        return _messages(s, json.loads(raw))[0]
+        return _messages(s, payload)[0]
+
+    def _record_payload(self, payload: dict[str, Any]) -> None:
+        """Hand the change to the durable history (the process that applied it records it)."""
+        if payload.get("event") is not None:
+            asset = fold_view(dict(payload["asset"])) if payload["kind"] == "upsert" else None
+            self._record(payload["event"], asset)
 
     async def site_assets(self, site_id: str) -> list[Asset]:
         raw = await self._snapshot_script(keys=[self._index_key(site_id)], args=[f"{self._site(site_id)}:a:"])
         out = []
-        for asset_id, updated_ts, fields in json.loads(raw):
+        for asset_id, updated_ts, fields, groups in json.loads(raw):
             values = {
                 name: FieldValue(value=value, source_id=src, mapping_id=mapping, updated_ts=float(ts))
                 for name, (value, src, mapping, ts) in fields.items()
             }
-            out.append(Asset(site_id=site_id, asset_id=asset_id, fields=values, updated_ts=float(updated_ts)))
+            attached = {m: AttachedRecord(source_id=src, fields=vals) for m, (src, vals) in groups.items()}
+            out.append(
+                Asset(
+                    site_id=site_id,
+                    asset_id=asset_id,
+                    fields=values,
+                    updated_ts=float(updated_ts),
+                    attached=attached,
+                )
+            )
         return out
 
     async def clear_mapping(self, site_id: str, mapping_id: str) -> None:
@@ -369,7 +499,10 @@ class RedisStateStore(StateStore):
     async def reconcile(self, site_id: str, mapping_id: str, keep: set[str]) -> int:
         keys = [self._index_key(site_id), self._log_key(site_id), self._channel(site_id)]
         args = [f"{self._site(site_id)}:a:", site_id, mapping_id, repr(time.time()), str(self._maxlen), *keep]
-        return int(await self._reconcile_script(keys=keys, args=args))
+        payloads = json.loads(await self._reconcile_script(keys=keys, args=args))
+        for payload in payloads:
+            self._record_payload(payload)
+        return len(payloads)
 
     @property
     def redis(self) -> aioredis.Redis:

@@ -1,0 +1,4 @@
+/* 2D view (LIVEOPS-117): the walls of the 3D view, drawn from the same wall plan. Units are layout metres. */
+.lm-svg--walls .lm-zone { stroke-opacity: 0.3; }
+.lm-2d-wall { stroke: var(--muted); stroke-width: 0.2; stroke-linecap: square; pointer-events: none; }
+.lm-2d-wall--outer { stroke: var(--accent); stroke-width: 0.35; }

@@ -12,6 +12,12 @@ export type FeedEntry = {
   /** Source id that produced the change, when known. */
   source: string | null;
   assetId: string | null;
+  // --- polish fix ---
+  /** Field changes (field → [old, new]) when known, for plain-language lines (map/labels.ts eventText). */
+  changes?: Record<string, [unknown, unknown]>;
+  /** The whole record left the map. */
+  removed?: boolean;
+  // --- end polish fix ---
 };
 
 export type MapState = {
@@ -29,7 +35,7 @@ export function initialMapState(): MapState {
   return { assets: new Map(), feed: [], serverEvents: false, snapshotReceived: false, lastTs: null, seq: 0 };
 }
 
-const META = new Set(["site_id", "asset_id", "updated_ts", "_sources", "attributes"]);
+const META = new Set(["site_id", "asset_id", "updated_ts", "_sources", "attributes", "_attached"]); // --- state: _attached (LIVEOPS-116) ---
 
 export function assetName(a: Pick<Asset, "asset_id" | "label">): string {
   return typeof a.label === "string" && a.label ? a.label : a.asset_id;
@@ -110,7 +116,7 @@ export function reduceAll(state: MapState, msgs: readonly StreamMessage[]): MapS
           } else {
             for (const c of diffAsset(prev, a)) {
               push({ ts, kind: "change", text: `${assetName(a)}: ${c.field} ${fmt(c.from)} → ${fmt(c.to)}`,
-                source: c.source, assetId: a.asset_id });
+                source: c.source, assetId: a.asset_id, changes: { [c.field]: [c.from, c.to] } }); // --- polish fix: changes ---
             }
           }
         }
@@ -123,7 +129,7 @@ export function reduceAll(state: MapState, msgs: readonly StreamMessage[]): MapS
           const prev = m.get(a.asset_id);
           if (!m.delete(a.asset_id)) continue;
           if (!serverEvents) {
-            push({ ts, kind: "removed", text: `${assetName(prev ?? a)} removed`, source: null, assetId: a.asset_id });
+            push({ ts, kind: "removed", text: `${assetName(prev ?? a)} removed`, source: null, assetId: a.asset_id, removed: true }); // --- polish fix: removed ---
           }
         }
         break;
@@ -143,7 +149,11 @@ export function reduceAll(state: MapState, msgs: readonly StreamMessage[]): MapS
         serverEvents = true;
         const text = str(e.message) ?? str(e.text) ?? str(e.summary) ?? JSON.stringify(e);
         push({ ts: typeof e.ts === "number" ? e.ts : ts, kind: "event", text,
-          source: str(e.source) ?? str(e.source_id), assetId: str(e.asset_id) });
+          source: str(e.source) ?? str(e.source_id), assetId: str(e.asset_id),
+          // --- polish fix ---
+          ...(e.changes && typeof e.changes === "object" ? { changes: e.changes as Record<string, [unknown, unknown]> } : {}),
+          ...(e.removed === true ? { removed: true } : {}) });
+          // --- end polish fix ---
         break;
       }
       default:

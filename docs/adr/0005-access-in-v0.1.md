@@ -1,6 +1,6 @@
 # ADR 0005: Local-only access until sign-in ships
 
-Date: 2026-10-07 · Status: accepted · Fixes: LIVEOPS-15 (mitigation), 33, 37
+Date: 2026-10-07 · Status: superseded by ADR 0008 · Fixes: LIVEOPS-15 (mitigation), 33, 37
 
 ## Context
 

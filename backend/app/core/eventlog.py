@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import bisect
 import json
+import re
 import time
 from collections import defaultdict, deque
 from typing import Any
@@ -42,17 +43,121 @@ def _show(value: Any) -> str:
     return text if len(text) <= 40 else text[:39] + "…"
 
 
+# Plain-language feed lines (mirrors frontend/src/map/labels.ts). Codes such as
+# "waiting_for_provider" read as words; real names ("ED-02") are kept as they are.
+_ACRONYMS = {
+    "ed",
+    "er",
+    "icu",
+    "nicu",
+    "picu",
+    "pacu",
+    "cvu",
+    "mri",
+    "ct",
+    "esi",
+    "eta",
+    "evs",
+    "ems",
+    "iv",
+    "id",
+    "mph",
+}
+_TOKEN = re.compile(r"^(?:[a-z][a-z0-9]*(?:_[a-z0-9]+)*|[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+)$")
+_OWN_FIELDS = ("zone", "state", "label", "kind", "anchor", "floor", "role", "x", "y")
+_CHURN = re.compile(r"(^|_)(latitude|longitude|lat|lng|lon|speed|heading|x|y)$|(_at|_seen|_time|_since|updated)$")
+# Read as "is …": "transporting to hospital", "boarding", "at hospital · offloading" ("waiting room" is a place).
+_PROGRESSIVE = re.compile(r"^(\S+ing(\s+(to|for|at|on|in|from|with)\b.*)?|(at|on|en route)\b.*|in (?!use\b).*)$", re.I)
+_FIELD_WORDS = {
+    "esi_acuity": "acuity (ESI)",
+    "encounter_class": "visit type",
+    "eta_minutes": "ETA (min)",
+    "speed_mph": "speed (mph)",
+    "badge_last_seen": "badge last seen",
+    "clean_type": "cleaning type",
+}
+
+
+def words(value: Any) -> str:
+    """A code in words for use in a sentence: 'waiting_for_provider' -> 'waiting for provider',
+    'AT_HOSPITAL_OFFLOADING' -> 'at hospital · offloading'. Names are returned unchanged."""
+    text = _show(value) if not isinstance(value, str) else value.strip()
+    if not _TOKEN.match(text):
+        return text
+    parts = [w.upper() if w in _ACRONYMS else w for w in text.lower().split("_") if w]
+    if len(parts) >= 3 and parts[0] in ("at", "on", "in") and parts[-1].endswith("ing"):
+        return " ".join(parts[:-1]) + " · " + parts[-1]
+    return " ".join(parts)
+
+
+def _field(name: str) -> str:
+    key = name.removeprefix("attributes.").lower()
+    return _FIELD_WORDS.get(key) or words(re.sub(r"_(id|at)$", "", key) or key)
+
+
+def _status_phrase(new: Any, old: Any) -> str:
+    to = words(new)
+    if _PROGRESSIVE.match(to):
+        return f"is {to}"  # "is transporting to hospital", "is at hospital · offloading"
+    return f"is {to} (was {words(old)})" if old is not None else f"is now {to}"
+
+
 def describe(entry: EventEntry) -> str:
-    """One line for people: 'B01 state free → in_use, cleaning — → due'."""
+    """One short line for people, without field names or arrows:
+    'P7 moved from ED Waiting Room to ED-02 · now waiting for provider', 'ED-11 is dirty (was occupied)',
+    'M1 is transporting to hospital', 'P7 left the map (discharged)'."""
     asset = str(entry.get("asset_id", "?"))
+    changes: dict[str, Any] = entry.get("changes", {}) or {}
     if entry.get("removed"):
-        return f"{asset} removed"
-    changes = entry.get("changes", {})
+        label = (changes.get("label") or [None])[0]
+        name = label if isinstance(label, str) and label else asset
+        statuses = [
+            v for k in ("attributes.status", "state", "zone") for v in (changes.get(k) or []) if isinstance(v, str)
+        ]
+        discharged = any("discharg" in v.lower() for v in statuses)
+        return f"{name} left the map (discharged)" if discharged else f"{name} left the map"
     if changes and all(new is None for _, new in changes.values()):
         # One source stopped reporting the asset; another source still does.
-        return f"{asset} no longer in this source (still reported by another)"
-    parts = [f"{n.removeprefix('attributes.')} {_show(a)} → {_show(b)}" for n, (a, b) in sorted(changes.items())]
-    text = f"{asset} " + ", ".join(parts) if parts else f"{asset} updated"
+        return f"{asset} is no longer in this source (still reported by another)"
+    if not changes:
+        return f"{asset} updated"
+
+    def new_of(k: str) -> Any:
+        return changes[k][1] if k in changes else None
+
+    s_key = next((k for k in ("attributes.status", "state") if new_of(k) is not None), None)
+    s_old, s_new = (changes[s_key][0], changes[s_key][1]) if s_key else (None, None)
+    zone = changes.get("zone")
+    if zone and s_key and zone[1] == s_new:
+        zone = None  # fleet bays are named by status: the zone change is the status change
+    move = None
+    if zone and zone[1] is not None:
+        move = (
+            f"moved from {words(zone[0])} to {words(zone[1])}"
+            if zone[0] is not None
+            else f"arrived in {words(zone[1])}"
+        )
+    elif zone and zone[0] is not None:
+        move = f"left {words(zone[0])}"
+    if move and s_key and zone and zone[1] is not None and words(s_new).lower() in words(zone[1]).lower():
+        text = f"{asset} {move}"  # "arrived in ED Waiting Room · now waiting room" says it twice
+    elif move and s_key:
+        text = f"{asset} {move} · now {words(s_new)}"
+    elif move:
+        text = f"{asset} {move}"
+    elif s_key:
+        text = f"{asset} {_status_phrase(s_new, s_old)}"
+    elif new_of("anchor") is not None:
+        text = f"{asset} is now in bed {words(new_of('anchor'))}"
+    elif new_of("label") is not None:
+        text = f"{asset} is now called {_show(new_of('label'))}"
+    else:
+        rest = sorted(k for k in changes if k not in _OWN_FIELDS)
+        values = [k for k in rest if not _CHURN.search(k.removeprefix("attributes.")) and changes[k][1] is not None]
+        if values:
+            text = f"{asset} " + ", ".join(f"{_field(k)} is now {words(changes[k][1])}" for k in values[:3])
+        else:
+            text = f"{asset} updated: " + ", ".join(_field(k) for k in rest[:3])
     return text if len(text) <= 300 else text[:299] + "…"
 
 

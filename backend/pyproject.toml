@@ -27,6 +27,7 @@ dependencies = [
   "python-multipart>=0.0.9",
   "Pillow>=10.4",  # floor plan images: validation and pixel caps (ADR 0006)
   "pypdfium2>=4.30",  # floor plan PDFs: first page rendered to PNG
+  "argon2-cffi>=23.1",  # password hashing, Argon2id (ADR 0008)
 ]
 
 [project.optional-dependencies]
@@ -57,6 +58,7 @@ ignore = ["S101", "B008", "S311"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S", "BLE"]
+"tests/**/test_auth*.py" = ["F811"]  # pytest fixtures imported from tests/auth_fixtures.py
 
 [tool.mypy]
 python_version = "3.12"

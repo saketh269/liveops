@@ -11,7 +11,8 @@
     "test": "vitest run",
     "preview": "vite preview",
     "test:e2e": "node e2e/run.mjs",
-    "bench:map": "npm run build && playwright test -c e2e/bench.config.ts"
+    "bench:map": "npm run build && playwright test -c e2e/bench.config.ts",
+    "test:camera": "npm run build && playwright test -c e2e/camera.config.ts"
   },
   "dependencies": {
     "react": "^18.3.1",
