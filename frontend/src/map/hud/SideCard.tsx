@@ -1,4 +1,4 @@
-import { useEffect, useId, useMemo, useState } from "react";
+import { useEffect, useId, useMemo, useState, type ReactNode } from "react";
 import type { Asset, Floor, SiteLayout } from "../../api/types";
 import { humanize } from "../../components/format";
 import { FIGURE_LABELS } from "../figures";
@@ -21,6 +21,10 @@ type Props = {
   now: number;
   onSelect: (id: string) => void;
   onBack: () => void;
+  // --- track fix: Track button and History tab for the selected record (map/track) ---
+  actions?: ReactNode;
+  history?: ReactNode;
+  // --- end track fix ---
 };
 
 const BAR_ORDER: StateKey[] = ["in-use", "alert", "cleaning", "free", "unknown"];
@@ -29,6 +33,7 @@ const BAR_ORDER: StateKey[] = ["in-use", "alert", "cleaning", "free", "unknown"]
 export default function SideCard(props: Props) {
   const { selected } = props;
   const [open, setOpen] = useState(false);
+  const [tab, setTab] = useState<"details" | "history">("details"); // track fix
   const bodyId = useId();
   const headId = useId();
   // On phones a new selection opens the sheet; the overview starts folded.
@@ -41,12 +46,30 @@ export default function SideCard(props: Props) {
         <div className="lm-hud-eyebrow">{head.eyebrow}</div>
         <h2 id={headId}>{head.title}</h2>
         <div className="lm-hud-meta">{head.meta}</div>
+        {selected && props.actions /* track fix */}
         <button type="button" className="lm-hud-side-toggle" aria-expanded={open} aria-controls={bodyId} onClick={() => setOpen(!open)}>
           {open ? "Hide details" : selected ? "Show details" : "Show rooms and events"}
         </button>
       </header>
       <div className="lm-hud-side-body" id={bodyId}>
-        {selected ? <AssetBody {...props} selected={selected} /> : <Overview {...props} />}
+        {/* --- track fix: Details / History tabs --- */}
+        {selected && props.history ? (
+          <>
+            <div className="lm-track-tabs" role="tablist" aria-label="Record">
+              {(["details", "history"] as const).map((t) => (
+                <button key={t} type="button" role="tab" id={`${bodyId}-${t}`} aria-selected={tab === t} aria-controls={`${bodyId}-panel`}
+                  tabIndex={tab === t ? 0 : -1} onClick={() => setTab(t)}
+                  onKeyDown={(e) => { if (e.key === "ArrowRight" || e.key === "ArrowLeft") { const n = t === "details" ? "history" : "details"; setTab(n); document.getElementById(`${bodyId}-${n}`)?.focus(); } }}>
+                  {t === "details" ? "Details" : "History"}
+                </button>
+              ))}
+            </div>
+            <div role="tabpanel" id={`${bodyId}-panel`} aria-labelledby={`${bodyId}-${tab}`} className="lm-hud-side-tab">
+              {tab === "history" ? props.history : <AssetBody {...props} selected={selected} />}
+            </div>
+          </>
+        ) : selected ? <AssetBody {...props} selected={selected} /> : <Overview {...props} />}
+        {/* --- end track fix --- */}
       </div>
     </aside>
   );
