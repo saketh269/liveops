@@ -5,6 +5,7 @@ import { PlacementCache } from "./placement";
 import type { MapState } from "./reducer";
 import type { MapScene } from "./scene";
 import type { MapCamera } from "./world/camera";
+import CameraControls from "./hud/CameraControls"; // camera fix
 import type { FlushListener } from "./useLiveSite";
 import type { TrackHost } from "./track/RouteOverlay"; // track fix
 
@@ -44,6 +45,10 @@ type Props = {
   track?: boolean;
   onTrackHost?: (host: TrackHost | null) => void;
   // --- end track fix ---
+  // --- camera fix ---
+  /** HUD slot for the camera controls (they take their own place among the cards on phones); absent: drawn on the map. */
+  controlsHost?: HTMLElement | null;
+  // --- end camera fix ---
 };
 
 declare global {
@@ -53,7 +58,7 @@ declare global {
 }
 
 /** Hosts the Three.js scene. Asset updates bypass React and go straight to the scene. */
-export default function MapView3D({ layout, stateRef, listen, selectedId, onHover, onSelect, onFail, debug, plan, assetFilter, viewKey, motion = true, onDeparting, focusZone, cameraRef, onProject, glide, track, onTrackHost }: Props) {
+export default function MapView3D({ layout, stateRef, listen, selectedId, onHover, onSelect, onFail, debug, plan, assetFilter, viewKey, motion = true, onDeparting, focusZone, cameraRef, onProject, glide, track, onTrackHost, controlsHost }: Props) {
   const hostRef = useRef<HTMLDivElement>(null);
   const labelsRef = useRef<HTMLDivElement>(null);
   const [scene, setScene] = useState<MapScene | null>(null);
@@ -127,7 +132,7 @@ export default function MapView3D({ layout, stateRef, listen, selectedId, onHove
   useEffect(() => {
     if (!scene || framedKey.current === viewKey) return;
     framedKey.current = viewKey;
-    scene.resetCamera();
+    scene.frameFloor(true); // camera fix: a new floor (or "whole floor") keeps the user's angle
   }, [scene, viewKey]);
 
   useEffect(() => { scene?.setPlan(plan ?? null); }, [scene, plan]);
@@ -175,24 +180,16 @@ export default function MapView3D({ layout, stateRef, listen, selectedId, onHove
         tabIndex={0}
         role="application"
         aria-roledescription="3D map"
-        aria-label="3D site map. Drag to rotate, scroll to zoom, right-drag or arrow keys to pan. Use Find asset to select an asset with the keyboard."
+        aria-label="3D site map. Drag to rotate, right-drag or Shift+drag to move, scroll or pinch to zoom. Keys: arrows move, Q and E rotate, W and S tilt, plus and minus zoom, 0 resets. Use Find asset to select an asset with the keyboard."
       />
       <div ref={labelsRef} className="lm-labels" aria-hidden="true" />
-      <div className="lm-view-controls" role="group" aria-label="Camera">
-        <button type="button" className="btn" onClick={() => scene?.zoom(0.8)} aria-label="Zoom in" disabled={!scene}>+</button>
-        <button type="button" className="btn" onClick={() => scene?.zoom(1.25)} aria-label="Zoom out" disabled={!scene}>−</button>
-        <button type="button" className="btn" onClick={() => scene?.rotate(-Math.PI / 8)} aria-label="Rotate left" disabled={!scene}>⟲</button>
-        <button type="button" className="btn" onClick={() => scene?.rotate(Math.PI / 8)} aria-label="Rotate right" disabled={!scene}>⟳</button>
-        <button
-          type="button"
-          className="btn"
-          aria-pressed={following}
-          onClick={() => setFollow((v) => !v)}
-          disabled={!scene || !selectedId}
-          title={selectedId ? "Keep the selected asset in view as it moves" : "Select an asset to follow it"}
-        >Follow</button>
-        <button type="button" className="btn" onClick={() => { setFollow(false); scene?.resetCamera(); }} disabled={!scene}>Reset view</button>
-      </div>
+      {/* --- camera fix: on-screen camera controls (hud/CameraControls) --- */}
+      <CameraControls
+        camera={scene}
+        host={controlsHost}
+        follow={{ on: following, enabled: !!scene && !!selectedId, toggle: () => setFollow((v) => !v) }}
+      />
+      {/* --- end camera fix --- */}
       {!scene && <p className="lm-loading muted">Loading 3D view…</p>}
     </div>
   );

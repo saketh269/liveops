@@ -1,0 +1,50 @@
+/* Camera controls (camera fix). Desktop: a small glass card at the bottom right, clear of
+   the side card and the journey card. Tablets/phones: a row in the HUD flow just above the
+   bottom sheet, so it never sits on top of a card. */
+.lm-cam { pointer-events: auto; display: grid; gap: 5px; padding: 5px; width: max-content; max-width: 100%;
+  background: var(--glass, var(--panel)); border: 1px solid var(--glass-line, var(--line)); border-radius: var(--hud-r, var(--radius)); }
+.lm-cam-grid { display: grid; grid-template-columns: repeat(6, 36px); grid-auto-rows: 36px; gap: 3px; }
+.lm-cam-grid--flat { grid-template-columns: repeat(6, 36px); }
+.lm-cam .btn { display: grid; place-items: center; padding: 0; min-width: 0; width: 100%; height: 100%; border-color: transparent;
+  background: transparent; border-radius: 8px; color: var(--fg); }
+.lm-cam .btn:hover:not(:disabled) { background: var(--accent-soft); border-color: transparent; }
+.lm-cam .btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.lm-cam .btn[aria-pressed="true"] { background: var(--accent-soft); color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+.lm-cam-compass { grid-row: span 2; }
+.lm-cam-compass svg { width: 34px; height: 34px; }
+.lm-cam-grid--flat .lm-cam-compass { grid-row: auto; }
+.lm-cam-dial { fill: var(--panel); stroke: var(--line); stroke-width: 1; }
+.lm-cam-north { fill: var(--bad); }
+.lm-cam-south { fill: var(--faint); }
+.lm-cam-n { font: 700 3.4px var(--f-body); fill: var(--panel); text-anchor: middle; dominant-baseline: middle; }
+.lm-cam-follow { grid-column: span 3; display: flex !important; gap: 5px; padding: 0 8px !important; font-size: 0.8rem; }
+.lm-cam .lm-cam-resume { display: block; height: auto; padding: 7px 10px; font-size: 0.8rem; border-radius: 9px; background: var(--accent);
+  color: var(--accent-fg); }
+.lm-cam .lm-cam-resume:hover:not(:disabled) { background: var(--accent); filter: brightness(1.08); }
+
+/* 3D canvas: hand cursor while the floor can be grabbed. */
+.lm-canvas { cursor: grab; }
+.lm-canvas:active { cursor: grabbing; }
+
+/* 2D fallback: drag to pan. */
+.lm-svg--cam { cursor: grab; touch-action: none; user-select: none; }
+.lm-svg--cam:active { cursor: grabbing; }
+
+/* Where the controls sit. The slot lives in the HUD (LiveMapPage); without a slot the controls
+   sit at the bottom right of the map itself. */
+.lm-hud-camera { position: absolute; right: 16px; bottom: calc(16px + env(safe-area-inset-bottom, 0px)); pointer-events: none; }
+.lm-viewport > .lm-cam { position: absolute; right: 8px; bottom: 8px; }
+
+@media (max-width: 860px) {
+  .lm-hud-camera { position: static; align-self: flex-end; margin-top: auto; max-width: 100%; }
+  .lm-hud-camera:empty { display: none; }
+  .lm-hud-camera + .lm-hud-dock { margin-top: 0; }
+  .lm-cam-grid { grid-template-columns: none; grid-auto-flow: column; grid-auto-columns: 36px; }
+  .lm-cam-compass { grid-row: auto; }
+  .lm-cam-compass svg { width: 28px; height: 28px; }
+  .lm-cam-follow { grid-column: auto; padding: 0 !important; }
+  .lm-cam-follow-text { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+}
+@media (max-width: 400px) {
+  .lm-cam-grid { grid-auto-columns: 33px; grid-auto-rows: 36px; gap: 2px; }
+}
