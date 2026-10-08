@@ -1,9 +1,12 @@
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
 import type { Site, SiteLayout } from "../api/types";
 
 const updateSite = vi.fn();
 const uploadPlan = vi.fn();
 const deletePlan = vi.fn();
+const sources = vi.fn();
+const importLayout = vi.fn();
 vi.mock("../api/client", () => ({
   ApiError: class extends Error {
     status: number; hint?: string;
@@ -13,6 +16,8 @@ vi.mock("../api/client", () => ({
     updateSite: (...a: unknown[]) => updateSite(...a),
     uploadPlan: (...a: unknown[]) => uploadPlan(...a),
     deletePlan: (...a: unknown[]) => deletePlan(...a),
+    sources: (...a: unknown[]) => sources(...a),
+    importLayout: (...a: unknown[]) => importLayout(...a),
   },
 }));
 
@@ -154,4 +159,27 @@ test("a failed upload explains what to do; leaving without saving deletes upload
   await screen.findByRole("button", { name: "Remove plan" });
   unmount();
   expect(deletePlan).toHaveBeenCalledWith("s1", "p2");
+});
+
+test("import layout from a source: the editor shows the saved import and tells the map", async () => {
+  sources.mockResolvedValue([{ id: "beds", name: "Beds API", type: "rest", settings: {}, secrets_set: {}, warnings: [], created_ts: 0, updated_ts: 0 }]);
+  const imported: SiteLayout = {
+    floors: [{ id: "1", name: "Floor 1", level: 0, width: 40, depth: 30 }],
+    zones: [{ id: "ED-01", name: "ED-01", kind: "room", floor_id: "1", polygon: sq(0, 0) }],
+  };
+  importLayout.mockImplementation((_id: string, b: { dry_run: boolean }) => Promise.resolve({
+    layout: imported, saved: !b.dry_run,
+    summary: { format: "riverside", floors: 1, zones: 1, zones_by_kind: { room: 1 }, beds: 1, kept_zones: 0, removed_zones: 1, warnings: [], problems: [] },
+  }));
+  const onSaved = vi.fn();
+  render(<MemoryRouter><LayoutEditor site={oldSite} onSaved={onSaved} onClose={() => {}} /></MemoryRouter>);
+  fireEvent.click(screen.getByRole("button", { name: "Import layout from a source" }));
+  fireEvent.click(await screen.findByRole("button", { name: "Preview" }));
+  await screen.findByRole("region", { name: "Import preview" });
+  fireEvent.click(screen.getByRole("button", { name: "Import" }));
+  await waitFor(() => expect(onSaved).toHaveBeenCalledTimes(1));
+  expect(onSaved.mock.calls[0][0].layout).toEqual(imported);
+  expect(screen.getByRole("button", { name: "Zone ED-01" })).toBeTruthy();
+  expect(screen.queryByRole("button", { name: "Zone ICU" })).toBeNull();
+  expect(updateSite).not.toHaveBeenCalled(); // the import endpoint saved it
 });

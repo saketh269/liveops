@@ -1,5 +1,5 @@
 import type {
-  AppHealth, ConnectorSpec, Dataset, Mapping, MappingConfig, MappingHealth, Site, SiteLayout, Source,
+  AppHealth, ConnectorSpec, Dataset, LayoutImportRequest, LayoutImportResult, Mapping, MappingConfig, MappingHealth, Site, SiteLayout, Source,
   PlanUpload, SourceRecord, StreamMessage, Suggestion, TestReport, UploadResult,
 } from "./types";
 
@@ -86,6 +86,8 @@ export const api = {
   },
   deletePlan: (siteId: string, assetId: string) =>
     req<void>("DELETE", `/api/sites/${encodeURIComponent(siteId)}/plans/${encodeURIComponent(assetId)}`),
+  importLayout: (siteId: string, b: LayoutImportRequest) =>
+    req<LayoutImportResult>("POST", `/api/sites/${encodeURIComponent(siteId)}/layout/import`, b),
 
   mappings: (siteId?: string) => req<Mapping[]>("GET", `/api/mappings${siteId ? `?site_id=${siteId}` : ""}`),
   createMapping: (b: { site_id: string; source_id: string; dataset: string; config: MappingConfig; options?: Record<string, unknown>; active?: boolean }) =>

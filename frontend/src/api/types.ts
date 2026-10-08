@@ -161,3 +161,26 @@ export type PlanUpload = { asset_id: string; width_px: number; height_px: number
 
 // POST /api/sources/{id}/upload
 export type UploadResult = { dataset: string; bytes: number; rows: number; columns: string[] };
+
+// POST /api/sites/{id}/layout/import (docs/adr/0007-hospital-view.md, "Layout import")
+export type LayoutImportFormat = "auto" | "riverside" | "geojson-lite";
+export type LayoutImportRequest = {
+  source_id: string;
+  path?: string;
+  format: LayoutImportFormat;
+  mode: "replace" | "merge";
+  dry_run: boolean;
+  options?: { root?: string };
+};
+export type LayoutImportSummary = {
+  format: "riverside" | "geojson-lite";
+  floors: number;
+  zones: number;
+  zones_by_kind: Record<string, number>;
+  beds: number;
+  kept_zones: number;
+  removed_zones: number;
+  warnings: string[];
+  problems: string[]; // block saving; same rules as the layout editor
+};
+export type LayoutImportResult = { layout: SiteLayout; summary: LayoutImportSummary; saved: boolean };
