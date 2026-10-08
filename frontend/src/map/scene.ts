@@ -1,7 +1,6 @@
 // Imperative Three.js scene for the live map. Loaded lazily by LiveMapPage so
 // three.js is only downloaded when the map is opened.
 import * as THREE from "three";
-import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import type { Asset, SiteLayout } from "../api/types";
 import { FloorPlanLayer } from "./floorPlanLayer";
 import type { PlanView } from "./floors";
@@ -11,7 +10,10 @@ import { APPROACH_DISTANCE, Motion } from "./motion";
 import { floorSize, polygonBounds, polygonCentroid, type PlacementResult, type Rect } from "./placement";
 import { STATE_KEYS, onThemeChange, readStateColors, readToken, stateKey, type StateKey } from "./stateColors";
 import { buildWorld, type BuiltWorld } from "./world/build";
-import { FOCUS_ZOOM, ORBIT, VIEW_DIR, fitOrtho, flyStep, maxZoomFor, zoomToFit, type FlyGoal, type MapCamera } from "./world/camera";
+// --- camera fix ---
+import { DEFAULT_AZIMUTH, DEFAULT_POLAR, FOCUS_ZOOM, boundsFor, fitOrtho, frameZoomFor, maxZoomFor, minZoomFor, viewDirection, zoomToFit, type CameraReadout, type MapCamera } from "./world/camera";
+import { CameraRig, type CameraState } from "./world/cameraRig";
+// --- end camera fix ---
 import { applyLightPalette, configureRenderer, createLights, fitSun, type Lights } from "./world/lighting";
 import { currentPalette, type ScenePalette } from "./world/style";
 import { GLOW_MS, glowAt, isBed, newlyFree, roomStates, statesChanged, tintFor } from "./world/tint";
@@ -45,16 +47,12 @@ function isSoftwareRenderer(): boolean {
 }
 
 const PULSE_MS = 700;
-/** Per-frame ease of a fly-to (0..1). */
-const FLY_EASE = 0.1;
 /**
  * Software renderers (SwiftShader/llvmpipe) are fill-rate bound, and the angled view
  * fills more of the canvas with floor and figures than the old top view: they draw at
  * 80% resolution (upscaled, slightly soft) to keep the frame rate. GPUs draw at full.
  */
 const SOFTWARE_RENDER_SCALE = 0.8;
-/** How quickly the camera catches up with a followed figure (per frame, 0..1). */
-const FOLLOW_EASE = 0.15;
 
 export class MapScene implements MapCamera {
   private renderer: THREE.WebGLRenderer;
@@ -68,9 +66,8 @@ export class MapScene implements MapCamera {
   private roomState = new Map<string, StateKey>();
   private zoneById = new Map<string, Zone>();
   private glows = new Map<string, number>();
-  private fly: FlyGoal | null = null;
   private tmpColor = new THREE.Color();
-  private controls: OrbitControls;
+  private rig: CameraRig; // camera fix: free orbit/tilt/pan/zoom (world/cameraRig.ts)
   private floor = new THREE.Group();
   private planLayer = new FloorPlanLayer(); // floor plan image (LIVEOPS-97)
   private figures = new FigureLayer((x, y, out) => this.toWorld(x, y, out));
@@ -113,16 +110,11 @@ export class MapScene implements MapCamera {
     container.appendChild(this.renderer.domElement);
     this.readRendererInfo();
 
-    this.controls = new OrbitControls(this.camera, this.renderer.domElement);
-    this.controls.enableDamping = true;
-    this.controls.dampingFactor = 0.1;
-    this.controls.minPolarAngle = ORBIT.minPolar;
-    this.controls.maxPolarAngle = ORBIT.maxPolar;
-    this.controls.minZoom = ORBIT.minZoom;
-    this.controls.screenSpacePanning = true;
-    this.controls.listenToKeyEvents(container); // arrow keys pan when the map has focus
-    this.controls.keyPanSpeed = 20;
-    this.controls.addEventListener("start", () => { this.userMoved = true; this.fly = null; });
+    // --- camera fix --- mouse, trackpad, touch and keyboard (when the map has focus) move the camera.
+    this.rig = new CameraRig(this.camera, this.renderer.domElement, container);
+    this.rig.onUserInput = () => { this.userMoved = true; };
+    this.rig.onReset = () => this.reset();
+    // --- end camera fix ---
 
     this.lights = createLights(this.software);
     this.scene.add(this.lights.group);
@@ -138,7 +130,8 @@ export class MapScene implements MapCamera {
 
     const mq = matchMedia("(prefers-reduced-motion: reduce)");
     this.reducedMotion = mq.matches;
-    const onMq = () => { this.reducedMotion = mq.matches; this.applyMotionSetting(); };
+    this.rig.reducedMotion = mq.matches;
+    const onMq = () => { this.reducedMotion = mq.matches; this.rig.reducedMotion = mq.matches; this.applyMotionSetting(); };
     mq.addEventListener("change", onMq);
     this.disposers.push(() => mq.removeEventListener("change", onMq));
     this.disposers.push(onThemeChange(() => this.refreshTheme()));
@@ -286,59 +279,84 @@ export class MapScene implements MapCamera {
     this.labels.push({ el, pos });
   }
 
+  // --- camera fix --- framing, buttons and fly-to go through the camera rig.
   /** Frame the floor (and the Unassigned strip) from the default angle, fitted to the viewport aspect. */
   resetCamera() {
+    this.frameFloor(false);
+  }
+
+  /**
+   * Frame the whole floor. `keepAngle` (switching floors, "whole floor" tiles) keeps the
+   * user's rotation and tilt and zooms so the floor fits from that angle.
+   */
+  frameFloor(keepAngle = true) {
     const { width, depth } = floorSize(this.layout);
     const extra = this.placement?.unassigned ? this.placement.unassigned.h + 4 : 0;
     const dist = Math.max(120, Math.max(width, depth) * 2);
-    this.fly = null;
-    this.controls.target.set(0, 0, extra / 2);
-    this.camera.position.copy(VIEW_DIR).multiplyScalar(dist).add(this.controls.target);
     this.camera.near = 0.1;
     this.camera.far = dist * 4;
-    this.camera.zoom = 1;
-    this.controls.maxZoom = maxZoomFor(width, depth);
+    this.rig.distance = dist;
     this.fitFrustum();
-    this.controls.update();
+    const azimuth = keepAngle ? this.rig.goal.azimuth : DEFAULT_AZIMUTH;
+    const polar = keepAngle ? this.rig.goal.polar : DEFAULT_POLAR;
+    const zoom = keepAngle ? Math.min(1, frameZoomFor(width, depth + extra, this.aspect(), viewDirection(azimuth, polar))) : 1;
+    this.rig.jumpTo({ target: new THREE.Vector3(0, 0, extra / 2), azimuth, polar, zoom });
     this.userMoved = false;
+  }
+
+  private aspect(): number {
+    return Math.max(1, this.container.clientWidth) / Math.max(1, this.container.clientHeight);
   }
 
   private fitFrustum() {
     const { width, depth } = floorSize(this.layout);
     const extra = this.placement?.unassigned ? this.placement.unassigned.h + 4 : 0;
-    const w = Math.max(1, this.container.clientWidth), h = Math.max(1, this.container.clientHeight);
-    const aspect = w / h;
+    const aspect = this.aspect();
     this.frameHalf = fitOrtho(width, depth + extra, aspect);
     this.camera.top = this.frameHalf;
     this.camera.bottom = -this.frameHalf;
     this.camera.left = -this.frameHalf * aspect;
     this.camera.right = this.frameHalf * aspect;
     this.camera.updateProjectionMatrix();
+    this.rig.frameHalf = this.frameHalf;
+    this.rig.bounds = boundsFor(width, depth + 2 * extra, minZoomFor(width, depth + extra, aspect), maxZoomFor(width, depth));
   }
 
+  /** `factor` < 1 zooms in (buttons: 0.8 in, 1.25 out). */
   zoom(factor: number) {
-    this.userMoved = true;
-    this.fly = null;
-    this.camera.zoom = THREE.MathUtils.clamp(this.camera.zoom / factor, this.controls.minZoom, this.controls.maxZoom);
-    this.camera.updateProjectionMatrix();
-    this.controls.update();
+    if (factor > 0) this.rig.zoomBy(1 / factor);
   }
 
+  /** Turn the view by `radians` (positive: the map turns clockwise on screen). */
   rotate(radians: number) {
-    this.userMoved = true;
-    const off = this.camera.position.clone().sub(this.controls.target);
-    off.applyAxisAngle(new THREE.Vector3(0, 1, 0), radians);
-    this.camera.position.copy(this.controls.target).add(off);
-    this.controls.update();
+    this.rig.rotateBy(radians);
+  }
+
+  /** Tilt by `radians`: positive towards the horizon, negative towards a top view. */
+  tilt(radians: number) {
+    this.rig.tiltBy(radians);
+  }
+
+  /** Turn so north (the layout's top edge) points up. */
+  faceNorth() {
+    this.rig.faceNorth();
+  }
+
+  /** "Resume tracking" after the user panned away from a followed figure. */
+  resumeFollow() {
+    this.rig.resumeFollow();
+  }
+
+  /** Camera angles and follow state for the HUD (compass, Resume tracking). */
+  onCameraChange(fn: (s: CameraState) => void): () => void {
+    return this.rig.subscribe(fn);
   }
 
   /** Smoothly bring a layout point to the centre of the view (reduced motion: jump). */
-  flyTo(point: readonly [number, number], zoom = Math.max(this.camera.zoom, FOCUS_ZOOM)) {
+  flyTo(point: readonly [number, number], zoom = Math.max(this.rig.goal.zoom, FOCUS_ZOOM)) {
     if (!Number.isFinite(point[0]) || !Number.isFinite(point[1])) return;
     this.userMoved = true;
-    const z = THREE.MathUtils.clamp(Number.isFinite(zoom) ? zoom : FOCUS_ZOOM, this.controls.minZoom, this.controls.maxZoom);
-    this.fly = { target: this.toWorld(point[0], point[1], new THREE.Vector3()), zoom: z };
-    if (this.reducedMotion) this.stepFly();
+    this.rig.flyTo(this.toWorld(point[0], point[1], new THREE.Vector3()), Number.isFinite(zoom) ? zoom : FOCUS_ZOOM);
   }
 
   /** Fly to a zone of the current floor (e.g. a room picked in a panel), zoomed to fit it. False if it is not on this floor. */
@@ -346,25 +364,32 @@ export class MapScene implements MapCamera {
     const z = this.zoneById.get(zoneId);
     if (!z || !Array.isArray(z.polygon) || z.polygon.length < 3) return false;
     const b = polygonBounds(z.polygon);
-    const aspect = Math.max(1, this.container.clientWidth) / Math.max(1, this.container.clientHeight);
-    this.flyTo(polygonCentroid(z.polygon), zoomToFit(this.frameHalf, aspect, b.w, b.h, this.controls.minZoom, this.controls.maxZoom));
+    const { minZoom, maxZoom } = this.rig.bounds;
+    this.flyTo(polygonCentroid(z.polygon), zoomToFit(this.frameHalf, this.aspect(), b.w, b.h, minZoom, maxZoom));
     return true;
   }
 
+  /** The user's "Reset view": default framing; following (if on) pauses so the reset sticks. */
   reset() {
+    this.rig.pauseFollow();
     this.resetCamera();
   }
 
-  view(): { target: [number, number]; zoom: number } {
+  view(): CameraReadout {
     const { width, depth } = floorSize(this.layout);
-    const t = this.controls.target;
-    return { target: [Math.round((t.x + width / 2) * 100) / 100, Math.round((t.z + depth / 2) * 100) / 100], zoom: Math.round(this.camera.zoom * 1000) / 1000 };
+    const c = this.rig.current;
+    const r = (v: number, k: number) => Math.round(v * k) / k;
+    const s = this.rig.state();
+    return {
+      target: [r(c.target.x + width / 2, 100), r(c.target.z + depth / 2, 100)],
+      zoom: r(c.zoom, 1000),
+      azimuth: r(c.azimuth, 10000),
+      polar: r(c.polar, 10000),
+      following: s.following,
+      paused: s.paused,
+    };
   }
-
-  private stepFly() {
-    if (!this.fly) return;
-    if (flyStep(this.camera, this.controls.target, this.fly, this.reducedMotion ? 1 : FLY_EASE)) this.fly = null;
-  }
+  // --- end camera fix ---
 
   /**
    * Update assets. A new `placement` object rebuilds every instance; otherwise
@@ -414,6 +439,7 @@ export class MapScene implements MapCamera {
   /** Keep the camera on the selected figure while it moves. */
   setFollow(on: boolean) {
     this.following = on;
+    this.rig.setFollowing(on); // camera fix
     if (on) this.userMoved = true;
   }
 
@@ -538,8 +564,7 @@ export class MapScene implements MapCamera {
     this.raf = requestAnimationFrame(this.loop);
     const t0 = performance.now();
     this.animateMotion();
-    this.stepFly();
-    this.controls.update();
+    this.rig.update(t0); // camera fix: easing, inertia, follow
     if (this.pulses.size) this.animatePulses(t0);
     if (this.glows.size) this.animateGlows(t0);
     if (this.pointerDirty) {
@@ -575,16 +600,10 @@ export class MapScene implements MapCamera {
     if (this.following) this.followSelected();
   }
 
+  /** camera fix: the rig eases onto the followed figure unless the user panned away. */
   private followSelected() {
     const f = this.selected ? this.motion.get(this.selected) : undefined;
-    if (!f) return;
-    const goal = this.toWorld(f.x, f.y, this.tmpV);
-    const ease = this.reducedMotion ? 1 : FOLLOW_EASE;
-    const dx = (goal.x - this.controls.target.x) * ease;
-    const dz = (goal.z - this.controls.target.z) * ease;
-    if (Math.abs(dx) < 1e-4 && Math.abs(dz) < 1e-4) return;
-    this.controls.target.x += dx; this.controls.target.z += dz;
-    this.camera.position.x += dx; this.camera.position.z += dz;
+    this.rig.setFollowPoint(f ? this.toWorld(f.x, f.y, this.tmpV) : null);
   }
 
   private animateGlows(now: number) {
@@ -652,8 +671,7 @@ export class MapScene implements MapCamera {
   dispose() {
     cancelAnimationFrame(this.raf);
     for (const d of this.disposers) d();
-    this.controls.stopListenToKeyEvents();
-    this.controls.dispose();
+    this.rig.dispose(); // camera fix
     for (const l of this.labels) l.el.remove();
     this.labels = [];
     this.planLayer.dispose();
