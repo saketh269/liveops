@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { ApiError, api } from "../api/client";
 import type { Asset, Site } from "../api/types";
@@ -19,6 +19,7 @@ import { Legend } from "../map/panels";
 import { assetName } from "../map/reducer";
 import { webglAvailable } from "../map/webgl";
 import { useLiveSite, type LinkStatus } from "../map/useLiveSite";
+import { useTrack } from "../map/track/useTrack"; // track fix
 import "../map/map.css";
 
 function errorText(e: unknown, what: string): string {
@@ -128,8 +129,11 @@ function SiteMap({ siteId }: { siteId: string }) {
     api.sources().then((list) => setSourceNames(Object.fromEntries(list.map((s) => [s.id, s.name]))), () => {});
   }, [siteId]);
 
+  // --- track fix: Esc stops tracking first, then clears the selection ---
+  const trackEscape = useRef<() => boolean>(() => false);
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setSelected(null); };
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape" && !trackEscape.current()) setSelected(null); };
+  // --- end track fix ---
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, []);
@@ -168,6 +172,10 @@ function SiteMap({ siteId }: { siteId: string }) {
     }
   };
   /** Select and bring into view (KPI tiles, room chips, events, Find). */
+  // --- track fix: history, route and live tracking of the selected record ---
+  const track = useTrack({ siteId, layout, floors, floorId, assets: ui.assets, selectedId: selected, selectedAsset, setFloor, now, is3d: !use2d });
+  trackEscape.current = track.escape;
+  // --- end track fix ---
   const show = (id: string) => {
     select(id);
     setGlide((g) => ({ id, seq: (g?.seq ?? 0) + 1 }));
@@ -247,10 +255,13 @@ function SiteMap({ siteId }: { siteId: string }) {
             onDeparting={setDeparting}
             onProject={(p) => setProject(() => p)}
             glide={glide}
+            track={track.following /* track fix */}
+            onTrackHost={track.setHost}
           />
         )}
       </div>
       {!use2d && <ProblemPins pins={pins} project={project} onSelect={select} />}
+      {track.layer /* track fix: route, trail and notices */}
 
       <div className="lm-hud">
         <div className="lm-hud-top">
@@ -314,13 +325,15 @@ function SiteMap({ siteId }: { siteId: string }) {
             floorAssets={floorAssets}
             assets={ui.assets}
             feed={ui.feed}
-            selected={selectedAsset}
+            selected={track.asset /* track fix: stays open after the record leaves */}
             sourceNames={sourceNames}
             now={now}
             onSelect={show}
             onBack={() => { select(null); setFind(""); }}
+            actions={track.actions}
+            history={track.history}
           />
-          <JourneyCard asset={selectedAsset} />
+          <JourneyCard asset={track.asset} sub={track.journeySub}>{track.journey}</JourneyCard>
         </div>
       </div>
     </section>

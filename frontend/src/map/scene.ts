@@ -627,6 +627,16 @@ export class MapScene implements MapCamera {
     return { x: r.left + ((v.x + 1) / 2) * r.width, y: r.top + ((1 - v.y) / 2) * r.height };
   }
 
+  // --- track fix: project a layout point (route and trail overlay) ---
+  /** Page coordinates of a layout point on the floor, or null when it is outside the camera's depth range. */
+  screenOfPoint(x: number, y: number): { x: number; y: number } | null {
+    const v = this.toWorld(x, y, new THREE.Vector3()).setY(0.05).project(this.camera);
+    if (v.z > 1 || v.z < -1) return null;
+    const r = this.renderer.domElement.getBoundingClientRect();
+    return { x: r.left + ((v.x + 1) / 2) * r.width, y: r.top + ((1 - v.y) / 2) * r.height };
+  }
+  // --- end track fix ---
+
   /** Layout position currently drawn for a figure and whether it is moving, for tests and debugging. */
   positionOf(id: string): { x: number; y: number; moving: boolean; leaving: boolean } | null {
     const f = this.motion.get(id);

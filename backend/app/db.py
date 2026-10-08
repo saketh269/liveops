@@ -7,7 +7,7 @@ import uuid
 from collections.abc import Iterator
 from typing import Any
 
-from sqlalchemy import JSON, Boolean, Engine, Float, ForeignKey, String, Text, create_engine
+from sqlalchemy import JSON, BigInteger, Boolean, Engine, Float, ForeignKey, Index, Integer, String, Text, create_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 from app.config import get_settings
@@ -54,6 +54,29 @@ class Mapping(Base):
     active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_ts: Mapped[float] = mapped_column(Float, default=time.time)
     updated_ts: Mapped[float] = mapped_column(Float, default=time.time, onupdate=time.time)
+
+
+class AssetHistory(Base):
+    """One recorded change of one asset (app.core.history). No foreign key to
+    sites: rows are written in batches off the live path, and a site deleted
+    meanwhile must not fail the batch; its rows are deleted with it."""
+
+    __tablename__ = "asset_history"
+    id: Mapped[int] = mapped_column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True)
+    site_id: Mapped[str] = mapped_column(String(32))
+    asset_id: Mapped[str] = mapped_column(String(300))
+    ts: Mapped[float] = mapped_column(Float)
+    op: Mapped[str] = mapped_column(String(10))
+    removed: Mapped[bool] = mapped_column(Boolean, default=False)
+    source_id: Mapped[str] = mapped_column(String(32), default="")
+    mapping_id: Mapped[str] = mapped_column(String(32), default="")
+    changes: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)  # field -> [old, new] (tracked fields)
+    ctx: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)  # where/what after the change
+    __table_args__ = (
+        Index("ix_asset_history_site_asset_ts", "site_id", "asset_id", "ts"),
+        Index("ix_asset_history_site_ts", "site_id", "ts"),
+        Index("ix_asset_history_ts", "ts"),
+    )
 
 
 _engine: Engine | None = None

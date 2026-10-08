@@ -6,6 +6,7 @@ import type { MapState } from "./reducer";
 import type { MapScene } from "./scene";
 import type { MapCamera } from "./world/camera";
 import type { FlushListener } from "./useLiveSite";
+import type { TrackHost } from "./track/RouteOverlay"; // track fix
 
 type Props = {
   layout: SiteLayout;
@@ -39,6 +40,10 @@ type Props = {
   /** Each new value eases the camera onto that (selected) asset once. */
   glide?: { id: string; seq: number } | null;
   // --- end ui-shell hook ---
+  // --- track fix: live tracking keeps the camera on the selected figure; the overlay gets point projection ---
+  track?: boolean;
+  onTrackHost?: (host: TrackHost | null) => void;
+  // --- end track fix ---
 };
 
 declare global {
@@ -48,7 +53,7 @@ declare global {
 }
 
 /** Hosts the Three.js scene. Asset updates bypass React and go straight to the scene. */
-export default function MapView3D({ layout, stateRef, listen, selectedId, onHover, onSelect, onFail, debug, plan, assetFilter, viewKey, motion = true, onDeparting, focusZone, cameraRef, onProject, glide }: Props) {
+export default function MapView3D({ layout, stateRef, listen, selectedId, onHover, onSelect, onFail, debug, plan, assetFilter, viewKey, motion = true, onDeparting, focusZone, cameraRef, onProject, glide, track, onTrackHost }: Props) {
   const hostRef = useRef<HTMLDivElement>(null);
   const labelsRef = useRef<HTMLDivElement>(null);
   const [scene, setScene] = useState<MapScene | null>(null);
@@ -150,7 +155,16 @@ export default function MapView3D({ layout, stateRef, listen, selectedId, onHove
     const t = setTimeout(() => setGliding(false), 1200);
     return () => clearTimeout(t);
   }, [scene, glide]);
-  const following = (follow || gliding) && !!selectedId;
+  // --- track fix ---
+  const trackHostRef = useRef(onTrackHost);
+  trackHostRef.current = onTrackHost;
+  useEffect(() => {
+    if (!scene) return;
+    trackHostRef.current?.({ screenOfPoint: (x, y) => scene.screenOfPoint(x, y), positionOf: (id) => scene.positionOf(id) });
+    return () => trackHostRef.current?.(null);
+  }, [scene]);
+  const following = (follow || gliding || !!track) && !!selectedId;
+  // --- end track fix ---
   useEffect(() => { scene?.setFollow(following); }, [scene, following]);
 
   return (

@@ -1,5 +1,5 @@
 import type {
-  AppHealth, ConnectorSpec, Dataset, LayoutImportRequest, LayoutImportResult, Mapping, MappingConfig, MappingHealth, Site, SiteLayout, Source,
+  AppHealth, AssetHistory, ConnectorSpec, Dataset, LayoutImportRequest, LayoutImportResult, Mapping, MappingConfig, MappingHealth, Site, SiteLayout, Source,
   PlanUpload, SourceRecord, StreamMessage, Suggestion, TestReport, UploadResult,
 } from "./types";
 
@@ -88,6 +88,10 @@ export const api = {
     req<void>("DELETE", `/api/sites/${encodeURIComponent(siteId)}/plans/${encodeURIComponent(assetId)}`),
   importLayout: (siteId: string, b: LayoutImportRequest) =>
     req<LayoutImportResult>("POST", `/api/sites/${encodeURIComponent(siteId)}/layout/import`, b),
+  assetHistory: (siteId: string, assetId: string, q: { since?: number; until?: number; limit?: number } = {}) => {
+    const qs = new URLSearchParams(Object.entries(q).filter(([, v]) => v !== undefined).map(([k, v]) => [k, String(v)])).toString();
+    return req<AssetHistory>("GET", `/api/sites/${encodeURIComponent(siteId)}/assets/${encodeURIComponent(assetId)}/history${qs ? `?${qs}` : ""}`);
+  },
 
   mappings: (siteId?: string) => req<Mapping[]>("GET", `/api/mappings${siteId ? `?site_id=${siteId}` : ""}`),
   createMapping: (b: { site_id: string; source_id: string; dataset: string; config: MappingConfig; options?: Record<string, unknown>; active?: boolean }) =>
