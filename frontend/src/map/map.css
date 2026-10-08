@@ -24,8 +24,6 @@
   padding: 1px 6px; border-radius: 4px; opacity: 0.92; }
 .lm-zone-label--warn { color: var(--warn); border-color: var(--warn); }
 .lm-loading { position: absolute; inset: 0; display: grid; place-items: center; margin: 0; }
-.lm-view-controls { position: absolute; right: 8px; bottom: 8px; display: flex; flex-wrap: wrap; gap: 4px; justify-content: flex-end; }
-.lm-view-controls .btn { padding: 5px 10px; min-width: 34px; }
 .lm-fallback-note { margin: 0 0 6px; font-size: 0.8rem; }
 
 .lm-details-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
@@ -87,7 +85,6 @@
 }
 @media (max-width: 480px) {
   .lm-viewport { height: 360px; min-height: 0; }
-  .lm-view-controls .btn { padding: 4px 8px; }
   .lm-inline-field input { max-width: 150px; }
 }
 
@@ -128,7 +125,6 @@
 /* Figures (LIVEOPS-98): role accents use the panel token so they read on every state color, light and dark. */
 .lm-fig-accent { fill: var(--panel); stroke: none; }
 .lm-asset--leaving { opacity: 0.7; }
-.lm-view-controls .btn[aria-pressed="true"] { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
 
 /* ---------- Live map HUD (ADR 0007, LIVEOPS-111): the 3D view fills the page, glass cards float over it ---------- */
 body.lm-live-body .shell { height: 100dvh; overflow: hidden; }
@@ -159,10 +155,6 @@ body.lm-demo .nav { display: none; }
 .lm-hud-stage .lm-viewport { position: absolute; inset: 0; height: auto; min-height: 0; border: 0; border-radius: 0; }
 .lm-hud-stage .lm-viewport--2d { padding: 104px 350px 24px 84px; overflow: auto; background: var(--bg); }
 .lm-hud-stage .lm-svg { height: 100%; max-height: none; }
-.lm-live .lm-view-controls { right: 16px; bottom: 16px; padding: 5px; gap: 4px; border-radius: 12px; background: var(--glass);
-  border: 1px solid var(--glass-line); box-shadow: var(--hud-shadow); -webkit-backdrop-filter: blur(14px); backdrop-filter: blur(14px); }
-.lm-live .lm-view-controls .btn { border-color: transparent; background: transparent; border-radius: 8px; }
-.lm-live .lm-view-controls .btn:hover { background: var(--accent-soft); }
 
 .lm-hud { position: absolute; inset: 0; pointer-events: none; z-index: 2; }
 .lm-hud .lm-glass, .lm-hud-top > * { pointer-events: auto; }
@@ -335,7 +327,6 @@ button.lm-hud-chip { cursor: pointer; }
   .lm-hud-side--open .lm-hud-side-head { border-bottom: 1px solid var(--glass-line); }
   .lm-hud-journey { width: auto; min-width: 0; }
   .lm-hud-journey[data-empty] { display: none; } /* phones: the slot takes room only when it has a journey */
-  .lm-live .lm-view-controls { right: 12px; bottom: auto; top: 50%; transform: translateY(-50%); flex-direction: column; flex-wrap: nowrap; }
   .lm-hud-stage .lm-viewport--2d { padding: 0; }
 }
 @media (max-width: 560px) {
@@ -343,5 +334,4 @@ button.lm-hud-chip { cursor: pointer; }
   .lm-hud-tools input { width: 120px; }
   .lm-hud-kpi { min-width: 112px; padding: 7px 11px; }
   .lm-hud-kpi-val { font-size: 20px; }
-  .lm-live .lm-view-controls .btn:nth-child(-n + 4) { display: none; } /* pinch and drag do zoom and rotate on touch */
 }

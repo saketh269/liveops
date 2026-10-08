@@ -9,6 +9,10 @@ import { floorSize, PlacementCache, polygonCentroid } from "./placement";
 import { onThemeChange, stateKey } from "./stateColors";
 import { currentPalette } from "./world/style";
 import { roomStates, tintFor } from "./world/tint";
+// --- camera fix ---
+import CameraControls from "./hud/CameraControls";
+import { useView2D } from "./view2d";
+// --- end camera fix ---
 import type { Zone } from "../api/types";
 
 type Props = {
@@ -26,6 +30,8 @@ type Props = {
   ready?: boolean;
   /** Removed records still walking out, with their final data. */
   onDeparting?: (assets: Map<string, Asset>) => void;
+  /** camera fix: HUD slot for the camera controls; absent: drawn on the map. */
+  controlsHost?: HTMLElement | null;
 };
 
 const STACK = 0.15;
@@ -47,12 +53,13 @@ function prefersReducedMotion(): boolean {
 }
 
 /** Top-down SVG view used when WebGL is unavailable. Same zones, positions, figures and movement as the 3D map. */
-export default function Map2D({ layout, assets, selectedId, onSelect, onHover, reason, plan, motion = true, ready = true, onDeparting }: Props) {
+export default function Map2D({ layout, assets, selectedId, onSelect, onHover, reason, plan, motion = true, ready = true, onDeparting, controlsHost }: Props) {
   const cache = useMemo(() => new PlacementCache(), []);
   const placement = cache.get(layout, assets.values());
   const { width, depth } = floorSize(layout);
   const u = placement.unassigned;
   const totalH = u ? u.y + u.h + 1 : depth;
+  const cam = useView2D({ x: -2, y: -2, w: width + 4, h: totalH + 4 }); // camera fix: pan, zoom, rotate
 
   // Motion state lives outside React; walkers are moved by writing transforms directly.
   const engine = useMemo(() => new Motion(), []);
@@ -109,12 +116,14 @@ export default function Map2D({ layout, assets, selectedId, onSelect, onHover, r
     <div className="lm-viewport lm-viewport--2d">
       {reason && <p className="lm-fallback-note muted">2D view: {reason}</p>}
       <svg
-        className="lm-svg"
-        viewBox={`-2 -2 ${width + 4} ${totalH + 4}`}
+        ref={cam.svgRef}
+        className="lm-svg lm-svg--cam"
+        viewBox={cam.viewBox}
         role="img"
         aria-label={`Top view of the site floor, ${width} by ${depth}, with ${assets.size} assets`}
         onClick={(e) => { if (e.target === e.currentTarget) onSelect(null); }}
       >
+        <g ref={cam.groupRef} transform={cam.contentTransform}>{/* camera fix: rotation */}
         <rect className="lm-floor" x={0} y={0} width={width} height={depth} />
         {(layout.zones ?? []).map((z, i) => {
           if (!(z.polygon?.length >= 3)) return null;
@@ -163,7 +172,9 @@ export default function Map2D({ layout, assets, selectedId, onSelect, onHover, r
             <text key={z.id} className="lm-zone-text" x={polygonCentroid(z.polygon)[0]} y={polygonCentroid(z.polygon)[1]} style={{ fontSize: labelSize(z, z.name || z.id) }}>{z.name || z.id}</text>
           ) : null,
         )}
+        </g>
       </svg>
+      <CameraControls camera={cam.handle} host={controlsHost} />{/* camera fix */}
     </div>
   );
 }
