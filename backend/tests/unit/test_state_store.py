@@ -27,6 +27,7 @@ def ev(
     op: AssetOp = AssetOp.UPSERT,
     ts: float | None = None,
     site: str = "s",
+    attached: bool = False,
 ) -> AssetEvent:
     return AssetEvent(
         site_id=site,
@@ -37,6 +38,7 @@ def ev(
         dataset="d",
         fields=fields or {},
         received_ts=time.time() if ts is None else ts,
+        attached=attached,
     )
 
 
@@ -434,8 +436,9 @@ async def test_random_merge_sequences_match_between_stores(store_factory: StoreF
 
     rnd = random.Random(92)
     redis_store, ref = store_factory(), InMemoryStateStore()
-    for step in range(600):
-        mapping = rnd.choice(["m1", "m2", "m3"])
+    for step in range(900):
+        mapping = rnd.choice(["m1", "m2", "m3", "m4"])  # m3, m4: attached (LIVEOPS-116)
+        attached = mapping in ("m3", "m4")
         asset = rnd.choice(["A", "B", "C"])
         ts = float(rnd.randint(1, 40))  # small range: plenty of equal timestamps
         if rnd.random() < 0.25:
@@ -443,9 +446,9 @@ async def test_random_merge_sequences_match_between_stores(store_factory: StoreF
         else:
             names = rnd.sample(["state", "label", "zone"], rnd.randint(1, 3))
             fields: dict[str, Any] = {n: rnd.choice(["x", "y", "z"]) for n in names}
-            if rnd.random() < 0.3:
-                fields["attributes"] = {rnd.choice(["k1", "k2"]): rnd.randint(0, 2)}
-            e = ev(fields, asset=asset, src=f"src-{mapping}", mapping=mapping, ts=ts)
+            if rnd.random() < 0.5:
+                fields["attributes"] = {rnd.choice(["status", "k2"]): rnd.choice(["a", "b", None])}
+            e = ev(fields, asset=asset, src=f"src-{mapping}", mapping=mapping, ts=ts, attached=attached)
         got, want = await redis_store.apply(e), await ref.apply(e)
         assert (got and (got.type, got.assets)) == (want and (want.type, want.assets)), f"step {step}: {e}"
     assert {a.asset_id: a.flat() for a in await redis_store.site_assets("s")} == {
@@ -456,6 +459,92 @@ async def test_random_merge_sequences_match_between_stores(store_factory: StoreF
         return [(e["asset_id"], e["changes"], e["removed"]) for e in entries]
 
     assert changes(await redis_store.events("s", limit=1000)) == changes(await ref.events("s", limit=1000))
+
+
+# LIVEOPS-116 / LIVEOPS-115: an attached mapping (transport on a patient,
+# cleaning task on a bed) never takes over the record's own status.
+
+
+def transport(fields: dict[str, Any] | None, ts: float, op: AssetOp = AssetOp.UPSERT) -> AssetEvent:
+    return ev(fields, asset="P1", src="tr", mapping="m-tr", ts=ts, op=op, attached=True)
+
+
+def patient(fields: dict[str, Any] | None, ts: float, op: AssetOp = AssetOp.UPSERT) -> AssetEvent:
+    return ev(fields, asset="P1", src="ehr", mapping="m-pt", ts=ts, op=op)
+
+
+async def test_attached_status_never_replaces_own_status_live_or_after_reload(store: StateStore) -> None:
+    await store.apply(
+        patient({"state": "alert", "attributes": {"status": "waiting_for_provider", "bed_id": "ED-02"}}, 1)
+    )
+    live = await store.apply(transport({"attributes": {"status": "in_progress", "to": "Radiology – MRI"}}, 2))
+    assert live is not None and live.type == "upsert"
+    want_attached = {"m-tr": {"source_id": "tr", "attributes": {"status": "in_progress", "to": "Radiology – MRI"}}}
+    for view in (live.assets[0], (await store.site_assets("s"))[0].flat()):
+        # The patient's own status wins the merged field, however new the transport is.
+        assert view["attributes"]["status"] == "waiting_for_provider"
+        assert view["_sources"]["attributes.status"] == "ehr" and view["state"] == "alert"
+        # The transport's own values stay available; keys only it sends still merge in.
+        assert view["_attached"] == want_attached
+        assert view["attributes"]["to"] == "Radiology – MRI" and view["_sources"]["attributes.to"] == "tr"
+    # A reload (snapshot from the store) gives exactly what the live stream gave.
+    gen = store.subscribe("s")
+    snap = await next_msg(gen)
+    await gen.aclose()
+    assert snap.assets == live.assets
+    # The transport's event records its own status; the patient's records the patient's.
+    assert (await store.events("s"))[-1]["changes"]["attributes.status"] == [None, "in_progress"]
+    await store.apply(transport({"attributes": {"status": "done", "to": "Radiology – MRI"}}, 3))
+    assert (await store.events("s"))[-1]["changes"] == {"attributes.status": ["in_progress", "done"]}
+    [a] = await store.site_assets("s")
+    assert a.flat()["attributes"]["status"] == "waiting_for_provider"
+    assert a.flat()["_attached"]["m-tr"]["attributes"]["status"] == "done"
+    await store.apply(patient({"state": "in_use", "attributes": {"status": "in_treatment", "bed_id": "ED-02"}}, 4))
+    last = (await store.events("s"))[-1]
+    assert last["changes"]["attributes.status"] == ["waiting_for_provider", "in_treatment"]
+    # The transport leaving drops only its namespace and its own keys.
+    msg = await store.apply(transport(None, 5, op=AssetOp.REMOVE))
+    assert msg is not None and msg.type == "upsert"
+    assert "_attached" not in msg.assets[0] and msg.assets[0]["attributes"] == {
+        "status": "in_treatment",
+        "bed_id": "ED-02",
+    }
+    assert (await store.events("s"))[-1]["changes"] == {
+        "attributes.status": ["done", None],
+        "attributes.to": ["Radiology – MRI", None],
+    }
+
+
+async def test_own_status_wins_even_when_attached_arrived_first(store: StateStore) -> None:
+    await store.apply(transport({"attributes": {"status": "requested"}}, 1))
+    [a] = await store.site_assets("s")
+    assert a.flat()["attributes"]["status"] == "requested"  # nothing of its own yet: details only
+    await store.apply(patient({"state": "alert", "attributes": {"status": "boarding"}}, 0.5))  # older, still wins
+    [a] = await store.site_assets("s")
+    assert a.flat()["attributes"]["status"] == "boarding" and a.flat()["_sources"]["attributes.status"] == "ehr"
+    assert (await store.events("s"))[-1]["changes"]["attributes.status"] == [None, "boarding"]
+    # The patient leaving: its own status is gone (not "now requested").
+    await store.apply(patient(None, 2, op=AssetOp.REMOVE))
+    last = (await store.events("s"))[-1]
+    assert last["changes"] == {"state": ["alert", None], "attributes.status": ["boarding", None]}
+    assert describe(last) == "P1 is no longer in this source (still reported by another)"
+    [a] = await store.site_assets("s")
+    assert a.flat()["attributes"] == {"status": "requested"}
+
+
+async def test_bed_event_text_uses_the_beds_own_previous_status(store: StateStore) -> None:
+    bed = {"asset": "ED-11", "src": "beds", "mapping": "m-bed"}
+    task = {"asset": "ED-11", "src": "evs", "mapping": "m-clean", "attached": True}
+    await store.apply(ev({"state": "in_use", "attributes": {"status": "occupied"}}, ts=1, **bed))  # type: ignore[arg-type]
+    await store.apply(ev({"attributes": {"status": "queued", "priority": "stat"}}, ts=2, **task))  # type: ignore[arg-type]
+    await store.apply(ev({"state": "cleaning", "attributes": {"status": "dirty"}}, ts=3, **bed))  # type: ignore[arg-type]
+    last = (await store.events("s"))[-1]
+    assert last["changes"]["attributes.status"] == ["occupied", "dirty"]
+    assert describe(last) == "ED-11 is dirty (was occupied)"
+    [a] = await store.site_assets("s")
+    assert a.flat()["_attached"] == {
+        "m-clean": {"source_id": "evs", "attributes": {"status": "queued", "priority": "stat"}}
+    }
 
 
 # LIVEOPS-55: a burst of removes (pause/delete/reconcile) must not resync viewers.

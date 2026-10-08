@@ -1,6 +1,6 @@
 import type { Asset, SiteLayout } from "../api/types";
 import {
-  attachedSections, detailOnly, durWords, eventText, fieldLabel, humanizeToken, inSentence, isRawToken, looksTransient,
+  attachedOf, attachedSections, detailOnly, durWords, eventText, fieldLabel, humanizeToken, inSentence, isRawToken, looksTransient,
   ownStatus, resetOwnStatus, shortRoomLabel, shortSourceName, splitTransient, statusText, valueText, whoName, zoneLabel,
 } from "./labels";
 
@@ -108,6 +108,32 @@ describe("attached sources", () => {
     expect(shortSourceName("Housekeeping")).toBe("Housekeeping");
   });
 });
+
+// --- state (LIVEOPS-116) ---
+describe("attached values kept apart by the server (_attached)", () => {
+  const reloaded = () => rec({
+    asset_id: "P1", kind: "patient", state: "alert",
+    attributes: { status: "waiting_for_provider", to: "Radiology – MRI" },
+    _sources: { state: "pat", zone: "pat", "attributes.status": "pat", "attributes.to": "tr" },
+    _attached: { "m-tr": { source_id: "tr", attributes: { status: "in_progress", to: "Radiology – MRI" } } },
+  });
+
+  test("after a reload the card shows the patient's own status and the transport's", () => {
+    resetOwnStatus(); // a fresh page: nothing remembered from the live stream
+    const p = reloaded();
+    expect(statusText(p)).toBe("Waiting for provider");
+    const [t] = attachedSections(p, { tr: "Riverside – Transport requests" }, { now: NOW, layout });
+    expect(`${t.title}: ${t.summary}`).toBe("Transport to Radiology – MRI: in progress");
+    expect(attachedOf(p).map((g) => g.source_id)).toEqual(["tr"]);
+    expect(attachedOf(rec({ _attached: { x: "bad" } }))).toEqual([]);
+  });
+
+  test("the attached source's own status change is named by the source", () => {
+    const ctx = { layout, sourceNames: { tr: "Riverside – Transport requests" } };
+    expect(eventText({ source: "tr", changes: { "attributes.status": ["requested", "assigned"] } }, reloaded(), ctx)).toBe("transport is now assigned");
+  });
+});
+// --- end state ---
 
 describe("event text", () => {
   const ctx = { layout, sourceNames: { tr: "Riverside – Transport requests" } };
