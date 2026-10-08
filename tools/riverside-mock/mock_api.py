@@ -2,7 +2,8 @@
 
 Same endpoints, auth and JSON shapes as the API on the user's PC (http://localhost:8000):
 /api/floor-layout, /api/units, /api/beds, /api/patients, /api/staff, /api/ambulances,
-/api/cleaning-tasks, /api/transport-requests, plus PATCH /api/beds/{id}. Lists return
+/api/cleaning-tasks, /api/transport-requests, plus PATCH /api/beds/{id} and PATCH /api/patients/{id}
+(test tool: move a patient, e.g. {"bed_id": "3W-305A", "status": "admitted"}). Lists return
 {"count": n, "items": [...]}. Auth: X-API-Key header, Bearer token or ?api_key=.
 
 The floor layout follows the real one: 5 floors, ED (20 rooms), ICU (12), CVU (8 x 2 beds),
@@ -327,6 +328,26 @@ def make_handler(h: Hospital) -> type[BaseHTTPRequestHandler]:
                         return self._send(404, {"detail": "Not Found"})
                     b.update({k: v for k, v in body.items() if k in ("status", "blocked_reason")}, status_since=now_iso(), updated_at=now_iso())
                     return self._send(200, b)
+            if path.startswith("/api/patients/"):
+                pid = path.removeprefix("/api/patients/")
+                with LOCK:
+                    p = h.patients.get(pid)
+                    if not p:
+                        return self._send(404, {"detail": "Not Found"})
+                    bed = body.get("bed_id", p["bed_id"])
+                    if bed is not None and bed not in h.beds:
+                        return self._send(422, {"detail": f"Unknown bed {bed}"})
+                    if bed != p["bed_id"]:  # the old bed needs cleaning, the new one is taken
+                        if p["bed_id"] in h.beds:
+                            h.beds[p["bed_id"]].update(status="dirty", status_since=now_iso(), patient_id=None, updated_at=now_iso())
+                        if bed is not None:
+                            h.beds[bed].update(status="occupied", status_since=now_iso(), patient_id=pid, updated_at=now_iso())
+                            p["unit_id"] = BED_INDEX[bed][1]
+                    p.update({k: v for k, v in body.items() if k in ("status", "current_location", "unit_id")}, bed_id=bed,
+                             updated_at=now_iso())
+                    if "current_location" not in body and "bed_id" in body:
+                        p["current_location"] = bed or p["unit_id"]
+                    return self._send(200, p)
             return self._send(404, {"detail": "Not Found"})
 
     return Handler
