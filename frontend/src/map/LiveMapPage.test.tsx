@@ -19,6 +19,10 @@ vi.mock("../api/client", () => ({
     sources: () => Promise.resolve([{ id: "src", name: "Hospital EHR" }]),
     mappings: () => Promise.resolve(mappingsList),
     updateSite: (...args: unknown[]) => updateSite(...args),
+    assetHistory: (siteId: string, assetId: string) => Promise.resolve({
+      site_id: siteId, asset_id: assetId, present: true, current: null, history_since: 1, retention_days: 30, truncated: false,
+      entries: [], milestones: [], now: 2,
+    }),
   },
   openSiteStream: (_id: string, onMessage: (m: StreamMessage) => void, onStatus?: (s: "open" | "closed") => void) => {
     push = onMessage;
@@ -82,7 +86,7 @@ test("stream drives the 2D fallback, KPI tiles, the side card and its events", a
   const card = screen.getByRole("complementary", { name: "B1" });
   expect(card.querySelector(".lm-hud-chip--alert")!.textContent).toBe("Alert");
   expect(within(within(card).getByRole("region", { name: "From ehr" })).getByText("Location")).toBeTruthy();
-  expect(screen.getByRole("region", { name: /Journey/ }).textContent).toContain("No journey to show for B1 yet.");
+  expect(await within(screen.getByRole("region", { name: /Journey/ })).findByText("No state changes recorded yet.")).toBeTruthy();
   fireEvent.click(within(card).getByRole("button", { name: "Back" }));
   expect(screen.getByRole("complementary", { name: "Main floor" })).toBeTruthy();
   act(() => status?.("closed"));

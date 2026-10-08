@@ -184,3 +184,35 @@ export type LayoutImportSummary = {
   problems: string[]; // block saving; same rules as the layout editor
 };
 export type LayoutImportResult = { layout: SiteLayout; summary: LayoutImportSummary; saved: boolean };
+
+// GET /api/sites/{id}/assets/{asset_id}/history (backend/app/api/history.py)
+export type HistoryPlace = { zone_id: string | null; zone: string | null; bed: string | null; floor_id: string | null; floor: string | null };
+export type HistoryKind = "arrived" | "move" | "status" | "task" | "left" | "update";
+export type HistoryEntry = HistoryPlace & {
+  ts: number;
+  kind: HistoryKind;
+  text: string;
+  source: string | null;
+  status: string | null; // plain words ("Waiting for provider")
+  status_raw: unknown;
+  changes: Record<string, [unknown, unknown]>;
+  duration_s?: number;
+  duration_text?: string; // "in ED-02 for 42 min"
+  ongoing?: boolean;
+  floor_change?: { from: string; to: string };
+  task?: string; // attached record's label ("Cleaning task")
+  task_status?: string | null;
+};
+export type HistoryMilestone = { key: string; label: string; ts: number; value: unknown; status: unknown; seen_ts: number };
+export type AssetHistory = {
+  site_id: string;
+  asset_id: string;
+  present: boolean;
+  current: HistoryPlace | null;
+  history_since: number | null; // Live Ops knows history from when it started watching
+  retention_days: number;
+  truncated: boolean;
+  entries: HistoryEntry[];
+  milestones: HistoryMilestone[];
+  now: number;
+};

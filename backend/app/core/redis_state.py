@@ -203,7 +203,7 @@ return emit(akey, ikey, lkey, chan, site, asset, op, src, mapping, ts_s, maxlen,
 # site's hash tag, so they live in the same cluster slot as KEYS.
 # KEYS: 1 site index, 2 event stream, 3 channel
 # ARGV: 1 asset key prefix, 2 site_id, 3 mapping_id, 4 ts, 5 log maxlen, 6.. asset ids to keep
-# Returns how many assets were touched.
+# Returns the published payloads as one JSON array (one per touched asset).
 _RECONCILE_LUA = (
     _LUA_LIB
     + r"""
@@ -211,18 +211,17 @@ local ikey, lkey, chan = KEYS[1], KEYS[2], KEYS[3]
 local prefix, site, mapping, ts_s, maxlen = ARGV[1], ARGV[2], ARGV[3], ARGV[4], ARGV[5]
 local keep = {}
 for i = 6, #ARGV do keep[ARGV[i]] = true end
-local touched = 0
+local out = {}
 for _, asset in ipairs(redis.call('ZRANGE', ikey, 0, -1)) do
   if not keep[asset] then
     local akey = prefix .. asset
     local changes, empty, visible = remove_mapping(akey, mapping)
     if changes and (empty or visible) then
-      emit(akey, ikey, lkey, chan, site, asset, 'remove', '', mapping, ts_s, maxlen, changes, empty)
-      touched = touched + 1
+      table.insert(out, emit(akey, ikey, lkey, chan, site, asset, 'remove', '', mapping, ts_s, maxlen, changes, empty))
     end
   end
 end
-return touched
+return '[' .. table.concat(out, ',') .. ']'
 """
 )
 
@@ -349,8 +348,16 @@ class RedisStateStore(StateStore):
         raw = await self._apply_script(keys=keys, args=args)
         if not raw:
             return None
+        payload = json.loads(raw)
+        self._record_payload(payload)
         # Subscribers in every process (this one included) get it via pub/sub.
-        return _messages(s, json.loads(raw))[0]
+        return _messages(s, payload)[0]
+
+    def _record_payload(self, payload: dict[str, Any]) -> None:
+        """Hand the change to the durable history (the process that applied it records it)."""
+        if payload.get("event") is not None:
+            asset = fold_attributes(dict(payload["asset"])) if payload["kind"] == "upsert" else None
+            self._record(payload["event"], asset)
 
     async def site_assets(self, site_id: str) -> list[Asset]:
         raw = await self._snapshot_script(keys=[self._index_key(site_id)], args=[f"{self._site(site_id)}:a:"])
@@ -369,7 +376,10 @@ class RedisStateStore(StateStore):
     async def reconcile(self, site_id: str, mapping_id: str, keep: set[str]) -> int:
         keys = [self._index_key(site_id), self._log_key(site_id), self._channel(site_id)]
         args = [f"{self._site(site_id)}:a:", site_id, mapping_id, repr(time.time()), str(self._maxlen), *keep]
-        return int(await self._reconcile_script(keys=keys, args=args))
+        payloads = json.loads(await self._reconcile_script(keys=keys, args=args))
+        for payload in payloads:
+            self._record_payload(payload)
+        return len(payloads)
 
     @property
     def redis(self) -> aioredis.Redis:
