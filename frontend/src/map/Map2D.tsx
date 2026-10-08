@@ -6,7 +6,10 @@ import { FigureGlyph } from "./FigureGlyph";
 import { FIGURE_LABELS, type BodyPose } from "./figures";
 import { Motion, type FigureState } from "./motion";
 import { floorSize, PlacementCache, polygonCentroid } from "./placement";
-import { stateKey } from "./stateColors";
+import { onThemeChange, stateKey } from "./stateColors";
+import { currentPalette } from "./world/style";
+import { roomStates, tintFor } from "./world/tint";
+import type { Zone } from "../api/types";
 
 type Props = {
   layout: SiteLayout;
@@ -26,6 +29,13 @@ type Props = {
 };
 
 const STACK = 0.15;
+
+/** Zone name size (SVG units) that fits the zone's width; at most the stylesheet's 2. */
+function labelSize(z: Zone, text: string): number {
+  const xs = z.polygon.map((p) => p[0]);
+  const w = Math.max(...xs) - Math.min(...xs);
+  return Math.max(0.5, Math.min(2, (w * 0.9) / (Math.max(1, text.length) * 0.62)));
+}
 
 function transformOf(f: FigureState): string {
   const deg = (f.heading * 180) / Math.PI;
@@ -48,6 +58,10 @@ export default function Map2D({ layout, assets, selectedId, onSelect, onHover, r
   const engine = useMemo(() => new Motion(), []);
   const [reduced, setReduced] = useReducer((_: boolean, v: boolean) => v, false, prefersReducedMotion);
   const [, rerender] = useReducer((n: number) => n + 1, 0);
+  // Room tint (ADR 0007), same palette as the 3D view; follows the app theme.
+  const [palette, setPalette] = useReducer((_: ReturnType<typeof currentPalette>, v: ReturnType<typeof currentPalette>) => v, undefined, currentPalette);
+  useEffect(() => onThemeChange(() => setPalette(currentPalette())), []);
+  const rooms = roomStates(layout.zones ?? [], assets.values());
   const els = useRef(new Map<string, SVGGElement>());
   const departingSeen = useRef(0);
   const cb = useRef(onDeparting);
@@ -102,16 +116,23 @@ export default function Map2D({ layout, assets, selectedId, onSelect, onHover, r
         onClick={(e) => { if (e.target === e.currentTarget) onSelect(null); }}
       >
         <rect className="lm-floor" x={0} y={0} width={width} height={depth} />
-        {(layout.zones ?? []).map((z, i) =>
-          z.polygon?.length >= 3 ? (
+        {(layout.zones ?? []).map((z, i) => {
+          if (!(z.polygon?.length >= 3)) return null;
+          const tint = z.kind === "room" ? tintFor(rooms.get(z.id), palette) : null;
+          const style = tint
+            ? { fill: tint.color, fillOpacity: 0.2 + tint.strength * 0.75 }
+            : z.kind === "corridor" ? { fill: palette.corridor } : z.color ? { fill: z.color } : undefined;
+          return (
             <polygon
               key={z.id}
               className={`lm-zone ${i % 2 ? "lm-zone--alt" : ""}`}
+              data-zone={z.id}
+              data-room-state={tint ? rooms.get(z.id) ?? "none" : undefined}
               points={z.polygon.map((p) => p.join(",")).join(" ")}
-              style={z.color ? { fill: z.color } : undefined}
+              style={style}
             />
-          ) : null,
-        )}
+          );
+        })}
         {plan && <FloorPlanImage plan={plan} />}
         {u && (
           <g>
@@ -138,8 +159,8 @@ export default function Map2D({ layout, assets, selectedId, onSelect, onHover, r
         ))}
         {/* Labels last so assets never hide them. */}
         {(layout.zones ?? []).map((z) =>
-          z.polygon?.length >= 3 ? (
-            <text key={z.id} className="lm-zone-text" x={polygonCentroid(z.polygon)[0]} y={polygonCentroid(z.polygon)[1]}>{z.name || z.id}</text>
+          z.polygon?.length >= 3 && z.kind !== "corridor" ? (
+            <text key={z.id} className="lm-zone-text" x={polygonCentroid(z.polygon)[0]} y={polygonCentroid(z.polygon)[1]} style={{ fontSize: labelSize(z, z.name || z.id) }}>{z.name || z.id}</text>
           ) : null,
         )}
       </svg>
