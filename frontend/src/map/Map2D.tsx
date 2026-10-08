@@ -1,4 +1,8 @@
 import { useEffect, useMemo, useReducer, useRef } from "react";
+import { navFloorOf } from "./navigation";
+import type { TrackHost } from "./track/RouteOverlay";
+import { wallPlanFor } from "./world/wallPlan";
+import "./map2d.css";
 import type { Asset, SiteLayout } from "../api/types";
 import { FloorPlanImage } from "./FloorPlanImage";
 import type { PlanView } from "./floors";
@@ -33,6 +37,12 @@ type Props = {
   onDeparting?: (assets: Map<string, Asset>) => void;
   /** camera fix: HUD slot for the camera controls; absent: drawn on the map. */
   controlsHost?: HTMLElement | null;
+  /** Keep the selected figure in view as it moves (tracking). */
+  follow?: boolean;
+  /** The camera's Follow button: start or stop tracking the selection. Absent: no Follow button. */
+  onFollow?: () => void;
+  /** Gets point projection and figure positions for the route and trail overlay while the view is up. */
+  onTrackHost?: (host: TrackHost | null) => void;
 };
 
 const STACK = 0.15;
@@ -54,7 +64,7 @@ function prefersReducedMotion(): boolean {
 }
 
 /** Top-down SVG view used when WebGL is unavailable. Same zones, positions, figures and movement as the 3D map. */
-export default function Map2D({ layout, assets, selectedId, onSelect, onHover, reason, plan, motion = true, ready = true, onDeparting, controlsHost }: Props) {
+export default function Map2D({ layout, assets, selectedId, onSelect, onHover, reason, plan, motion = true, ready = true, onDeparting, controlsHost, follow = false, onFollow, onTrackHost }: Props) {
   const cache = useMemo(() => new PlacementCache(), []);
   const placement = cache.get(layout, assets.values());
   const { width, depth } = floorSize(layout);
@@ -81,6 +91,42 @@ export default function Map2D({ layout, assets, selectedId, onSelect, onHover, r
   engine.update(assets, placement, !primed.current);
   if (ready) primed.current = true;
   const figures = [...engine.all()];
+  // The same walls as the 3D view and navigation (world/wallPlan): rooms with door gaps, building walls with entrances.
+  const walls = useMemo(() => wallPlanFor(navFloorOf(layout)), [layout]);
+
+  // Route and trail overlay (map/track): layout point → page point, and where a figure is drawn now.
+  const hostRef = useRef(onTrackHost);
+  hostRef.current = onTrackHost;
+  useEffect(() => {
+    const host: TrackHost = {
+      screenOfPoint: (x, y) => {
+        const m = cam.groupRef.current?.getScreenCTM?.();
+        if (!m) return null;
+        const p = new DOMPoint(x, y).matrixTransform(m);
+        return { x: p.x, y: p.y };
+      },
+      positionOf: (id) => {
+        const f = engine.get(id);
+        return f ? { x: f.x, y: f.y, moving: engine.isMoving(id), leaving: f.leaving } : null;
+      },
+    };
+    hostRef.current?.(host);
+    return () => hostRef.current?.(null);
+  }, [engine, cam.groupRef]);
+
+  // Following: the view glides onto the selected figure and keeps it in the middle while it walks.
+  const following = follow && !!selectedId;
+  const { setFollowing, followTo } = cam;
+  useEffect(() => { setFollowing(following); }, [setFollowing, following]);
+  useEffect(() => {
+    if (!following || !selectedId) return;
+    let raf = requestAnimationFrame(function tick() {
+      const f = engine.get(selectedId);
+      if (f && !f.leaving) followTo(f.x, f.y);
+      raf = requestAnimationFrame(tick);
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [following, selectedId, engine, followTo]);
 
   useEffect(() => {
     if (typeof matchMedia !== "function") return;
@@ -118,7 +164,7 @@ export default function Map2D({ layout, assets, selectedId, onSelect, onHover, r
       {reason && <p className="lm-fallback-note muted">2D view: {reason}</p>}
       <svg
         ref={cam.svgRef}
-        className="lm-svg lm-svg--cam"
+        className="lm-svg lm-svg--cam lm-svg--walls"
         viewBox={cam.viewBox}
         role="img"
         aria-label={`Top view of the site floor, ${width} by ${depth}, with ${assets.size} assets`}
@@ -144,6 +190,10 @@ export default function Map2D({ layout, assets, selectedId, onSelect, onHover, r
           );
         })}
         {plan && <FloorPlanImage plan={plan} />}
+        <g className="lm-2d-walls" aria-hidden="true">
+          {walls.inner.map((w, i) => <line key={`i${i}`} className="lm-2d-wall" x1={w.a[0]} y1={w.a[1]} x2={w.b[0]} y2={w.b[1]} />)}
+          {walls.outer.map((w, i) => <line key={`o${i}`} className="lm-2d-wall lm-2d-wall--outer" x1={w.a[0]} y1={w.a[1]} x2={w.b[0]} y2={w.b[1]} />)}
+        </g>
         {u && (
           <g>
             <rect className="lm-unassigned" x={u.x} y={u.y} width={u.w} height={u.h} />
@@ -175,7 +225,8 @@ export default function Map2D({ layout, assets, selectedId, onSelect, onHover, r
         )}
         </g>
       </svg>
-      <CameraControls camera={cam.handle} host={controlsHost} />{/* camera fix */}
+      <CameraControls camera={cam.handle} host={controlsHost}
+        follow={onFollow ? { on: following, enabled: !!selectedId, toggle: onFollow } : undefined} />{/* camera fix */}
     </div>
   );
 }

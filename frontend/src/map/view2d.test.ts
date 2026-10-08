@@ -1,4 +1,4 @@
-import { SCALE_2D, clampView2D, initialView2D, pan2D, rotate2D, rotationOf, viewBoxOf, zoom2DAt } from "./view2d";
+import { FOLLOW_SCALE_2D, SCALE_2D, clampView2D, follow2D, initialView2D, outerPoint, pan2D, rotate2D, rotationOf, viewBoxOf, zoom2DAt } from "./view2d";
 
 const box = { x: -2, y: -2, w: 104, h: 54 };
 
@@ -43,5 +43,21 @@ describe("2D view", () => {
     };
     expect(under(v1)[0]).toBeCloseTo(under(v0)[0]);
     expect(under(v1)[1]).toBeCloseTo(under(v0)[1]);
+  });
+
+  test("following glides onto the figure and zooms in, also when the map is turned", () => {
+    for (const rot of [0, Math.PI / 3]) {
+      let v = initialView2D(box, rot);
+      for (let i = 0; i < 60; i++) v = follow2D(v, box, 80, 10);
+      const p = outerPoint(v, box, 80, 10);
+      expect(v.cx).toBeCloseTo(p.x, 2);
+      expect(v.cy).toBeCloseTo(p.y, 2);
+      expect(v.scale).toBeCloseTo(FOLLOW_SCALE_2D, 2);
+    }
+    // one frame moves only part of the way (a glide, not a jump), and never zooms out
+    const one = follow2D({ ...initialView2D(box), scale: 4 }, box, 80, 10);
+    expect(one.cx).toBeGreaterThan(50);
+    expect(one.cx).toBeLessThan(80);
+    expect(one.scale).toBe(4);
   });
 });

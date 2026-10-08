@@ -239,6 +239,11 @@ function SiteMap({ siteId }: { siteId: string }) {
             onDeparting={setDeparting}
             reason={force2d ? "selected with ?view=2d." : `${glError} Showing a top view instead.`}
             controlsHost={camHost}
+            // --- track2: route, trail and follow in the 2D view (LIVEOPS-112/117) ---
+            follow={track.following}
+            onFollow={track.toggle}
+            onTrackHost={track.setHost}
+            // --- end track2 ---
           />
         ) : (
           <MapView3D
