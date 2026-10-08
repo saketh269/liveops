@@ -14,9 +14,10 @@ from sqlalchemy import select
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from app import __version__
-from app.api import layout_import, mappings, plans, sites, sources, stream, system, uploads, webhooks
+from app.api import history, layout_import, mappings, plans, sites, sources, stream, system, uploads, webhooks
 from app.api.deps import mapping_spec
 from app.config import get_settings
+from app.core.history import HistoryRecorder
 from app.core.runner import MappingSpec, RunnerManager
 from app.core.state import InMemoryStateStore, StateStore
 from app.db import Mapping, Source, new_session
@@ -67,6 +68,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
     logging.basicConfig(level=settings.log_level, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     app.state.store = make_store()
+    # Asset history (LIVEOPS_HISTORY_DAYS): every applied change, written in batches off the live path.
+    app.state.history = HistoryRecorder(retention_days=settings.history_days)
+    app.state.store.history_sink = app.state.history.record
+    await app.state.history.start()
     app.state.runner = make_runner(app.state.store)
     if settings.start_runners:
         # Join the cluster first (Redis): even with no active mappings, this
@@ -86,6 +91,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     log.info("Live Ops %s started", __version__)
     yield
     await app.state.runner.stop_all()
+    await app.state.history.close()
     await app.state.store.close()
 
 
@@ -117,7 +123,7 @@ def create_app() -> FastAPI:
     )
     for r in (system.router, sources.router, sites.router, mappings.router, stream.router):
         app.include_router(r)
-    for r in (webhooks.router, uploads.router, plans.router, layout_import.router):  # layout_import: ADR 0007
+    for r in (webhooks.router, uploads.router, plans.router, layout_import.router, history.router):  # ADR 0007
         app.include_router(r)
     return app
 

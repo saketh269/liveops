@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from app.api.deps import runner
 from app.api.plans import remove_site_plans
 from app.api.schemas import SiteIn, SiteOut, SiteUpdate
+from app.core.history import delete_site_history
 from app.core.runner import RunnerManager
 from app.db import Mapping, Site, get_session
 
@@ -74,6 +75,7 @@ async def delete_site(
     for m in session.scalars(select(Mapping).where(Mapping.site_id == s.id)):
         await rm.stop(m.id, site_id=s.id)
     site_key = s.id
+    delete_site_history(session, site_key)
     session.delete(s)
     session.commit()
     await asyncio.to_thread(remove_site_plans, site_key)  # floor plan images go with the site

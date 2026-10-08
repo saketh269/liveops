@@ -21,7 +21,7 @@ import asyncio
 import contextlib
 import time
 from collections import defaultdict
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Callable
 from typing import Any
 
 from app.core.eventlog import EventEntry, InMemoryEventLog, feed_item
@@ -121,9 +121,20 @@ def event_messages(site_id: str, entry: EventEntry | None) -> list[StreamMessage
     return [StreamMessage(type="event", site_id=site_id, event=feed_item(entry), ts=entry["ts"])]
 
 
+# Called with every event-log entry this process writes and the asset's flat
+# view after the change (None on a removal). Must not block: the durable
+# history (app.core.history) only queues it.
+HistorySink = Callable[[EventEntry, dict[str, Any] | None], None]
+
+
 class StateStore(abc.ABC):
     def __init__(self, queue_size: int = 1000) -> None:
         self._fanout = Fanout(queue_size)
+        self.history_sink: HistorySink | None = None
+
+    def _record(self, entry: EventEntry | None, asset: dict[str, Any] | None) -> None:
+        if entry is not None and self.history_sink is not None:
+            self.history_sink(entry, asset)
 
     @abc.abstractmethod
     async def apply(self, event: AssetEvent) -> StreamMessage | None:
@@ -226,6 +237,7 @@ class InMemoryStateStore(StateStore):
                 return None
             if entry is not None:
                 self._log.append(entry)
+                self._record(entry, msg.assets[0] if msg.type == "upsert" else None)
             # Publish under the lock so every subscriber sees changes in apply order.
             self._fanout.publish(msg)
             for m in event_messages(event.site_id, entry):

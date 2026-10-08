@@ -48,6 +48,9 @@ class Settings(BaseSettings):
     # s3_files sources may use the server's own AWS credentials (instance role,
     # env vars) only if this is true AND the source opts in. Default: never.
     s3_allow_instance_role: bool = False
+    # Asset history (who was where, when): kept this many days in the portal
+    # DB (LIVEOPS_HISTORY_DAYS); 0 turns recording off.
+    history_days: float = 30.0
 
 
 @lru_cache
