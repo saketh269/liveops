@@ -13,22 +13,36 @@ with X-API-Key sign-in, polled every 3 s, and a layout built from /api/floor-lay
 (POST /api/sites/{id}/layout/import, ADR 0007) through the beds source; this script then only
 adds the Riverside-only areas (fleet bays, support areas, basement, entrances). If that Live Ops
 has no import endpoint yet, it falls back to building the whole layout here.
+
+Sign-in (ADR 0008): pass an API token with `--token lo_…` (or env LIVEOPS_TOKEN); create one
+under My account → API tokens. For a local dev install, `--email/--password` signs in instead
+and uses the session cookie plus its CSRF token.
 """
 
 from __future__ import annotations
 
 import argparse
+import http.cookiejar
 import json
+import os
+import sys
 import urllib.request as u
 from typing import Any
 
 KEY = "demo-key"
 
+# Sign-in for requests to Live Ops (ADR 0008): set by sign_in_to_liveops().
+_jar = http.cookiejar.CookieJar()
+_opener = u.build_opener(u.HTTPCookieProcessor(_jar))
+_liveops = ""
+_auth_headers: dict[str, str] = {}
+
 
 def req(base: str, method: str, path: str, body: Any = None, headers: dict[str, str] | None = None) -> Any:
+    extra = _auth_headers if _liveops and base == _liveops else {}
     r = u.Request(base + path, method=method, data=json.dumps(body).encode() if body is not None else None,
-                  headers={"Content-Type": "application/json", **(headers or {})})
-    with u.urlopen(r, timeout=60) as x:
+                  headers={"Content-Type": "application/json", **extra, **(headers or {})})
+    with _opener.open(r, timeout=60) as x:
         raw = x.read()
         return json.loads(raw) if raw else None
 
@@ -137,6 +151,24 @@ def import_layout(liveops: str, site_id: str, source_id: str) -> dict[str, Any] 
     return layout
 
 
+def sign_in_to_liveops(liveops: str, token: str | None, email: str | None, password: str | None) -> None:
+    """Bearer API token, or (local dev) sign in with email/password and use the session + CSRF cookie."""
+    global _liveops
+    _liveops = liveops
+    if token:
+        _auth_headers["Authorization"] = f"Bearer {token}"
+        return
+    if email and password:
+        try:
+            req(liveops, "POST", "/api/auth/signin", {"email": email, "password": password, "remember": False})
+        except u.HTTPError as e:
+            sys.exit(f"Sign-in to Live Ops failed ({e.code}): {e.read()[:300]!r}")
+        csrf = next((c.value for c in _jar if c.name == "liveops_csrf"), "")
+        _auth_headers["X-CSRF-Token"] = csrf
+        return
+    print("No --token or --email/--password given; this only works if Live Ops runs with LIVEOPS_AUTH_REQUIRED=false.")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--liveops", default="http://localhost:8000")
@@ -145,7 +177,12 @@ def main() -> None:
     ap.add_argument("--site", default="hs")
     ap.add_argument("--import-layout", action="store_true",
                     help="let Live Ops read the floor layout through the beds source (falls back to building it here)")
+    ap.add_argument("--token", default=os.environ.get("LIVEOPS_TOKEN"),
+                    help="Live Ops API token (lo_…), from My account → API tokens; or env LIVEOPS_TOKEN")
+    ap.add_argument("--email", help="local dev: sign in with this account instead of a token")
+    ap.add_argument("--password", default=os.environ.get("LIVEOPS_PASSWORD"), help="with --email (or env LIVEOPS_PASSWORD)")
     a = ap.parse_args()
+    sign_in_to_liveops(a.liveops, a.token, a.email, a.password)
     fetch = a.fetch or a.api
     sites = req(a.liveops, "GET", "/api/sites")
     site = next((s for s in sites if s["name"].lower() == a.site.lower()), None)

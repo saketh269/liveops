@@ -18,6 +18,10 @@ from cryptography.fernet import Fernet
 
 os.environ.setdefault("LIVEOPS_SECRET_KEY", Fernet.generate_key().decode())
 os.environ.setdefault("LIVEOPS_ALLOWED_HOSTS", "testserver")  # TestClient / ASGI test host
+# --- auth-api --- the tests written before sign-in (ADR 0008) run without it;
+# tests/*/test_auth*.py switch it back on with the ``auth_on`` fixture.
+os.environ.setdefault("LIVEOPS_AUTH_REQUIRED", "false")
+# --- auth-api ---
 
 PG_DSN = os.environ.get("LIVEOPS_TEST_PG_DSN")
 requires_pg = pytest.mark.skipif(not PG_DSN, reason="LIVEOPS_TEST_PG_DSN not set")

@@ -37,10 +37,37 @@ your sources. If it changes, the portal asks you to enter those passwords again.
 docker compose up --build
 ```
 
-Open http://localhost:8080.
+Open http://localhost:8080. The first visit asks you to **create your admin
+account** (organisation name, your name, email and a password of at least 10
+characters). Upgrading an install from before sign-in works the same way: your
+sources, sites and mappings are kept, and the first visit creates the admin.
+After that, everyone signs in; admins add people under **Users** (invite link or
+password) with a role: admin, manager, viewer (read-only) or wallboard (live map only).
 
-> **Local use only in v0.1.** There is no sign-in yet, so the portal only
-> listens on your own computer. Don't expose it on a network until sign-in ships.
+Without email settings, invite and password-reset links appear in the admin
+screen to copy, and are written to the backend log (`docker compose logs backend`).
+To send them by email, set `LIVEOPS_SMTP_HOST`, `LIVEOPS_SMTP_PORT`,
+`LIVEOPS_SMTP_USER`, `LIVEOPS_SMTP_PASSWORD`, `LIVEOPS_SMTP_FROM` and
+`LIVEOPS_PUBLIC_URL` (the address people open, used in links) in `.env`.
+
+> **Still local by default.** The portal listens only on your own computer.
+> Before you share it with a team, serve it over HTTPS (sign-in cookies are then
+> marked Secure; set `LIVEOPS_COOKIE_SECURE=true` if TLS ends at a proxy) and add
+> its host name to `LIVEOPS_ALLOWED_HOSTS`. See ADR 0008.
+
+### API tokens for scripts
+
+Scripts use an API token instead of a password: in the app open **My account →
+API tokens**, create one and copy it (it is shown once). Send it as
+`Authorization: Bearer lo_…`, for example:
+
+```bash
+python tools/riverside-mock/setup_site.py --liveops http://localhost:8000 --token lo_... --site hs
+```
+
+A token acts with your role and stops working when you delete it or your account
+is turned off. On a local dev install, `--email you@example.org --password ...`
+signs in instead.
 
 ## Update to a new version
 
