@@ -51,6 +51,18 @@ class Settings(BaseSettings):
     # Asset history (who was where, when): kept this many days in the portal
     # DB (LIVEOPS_HISTORY_DAYS); 0 turns recording off.
     history_days: float = 30.0
+    # Sign-in and accounts (ADR 0008). Every route except the open ones needs a
+    # signed-in user. Only the existing test suite switches this off.
+    auth_required: bool = True
+    cookie_secure: bool = False  # always mark cookies Secure (also automatic on HTTPS requests)
+    public_signup: bool = False  # anyone may create a new organisation at /signup
+    public_url: str = ""  # e.g. https://liveops.example.org — base of links in emails
+    smtp_host: str = ""  # empty: links are logged (INFO) instead of emailed
+    smtp_port: int = 587
+    smtp_user: str = ""
+    smtp_password: str = ""
+    smtp_from: str = ""
+    smtp_starttls: bool = True
 
 
 @lru_cache

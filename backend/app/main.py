@@ -5,7 +5,7 @@ import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -14,8 +14,11 @@ from sqlalchemy import select
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from app import __version__
+from app.api import auth as auth_api  # --- auth-api ---
 from app.api import history, layout_import, mappings, plans, sites, sources, stream, system, uploads, webhooks
+from app.api import users as users_api  # --- auth-api ---
 from app.api.deps import mapping_spec
+from app.auth.guard import AuthMiddleware, default_access  # --- auth-api ---
 from app.config import get_settings
 from app.core.history import HistoryRecorder
 from app.core.runner import MappingSpec, RunnerManager
@@ -100,7 +103,8 @@ SECRETS_HINT = "Open the source, enter its password or token again, and save. Th
 
 def create_app() -> FastAPI:
     settings = get_settings()
-    app = FastAPI(title="Live Ops", version=__version__, lifespan=lifespan)
+    # --- auth-api --- every route needs a signed-in user with a fitting role (ADR 0008)
+    app = FastAPI(title="Live Ops", version=__version__, lifespan=lifespan, dependencies=[Depends(default_access)])
 
     @app.exception_handler(SecretsError)
     async def _secrets_error(_: Request, exc: SecretsError) -> JSONResponse:
@@ -112,7 +116,8 @@ def create_app() -> FastAPI:
         errors = [{k: v for k, v in e.items() if k not in ("input", "ctx", "url")} for e in exc.errors()]
         return JSONResponse(status_code=422, content={"detail": jsonable_encoder(errors)})
 
-    # The portal has no sign-in yet (v0.1, see ADR 0005): only answer for the
+    app.add_middleware(AuthMiddleware)  # --- auth-api --- innermost: runs after host/CORS checks
+    # Kept from ADR 0005 alongside sign-in (ADR 0008): only answer for the
     # host names it is meant to be reached by, which also blocks DNS rebinding.
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=settings.allowed_hosts)
     app.add_middleware(
@@ -125,6 +130,8 @@ def create_app() -> FastAPI:
         app.include_router(r)
     for r in (webhooks.router, uploads.router, plans.router, layout_import.router, history.router):  # ADR 0007
         app.include_router(r)
+    app.include_router(auth_api.router)  # --- auth-api ---
+    app.include_router(users_api.router)  # --- auth-api ---
     return app
 
 
