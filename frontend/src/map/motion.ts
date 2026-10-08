@@ -13,9 +13,15 @@
 // "standing"), walks via the bedside and the corridors to the new bedside, and
 // lies down; staff walk bedside to bedside; a discharged patient gets up and
 // walks out to the nearest exit (a corridor end on floors without entrances).
+//
+// Walls (LIVEOPS-107): every route comes from the navigation grid, which walks
+// on the same wall plan the 3D world draws, so each straight run between route
+// points is clear of walls; a figure that can't walk to its place walks as far
+// as it can and is then put in place. People come onto a floor at its own
+// entrances or at the lift and stair cores, inside the building.
 import type { Asset, SiteLayout } from "../api/types";
 import { figureOf, isPerson, isVehicle, type FigureModel } from "./figures";
-import { navGridFor, nearestExit, type NavGrid } from "./navigation";
+import { navGridFor, type NavGrid } from "./navigation";
 import type { Placement, PlacementResult, Pose, Pt } from "./placement";
 
 /** Walking speed in layout units per second (layouts are drawn in metres: 1.4 m/s). */
@@ -269,14 +275,15 @@ export class Motion {
     return f.pose === "lying" && !f.walk ? f.target?.approach ?? null : null;
   }
 
-  /** Route from `from` (via the bedside it gets up to) to a placement, ending at its approach and then on it. */
+  /**
+   * Route from `from` (via the bedside it gets up to) to a placement, ending at its
+   * approach and then on it. Every leg is routed, so no run goes through a wall; when
+   * the place can't be walked to, the route stops short and the figure lands from there.
+   */
   private routeTo(from: Pt, via: Pt | null, p: Placement): Pt[] {
-    const start = via ?? from;
     const goal: Pt = p.approach ?? [p.x, p.y];
-    const mid = this.nav().route(start, goal).points;
-    const pts: Pt[] = [from, ...(via ? [via] : []), ...mid.slice(1)];
-    if (p.approach) pts.push([p.x, p.y]);
-    return pts;
+    const stops: Pt[] = [from, ...(via ? [via] : []), goal, ...(p.approach ? [[p.x, p.y] as Pt] : [])];
+    return this.nav().walk(stops).points;
   }
 
   private arrive(id: string, a: Asset, p: Placement, key: string, model: FigureModel, now: number) {
@@ -286,7 +293,11 @@ export class Motion {
     if (!this.enabled || this.walking.size >= this.maxWalkers) return;
     const vehicle = isVehicle(model);
     const nav = this.nav();
-    const entrance = nearestExit(nav.floor, [p.x, p.y], vehicle ? "ambulance" : "walk");
+    // Walkers come in at an entrance or a lift/stair core inside the building; vehicles on the
+    // approach road to an ambulance entrance. Without one (or off the floor) they appear in place.
+    const here: Pt = [p.x, p.y];
+    const entrance = p.unassigned ? null : vehicle ? nav.entranceNear(here, "ambulance") : nav.exitNear(here, "walk");
+    if (!entrance) return;
     const start: Pt = vehicle ? approachPoint(nav, entrance) : entrance;
     f.x = start[0]; f.y = start[1]; f.level = 0;
     this.startWalk(f, () => {
@@ -295,14 +306,15 @@ export class Motion {
     }, model, now);
   }
 
+  /** Route out of the floor: to the nearest entrance or core (vehicles on along the approach road); [from] when there is none. */
   private exitRoute(from: Pt, model: FigureModel, via: Pt | null = null): Pt[] {
     const nav = this.nav();
     const vehicle = isVehicle(model);
     const start = via ?? from;
-    const exit = nearestExit(nav.floor, start, vehicle ? "ambulance" : "walk");
-    const inner = nav.route(start, exit).points;
-    const head: Pt[] = via ? [from, via] : [];
-    return vehicle ? [...inner, approachPoint(nav, exit)] : [...head, ...inner.slice(via ? 1 : 0)];
+    const exit = vehicle ? nav.entranceNear(start, "ambulance") : nav.exitNear(start, "walk");
+    if (!exit) return [from];
+    const r = nav.walk([from, ...(via ? [via] : []), exit]);
+    return vehicle && r.reached ? [...r.points, approachPoint(nav, exit)] : r.points;
   }
 
   private startWalk(f: Fig, plan: () => Pt[], model: FigureModel, now: number) {
@@ -322,7 +334,7 @@ export class Motion {
 
   private plan(w: Walk, from: Pt, now: number) {
     let route = w.plan();
-    if (route.length < 2) route = [from, route[0] ?? from];
+    if (route.length < 2) route = [from, from]; // nowhere to walk: lands (or leaves) at once
     // The figure starts exactly where it is drawn now.
     route = [from, ...route.slice(1)];
     const cum = [0];
