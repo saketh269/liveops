@@ -112,6 +112,7 @@ function SiteMap({ siteId }: { siteId: string }) {
   const [frame, setFrame] = useState(0);
   const [project, setProject] = useState<Projector | null>(null);
   const [find, setFind] = useState("");
+  const [camHost, setCamHost] = useState<HTMLDivElement | null>(null); // camera fix: HUD slot for the camera controls
   const [sourceNames, setSourceNames] = useState<Record<string, string>>({});
   // Removed records still walking out keep their last data in the card.
   const [departing, setDeparting] = useState<ReadonlyMap<string, Asset>>(() => new Map());
@@ -229,6 +230,7 @@ function SiteMap({ siteId }: { siteId: string }) {
             ready={ui.snapshotReceived}
             onDeparting={setDeparting}
             reason={force2d ? "selected with ?view=2d." : `${glError} Showing a top view instead.`}
+            controlsHost={camHost}
           />
         ) : (
           <MapView3D
@@ -247,6 +249,7 @@ function SiteMap({ siteId }: { siteId: string }) {
             onDeparting={setDeparting}
             onProject={(p) => setProject(() => p)}
             glide={glide}
+            controlsHost={camHost}
           />
         )}
       </div>
@@ -307,6 +310,7 @@ function SiteMap({ siteId }: { siteId: string }) {
         {floors.length > 1 && <FloorRail floors={floors} current={floorId} counts={floorCounts} problems={floorProblems} onChange={setFloor} />}
         {!demo && <SetupHints site={site} assets={ui.assets} ready={ui.snapshotReceived} onSite={setSite} onEditLayout={() => setEdit(true)} floorId={floorId} />}
 
+        <div className="lm-hud-camera" ref={setCamHost} />{/* camera fix: camera controls render here */}
         <div className="lm-hud-dock">
           <SideCard
             layout={layout}
