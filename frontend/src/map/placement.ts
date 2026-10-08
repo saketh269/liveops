@@ -9,6 +9,8 @@
 // anchor that names nothing placed falls back to normal zone placement.
 import type { Asset, SiteLayout, Zone } from "../api/types";
 import { figureOf, isPerson } from "./figures";
+import { isNurseStation } from "./world/walls";
+import { WALKER_RADIUS, deskBox, nurseDesk } from "./world/wallPlan";
 
 export const DEFAULT_WIDTH = 100;
 export const DEFAULT_DEPTH = 60;
@@ -16,6 +18,11 @@ export const DEFAULT_DEPTH = 60;
 export const MIN_SPACING = 0.6;
 export const UNASSIGNED_GAP = 4;
 export const UNASSIGNED_SPACING = 2;
+/**
+ * Figures packed in a zone keep this far from its edges, where the walls are drawn
+ * (half a wall plus a walker, and a little air): nobody stands in a wall (LIVEOPS-107).
+ */
+export const WALL_MARGIN = 0.45;
 
 export type Pt = [number, number];
 export type Rect = { x: number; y: number; w: number; h: number };
@@ -97,14 +104,38 @@ export function polygonCentroid(poly: readonly Pt[]): Pt {
   return [cx / (3 * a), cy / (3 * a)];
 }
 
-function gridPoints(poly: readonly Pt[], b: Rect, s: number): Pt[] {
+/** Distance from a point to the nearest edge of a polygon. */
+export function distToEdges(p: Pt, poly: readonly Pt[]): number {
+  let best = Infinity;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const [ax, ay] = poly[j], [bx, by] = poly[i];
+    const dx = bx - ax, dy = by - ay;
+    const l2 = dx * dx + dy * dy;
+    const t = l2 > 0 ? Math.max(0, Math.min(1, ((p[0] - ax) * dx + (p[1] - ay) * dy) / l2)) : 0;
+    best = Math.min(best, Math.hypot(p[0] - ax - dx * t, p[1] - ay - dy * t));
+  }
+  return best;
+}
+
+/** Inside the polygon and at least `margin` from its edges. */
+const insideBy = (x: number, y: number, poly: readonly Pt[], margin: number) =>
+  pointInPolygon(x, y, poly) && (margin <= 0 || distToEdges([x, y], poly) >= margin - 1e-9);
+
+function gridPoints(poly: readonly Pt[], b: Rect, s: number, margin = 0): Pt[] {
   const pts: Pt[] = [];
-  for (let y = b.y + s / 2; y < b.y + b.h; y += s) {
-    for (let x = b.x + s / 2; x < b.x + b.w; x += s) {
-      if (pointInPolygon(x, y, poly)) pts.push([x, y]);
+  const x0 = b.x + margin, y0 = b.y + margin, x1 = b.x + b.w - margin, y1 = b.y + b.h - margin;
+  for (let y = y0 + s / 2; y < y1; y += s) {
+    for (let x = x0 + s / 2; x < x1; x += s) {
+      if (insideBy(x, y, poly, margin)) pts.push([x, y]);
     }
   }
   return pts;
+}
+
+/** Edge margin for packing a zone: WALL_MARGIN, less in zones too small for it. */
+export function zoneMargin(poly: readonly Pt[]): number {
+  const b = polygonBounds(poly);
+  return Math.min(WALL_MARGIN, 0.25 * Math.min(b.w, b.h));
 }
 
 /**
@@ -112,20 +143,22 @@ function gridPoints(poly: readonly Pt[], b: Rect, s: number): Pt[] {
  * sqrt(area / n) and shrinks until everything fits or MIN_SPACING is reached.
  * Returns fewer than `n` points only on overflow.
  */
-export function packPolygon(poly: readonly Pt[], n: number): { points: Pt[]; spacing: number } {
+export function packPolygon(poly: readonly Pt[], n: number, margin = 0): { points: Pt[]; spacing: number } {
   if (n <= 0 || poly.length < 3) return { points: [], spacing: 0 };
   const b = polygonBounds(poly);
   const area = polygonArea(poly);
   if (area <= 0) return { points: [], spacing: 0 };
-  let s = Math.sqrt(area / n);
+  const ratio = b.w > 0 && b.h > 0 ? Math.max(0, (b.w - 2 * margin) * (b.h - 2 * margin)) / (b.w * b.h) : 1;
+  let s = Math.sqrt(Math.max(area * ratio, area * 0.05) / n);
   for (let i = 0; i < 60; i++) {
     if (s <= MIN_SPACING) break;
-    const pts = gridPoints(poly, b, s);
+    const pts = gridPoints(poly, b, s, margin);
     if (pts.length >= n) return { points: pts.slice(0, n), spacing: s };
     s *= 0.92;
   }
   s = MIN_SPACING;
-  return { points: gridPoints(poly, b, s), spacing: s };
+  const pts = gridPoints(poly, b, s, margin);
+  return { points: pts.length || margin <= 0 ? pts : gridPoints(poly, b, s), spacing: s };
 }
 
 const collator = new Intl.Collator("en", { numeric: true, sensitivity: "variant" });
@@ -192,7 +225,13 @@ export function placeAssets(layout: SiteLayout | null | undefined, assets: Itera
     const ids = byZone.get(z.id);
     if (!ids) continue;
     ids.sort(compareIds);
-    const { points, spacing } = packPolygon(z.polygon, ids.length);
+    if (isNurseStation(z) && !ids.some((id) => beds.has(id))) {
+      // Staff at a nurse station stand behind its desk, facing it, not in it.
+      const spots = stationSpots(z, ids.length);
+      ids.forEach((id, i) => positions.set(id, { ...spots[i], zoneId: z.id, level: 0, size: 1, unassigned: false, pose: "standing", anchorId: null }));
+      continue;
+    }
+    const { points, spacing } = packPolygon(z.polygon, ids.length, zoneMargin(z.polygon));
     const slots: Pt[] = points.length ? points : [polygonCentroid(z.polygon)];
     if (slots.length < ids.length) overflow.push(z.id);
     const size = clampSize(spacing || MIN_SPACING);
@@ -225,6 +264,35 @@ export function placeAssets(layout: SiteLayout | null | undefined, assets: Itera
   placeAnchored(zones, anchored, anchorOf, positions, list);
 
   return { positions, unassigned, overflow };
+}
+
+/**
+ * Spots behind a nurse-station desk (the side away from the station's door), in rows
+ * along the desk, each facing it and clear of it by a walker's width.
+ */
+export function stationSpots(z: Zone, n: number): { x: number; y: number; heading: number }[] {
+  const desk = nurseDesk(z);
+  const box = deskBox(desk);
+  const door = (z.doors ?? []).find((d) => Array.isArray(d) && Number.isFinite(d[0]) && Number.isFinite(d[1]));
+  // Unit normal pointing to the staff side (away from the door; else +y / +x).
+  const across = desk.along ? 1 : 0; // 1: rows run along x, staff stand on ±y
+  const doorSide = door ? (across ? Math.sign(door[1] - desk.cy) : Math.sign(door[0] - desk.cx)) : -1;
+  const side = doorSide === 0 ? 1 : -doorSide;
+  const half = across ? box.h / 2 : box.w / 2;
+  const len = (across ? box.w : box.h) - 0.4;
+  const step = 0.7;
+  const perRow = Math.max(1, Math.floor(len / step) + 1);
+  const out: { x: number; y: number; heading: number }[] = [];
+  for (let i = 0; i < n; i++) {
+    const row = Math.floor(i / perRow), k = i % perRow;
+    const inRow = Math.min(perRow, n - row * perRow);
+    const along = (k - (inRow - 1) / 2) * step;
+    const off = half + WALKER_RADIUS + 0.1 + row * 0.65;
+    const x = across ? desk.cx + along : desk.cx + side * off;
+    const y = across ? desk.cy + side * off : desk.cy + along;
+    out.push({ x, y, heading: across ? (side > 0 ? -Math.PI / 2 : Math.PI / 2) : (side > 0 ? Math.PI : 0) });
+  }
+  return out;
 }
 
 // ---- anchors ----
@@ -323,8 +391,9 @@ export function bedSpot(z: Zone): { at: Pt; heading: number } {
 
 /**
  * Bedside spot `k` around an anchor at `t`: alternating sides of the bed, then
- * further along it. Spots outside the anchor's zone are pulled in or moved to
- * the other side, so nobody stands in a wall.
+ * further along it. Spots keep WALL_MARGIN-ish clear of the anchor zone's edges
+ * (where its walls are): pulled in towards the bed, else moved to the open side,
+ * else to the foot of the bed (towards the door), so nobody stands in a wall.
  */
 export function bedsideSpot(t: Placement, k: number, isBed: boolean, zone: Zone | undefined): Pt {
   const h = t.heading ?? 0;
@@ -336,16 +405,45 @@ export function bedsideSpot(t: Placement, k: number, isBed: boolean, zone: Zone 
   const along = (j % 2 === 1 ? 1 : -1) * Math.ceil(j / 2) * BEDSIDE_STEP * S;
   const alongC = isBed ? Math.max(-BED_HALF_LENGTH * S * 1.4, Math.min(BED_HALF_LENGTH * S * 1.4, along)) : along;
   const first = k % 2 === 0 ? 1 : -1;
-  const at = (side: number, d: number): Pt => [t.x + nx * side * d + ux * alongC, t.y + ny * side * d + uy * alongC];
+  const at = (side: number, d: number, a = alongC): Pt => [t.x + nx * side * d + ux * a, t.y + ny * side * d + uy * a];
   const d0 = half + BEDSIDE_CLEARANCE * S;
   if (!zone) return at(first, d0);
-  for (const side of [first, -first]) {
-    for (let d = d0; d >= half * 0.6; d -= 0.1 * S) {
+  const clear = Math.min(WALL_MARGIN, zoneMargin(zone.polygon));
+  const ok = (p: Pt) => insideBy(p[0], p[1], zone.polygon, clear);
+  const dMin = half + Math.min(0.12 * S, 0.2);
+  // The open side first: the one with more room between the bed and the wall.
+  const room = (side: number) => distToEdges(at(side, half, 0), zone.polygon) * (pointInPolygon(...at(side, half, 0), zone.polygon) ? 1 : -1);
+  const sides = room(first) + 0.05 >= room(-first) ? [first, -first] : [-first, first];
+  for (const side of sides) {
+    for (let d = d0; d >= dMin - 1e-9; d -= 0.05 * S) {
       const p = at(side, d);
-      if (pointInPolygon(p[0], p[1], zone.polygon)) return p;
+      if (ok(p)) return p;
     }
   }
-  return at(first, d0);
+  // No room beside the bed: at its foot (towards the door), fanned out across it.
+  const foot = (isBed ? BED_HALF_LENGTH : 0.5) * S + BEDSIDE_CLEARANCE * S;
+  const fan = (j % 2 === 1 ? 1 : -1) * Math.ceil(j / 2) * BEDSIDE_STEP * S * first;
+  for (let d = foot; d >= foot * 0.6; d -= 0.05 * S) {
+    const p = at(1, fan, d);
+    if (ok(p)) return p;
+  }
+  // Last resort: the point of the zone deepest inside it near the bed.
+  return deepestNear(zone.polygon, [t.x, t.y]);
+}
+
+/** A point inside the polygon, near `p`, as far from its edges as the neighbourhood allows. */
+function deepestNear(poly: readonly Pt[], p: Pt): Pt {
+  const b = polygonBounds(poly);
+  let best: Pt = polygonCentroid(poly), score = -Infinity;
+  const step = Math.max(0.1, Math.min(b.w, b.h) / 12);
+  for (let y = b.y + step / 2; y < b.y + b.h; y += step) {
+    for (let x = b.x + step / 2; x < b.x + b.w; x += step) {
+      if (!pointInPolygon(x, y, poly)) continue;
+      const sc = Math.min(distToEdges([x, y], poly), WALL_MARGIN) * 4 - Math.hypot(x - p[0], y - p[1]);
+      if (sc > score) { score = sc; best = [x, y]; }
+    }
+  }
+  return best;
 }
 
 function placeAnchored(zones: readonly Zone[], anchored: Asset[], anchorOf: (a: Asset) => string | null, positions: Map<string, Placement>, all: readonly Asset[]) {
