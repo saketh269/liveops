@@ -44,6 +44,10 @@ type Props = {
   // --- track fix: live tracking keeps the camera on the selected figure; the overlay gets point projection ---
   track?: boolean;
   onTrackHost?: (host: TrackHost | null) => void;
+  /** track2: the Follow button starts/stops tracking (which follows across floors) instead of a camera-only follow. */
+  onFollow?: () => void;
+  /** track2: each new value glides the camera to the selected figure once it is drawn. */
+  refocus?: number;
   // --- end track fix ---
   // --- camera fix ---
   /** HUD slot for the camera controls (they take their own place among the cards on phones); absent: drawn on the map. */
@@ -57,8 +61,11 @@ declare global {
   }
 }
 
+/** track2: how long a refocus waits for the figure to be drawn (a new floor is placed within a frame or two). */
+const REFOCUS_WAIT_MS = 4000;
+
 /** Hosts the Three.js scene. Asset updates bypass React and go straight to the scene. */
-export default function MapView3D({ layout, stateRef, listen, selectedId, onHover, onSelect, onFail, debug, plan, assetFilter, viewKey, motion = true, onDeparting, focusZone, cameraRef, onProject, glide, track, onTrackHost, controlsHost }: Props) {
+export default function MapView3D({ layout, stateRef, listen, selectedId, onHover, onSelect, onFail, debug, plan, assetFilter, viewKey, motion = true, onDeparting, focusZone, cameraRef, onProject, glide, track, onTrackHost, onFollow, refocus, controlsHost }: Props) {
   const hostRef = useRef<HTMLDivElement>(null);
   const labelsRef = useRef<HTMLDivElement>(null);
   const [scene, setScene] = useState<MapScene | null>(null);
@@ -134,6 +141,23 @@ export default function MapView3D({ layout, stateRef, listen, selectedId, onHove
     framedKey.current = viewKey;
     scene.frameFloor(true); // camera fix: a new floor (or "whole floor") keeps the user's angle
   }, [scene, viewKey]);
+  // --- track2: each new `refocus` glides the camera to the selected figure (after a floor change, once it is drawn) ---
+  const refocusId = useRef(selectedId);
+  refocusId.current = selectedId;
+  useEffect(() => {
+    if (!scene || !refocus) return;
+    const until = performance.now() + REFOCUS_WAIT_MS;
+    let raf = 0;
+    const tick = () => {
+      const id = refocusId.current;
+      const p = id ? scene.positionOf(id) : null;
+      if (p && !p.leaving) { scene.flyTo([p.x, p.y]); return; } // at the focus zoom
+      if (performance.now() < until) raf = requestAnimationFrame(tick);
+    };
+    tick();
+    return () => cancelAnimationFrame(raf);
+  }, [scene, refocus]);
+  // --- end track2 ---
 
   useEffect(() => { scene?.setPlan(plan ?? null); }, [scene, plan]);
 
@@ -187,7 +211,7 @@ export default function MapView3D({ layout, stateRef, listen, selectedId, onHove
       <CameraControls
         camera={scene}
         host={controlsHost}
-        follow={{ on: following, enabled: !!scene && !!selectedId, toggle: () => setFollow((v) => !v) }}
+        follow={{ on: following, enabled: !!scene && !!selectedId, toggle: onFollow ?? (() => setFollow((v) => !v)) /* track2 */ }}
       />
       {/* --- end camera fix --- */}
       {!scene && <p className="lm-loading muted">Loading 3D view…</p>}

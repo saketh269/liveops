@@ -174,7 +174,7 @@ function SiteMap({ siteId }: { siteId: string }) {
   };
   /** Select and bring into view (KPI tiles, room chips, events, Find). */
   // --- track fix: history, route and live tracking of the selected record ---
-  const track = useTrack({ siteId, layout, floors, floorId, assets: ui.assets, selectedId: selected, selectedAsset, setFloor, now, is3d: !use2d });
+  const track = useTrack({ siteId, layout, floors, floorId, assets: ui.assets, selectedId: selected, selectedAsset, setFloor, now });
   trackEscape.current = track.escape;
   // --- end track fix ---
   const show = (id: string) => {
@@ -239,6 +239,11 @@ function SiteMap({ siteId }: { siteId: string }) {
             onDeparting={setDeparting}
             reason={force2d ? "selected with ?view=2d." : `${glError} Showing a top view instead.`}
             controlsHost={camHost}
+            // --- track2: route, trail and follow in the 2D view (LIVEOPS-112/117) ---
+            follow={track.following}
+            onFollow={track.toggle}
+            onTrackHost={track.setHost}
+            // --- end track2 ---
           />
         ) : (
           <MapView3D
@@ -259,6 +264,8 @@ function SiteMap({ siteId }: { siteId: string }) {
             glide={glide}
             track={track.following /* track fix */}
             onTrackHost={track.setHost}
+            onFollow={track.toggle /* --- track2: the camera's Follow button tracks across floors (LIVEOPS-112) --- */}
+            refocus={track.refocus /* track2 */}
             controlsHost={camHost}
           />
         )}

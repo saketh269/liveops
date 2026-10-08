@@ -2,7 +2,7 @@
 // pointer, two-finger trackpad scroll pans, and rotate / zoom / reset / face north from
 // the on-screen controls. The view is applied to the SVG imperatively (viewBox and a
 // rotation on the content group) so panning does not re-render every figure.
-import { useEffect, useMemo, useRef } from "react";
+import { useCallback, useEffect, useMemo, useRef } from "react";
 import type { CameraControlsHandle, CameraControlsState } from "./hud/CameraControls";
 import { isWheelNotch, readWheel } from "./world/camera";
 
@@ -12,6 +12,10 @@ export type Box2D = { x: number; y: number; w: number; h: number };
 export type View2D = { cx: number; cy: number; scale: number; rot: number };
 
 export const SCALE_2D = { min: 0.6, max: 8 } as const;
+/** Zoom the 2D view eases to while following a figure (the 3D focus zoom). */
+export const FOLLOW_SCALE_2D = 2.2;
+/** Share of the remaining distance covered per frame while following (smooth glide). */
+const FOLLOW_EASE = 0.18;
 const MOUSE_LATCH_MS = 1500;
 
 export function initialView2D(b: Box2D, rot = 0): View2D {
@@ -62,6 +66,21 @@ export function rotate2D(v: View2D, b: Box2D, radians: number): View2D {
   return clampView2D({ ...v, rot: v.rot + radians, cx: bx + dx * c - dy * s, cy: by + dx * s + dy * c }, b);
 }
 
+/** Outer SVG point where content point (x, y) is drawn (the content turns around the floor's centre). */
+export function outerPoint(v: View2D, b: Box2D, x: number, y: number): { x: number; y: number } {
+  const bx = b.x + b.w / 2, by = b.y + b.h / 2;
+  const c = Math.cos(v.rot), s = Math.sin(v.rot);
+  const dx = x - bx, dy = y - by;
+  return { x: bx + dx * c - dy * s, y: by + dx * s + dy * c };
+}
+
+/** One frame of following content point (x, y): ease the centre onto it and zoom in to at least the follow zoom. */
+export function follow2D(v: View2D, b: Box2D, x: number, y: number, k = FOLLOW_EASE): View2D {
+  const p = outerPoint(v, b, x, y);
+  const scale = v.scale < FOLLOW_SCALE_2D ? v.scale + (FOLLOW_SCALE_2D - v.scale) * k : v.scale;
+  return clampView2D({ ...v, cx: v.cx + (p.x - v.cx) * k, cy: v.cy + (p.y - v.cy) * k, scale }, b);
+}
+
 type Ptr = { x: number; y: number };
 
 /**
@@ -76,12 +95,21 @@ export function useView2D(base: Box2D) {
   const group = useRef<SVGGElement | null>(null);
   const listeners = useRef(new Set<(s: CameraControlsState) => void>());
   const boxRef = useRef(box);
+  // track2: following a figure; a pan by the user pauses it until "Resume tracking" (as in 3D).
+  const follow = useRef({ on: false, paused: false });
 
+  const emit = () => {
+    for (const fn of listeners.current) fn({ azimuth: view.current.rot, following: follow.current.on, paused: follow.current.paused });
+  };
   const set = (v: View2D) => {
     view.current = clampView2D(v, boxRef.current);
     svg.current?.setAttribute("viewBox", viewBoxOf(view.current, boxRef.current));
     group.current?.setAttribute("transform", rotationOf(view.current, boxRef.current));
-    for (const fn of listeners.current) fn({ azimuth: view.current.rot, following: false, paused: false });
+    emit();
+  };
+  const userPan = (v: View2D) => {
+    if (follow.current.on && !follow.current.paused) follow.current = { on: true, paused: true };
+    set(v);
   };
 
   // A new floor: frame it again, keeping the rotation.
@@ -94,13 +122,32 @@ export function useView2D(base: Box2D) {
     zoom: (f) => { if (f > 0) set(zoom2DAt(view.current, boxRef.current, 1 / f, null, null)); },
     rotate: (r) => set(rotate2D(view.current, boxRef.current, r)),
     faceNorth: () => set(rotate2D(view.current, boxRef.current, -view.current.rot)),
-    reset: () => set(initialView2D(boxRef.current)),
+    reset: () => {
+      if (follow.current.on) follow.current = { on: true, paused: true };
+      set(initialView2D(boxRef.current));
+    },
+    resumeFollow: () => { follow.current = { on: follow.current.on, paused: false }; emit(); },
     onCameraChange: (fn) => {
       listeners.current.add(fn);
-      fn({ azimuth: view.current.rot, following: false, paused: false });
+      fn({ azimuth: view.current.rot, following: follow.current.on, paused: follow.current.paused });
       return () => { listeners.current.delete(fn); };
     },
-  }), []);
+  }), []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  /** Turn following on or off (a new value clears a pause). */
+  const setFollowing = useCallback((on: boolean) => {
+    if (follow.current.on === on) return;
+    follow.current = { on, paused: false };
+    emit();
+  }, []);
+  /** One frame of following the figure at content point (x, y); no-op while paused or off. */
+  const followTo = useCallback((x: number, y: number) => {
+    if (!follow.current.on || follow.current.paused) return;
+    const next = follow2D(view.current, boxRef.current, x, y);
+    const v = view.current;
+    if (Math.abs(next.cx - v.cx) < 1e-3 && Math.abs(next.cy - v.cy) < 1e-3 && Math.abs(next.scale - v.scale) < 1e-4) return;
+    set(next);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     const el = svg.current;
@@ -142,9 +189,9 @@ export function useView2D(base: Box2D) {
         if (pinch.d > 0 && n.d > 0) v = zoom2DAt(v, boxRef.current, n.d / pinch.d, at?.x ?? null, at?.y ?? null);
         v = pan2D(v, boxRef.current, (n.mid.x - pinch.mid.x) * k, (n.mid.y - pinch.mid.y) * k);
         pinch = n;
-        set(v);
+        userPan(v);
       } else if (moved > 4) {
-        set(pan2D(view.current, boxRef.current, dx * k, dy * k));
+        userPan(pan2D(view.current, boxRef.current, dx * k, dy * k));
       }
     };
     const up = (e: PointerEvent) => {
@@ -163,7 +210,7 @@ export function useView2D(base: Box2D) {
         set(zoom2DAt(view.current, boxRef.current, w.factor, at?.x ?? null, at?.y ?? null));
       } else {
         const k = unitsPerPx();
-        set(pan2D(view.current, boxRef.current, -w.dx * k, -w.dy * k));
+        userPan(pan2D(view.current, boxRef.current, -w.dx * k, -w.dy * k));
       }
     };
     el.addEventListener("pointerdown", down);
@@ -180,10 +227,12 @@ export function useView2D(base: Box2D) {
       el.removeEventListener("click", click, true);
       el.removeEventListener("wheel", wheel);
     };
-  }, []);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   return {
     handle,
+    setFollowing,
+    followTo,
     viewBox: viewBoxOf(view.current, box),
     contentTransform: rotationOf(view.current, box),
     svgRef: svg,

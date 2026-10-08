@@ -102,3 +102,8 @@
   .lm-track-step::after { left: 69px; }
 }
 .lm-hud-side-tab { display: grid; gap: 14px; align-content: start; min-width: 0; }
+
+/* Tracking paused while the user looks at another floor; where an off-plan record is (LIVEOPS-112). */
+.lm-track-actions .btn.lm-track-return { border-color: var(--accent); color: var(--accent); font-weight: 600; }
+.lm-track-where { flex-basis: 100%; font-size: 0.78rem; color: var(--fg); background: var(--warn-soft); border: 1px solid var(--warn);
+  border-radius: 9px; padding: 4px 10px; }

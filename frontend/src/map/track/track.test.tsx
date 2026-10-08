@@ -4,7 +4,7 @@ import HistoryPanel, { matchesFilter, sinceText } from "./HistoryPanel";
 import { bedJourney, patientJourney, patientStage, staffJourney, startOfDay } from "./journey";
 import JourneyView from "./JourneyView";
 import { buildRoute, walkPath } from "./route";
-import { GONE_AFTER_S, pushTrail, startTracking, trackStep } from "./tracking";
+import { GONE_AFTER_S, placeOf, pushTrail, startTracking, trackStep, transitOf } from "./tracking";
 
 const T0 = 1_791_400_000; // a fixed day
 const at = (min: number) => T0 + min * 60;
@@ -111,36 +111,77 @@ describe("staff and bed journeys", () => {
 });
 
 describe("tracking", () => {
-  const floorOf = (a: Asset) => String(a.floor);
   const name = (id: string) => `Floor ${id}`;
+  const L: SiteLayout = {
+    floors: [{ id: "B1", name: "Basement B1", level: -1, width: 40, depth: 20 }, { id: "1", name: "Floor 1", level: 0, width: 40, depth: 20 },
+      { id: "3", name: "Floor 3", level: 2, width: 40, depth: 20 }],
+    zones: [
+      { id: "ED-01", name: "ED-01", kind: "room", floor_id: "1", polygon: [[0, 0], [4, 0], [4, 4], [0, 4]] },
+      { id: "3W-305A", name: "3W-305A", kind: "room", floor_id: "3", polygon: [[0, 0], [4, 0], [4, 4], [0, 4]] },
+    ],
+  };
+  const where = (zone: string, extra: Partial<Asset> = {}) => ({ ...asset("patient", "P7401887"), zone, ...extra });
+  const place = (a: Asset) => placeOf(L, a);
+
+  test("where a record is: a zone, a journey between floors, a place the plan does not have", () => {
+    expect(placeOf(L, where("3W-305A"))).toEqual({ floorId: "3", onPlan: true, where: "in 3W-305A" });
+    expect(placeOf(L, where("En route ED-01 → 3W-305A"))).toEqual({ floorId: "3", onPlan: false, where: "on the way from ED-01 to 3W-305A" });
+    expect(placeOf(L, where("In transit from 3W-305A to Radiology – MRI")).floorId).toBe("3"); // only the origin is known
+    // never the first floor (the basement here) just because the place is unknown
+    expect(placeOf(L, where("Radiology – MRI"))).toEqual({ floorId: null, onPlan: false, where: "at Radiology – MRI" });
+    expect(transitOf("Return to sender")).toBeNull();
+    expect(transitOf("3W-305A -> 4E-401A")).toEqual({ from: "3W-305A", to: "4E-401A" });
+  });
 
   test("switches floor when the record's floor changes, with a notice", () => {
-    let s = startTracking("P7401887", "1");
-    const same = trackStep(s, { ...asset("patient", "P7401887"), floor: "1" }, T0, floorOf, name, "P7401887");
+    let s = startTracking("P7401887", place(where("ED-01")));
+    const same = trackStep(s, where("ED-01"), T0, place, name, "P7401887");
     expect(same.switchTo).toBeUndefined();
     expect(same.next).toBe(s); // nothing changed
-    const moved = trackStep(s, { ...asset("patient", "P7401887"), floor: "3" }, T0, floorOf, name, "P7401887");
+    const moved = trackStep(s, where("3W-305A"), T0, place, name, "P7401887");
     expect(moved.switchTo).toBe("3");
     expect(moved.notice).toBe("P7401887 moved to Floor 3, following");
     s = moved.next;
     expect(s.floorId).toBe("3");
   });
 
-  test("survives a short gap, then says when the record left the site", () => {
-    const s = startTracking("P1", "1");
-    const gap = trackStep(s, undefined, T0, floorOf, name, "P1");
+  test("off the plan: keeps tracking, stays on the floor and says where; arriving says so", () => {
+    const s = startTracking("P1", place(where("3W-305A")));
+    const mri = trackStep(s, where("Radiology – MRI"), T0, place, name, "P1");
+    expect(mri.switchTo).toBeUndefined();
+    expect(mri.stop).toBeUndefined();
+    expect(mri.notice).toBe("P1 is at Radiology – MRI, not on the floor plan. Still tracking.");
+    expect(mri.next.floorId).toBe("3");
+    const trip = trackStep(mri.next, where("En route 3W-305A → ED-01"), T0, place, name, "P1");
+    expect(trip.switchTo).toBe("1");
+    expect(trip.notice).toBe("P1 is on the way from 3W-305A to ED-01. Showing Floor 1.");
+    const there = trackStep(trip.next, where("ED-01"), T0, place, name, "P1");
+    expect(there.switchTo).toBeUndefined();
+    expect(there.notice).toBe("P1 arrived in ED-01, following");
+  });
+
+  test("survives a short gap, then stops when the record left the site", () => {
+    const s = startTracking("P1", place(where("ED-01")));
+    const gap = trackStep(s, undefined, T0, place, name, "P1");
     expect(gap.notice).toBeUndefined();
     expect(gap.next.missingSince).toBe(T0);
-    const back = trackStep(gap.next, { ...asset("patient"), floor: "1" }, T0 + 5, floorOf, name, "P1");
+    const back = trackStep(gap.next, where("ED-01"), T0 + 5, place, name, "P1");
     expect(back.notice).toBeUndefined();
     expect(back.next.missingSince).toBeNull();
-    const still = trackStep(gap.next, undefined, T0 + GONE_AFTER_S - 1, floorOf, name, "P1");
-    expect(still.next.gone).toBe(false);
-    const gone = trackStep(still.next, undefined, T0 + GONE_AFTER_S, floorOf, name, "P1");
-    expect(gone.next.gone).toBe(true);
-    expect(gone.notice).toMatch(/no longer reported.*history stays open/);
-    const again = trackStep(gone.next, { ...asset("patient"), floor: "2" }, T0 + 99, floorOf, name, "P1");
-    expect(again.switchTo).toBe("2");
+    const still = trackStep(gap.next, undefined, T0 + GONE_AFTER_S - 1, place, name, "P1");
+    expect(still.stop).toBeUndefined();
+    const gone = trackStep(still.next, undefined, T0 + GONE_AFTER_S, place, name, "P1");
+    expect(gone.stop).toBe(true);
+    expect(gone.notice).toMatch(/no longer reported.*Tracking stopped; their history stays open/);
+  });
+
+  test("a discharged record stops tracking at once, in plain words", () => {
+    const s = startTracking("P1", place(where("3W-305A")));
+    for (const a of [where("Discharged"), where("3W-305A", { attributes: { status: "discharged" } })]) {
+      const u = trackStep(s, a, T0, place, name, "P1");
+      expect(u.stop).toBe(true);
+      expect(u.notice).toBe("P1 was discharged or left the site. Tracking stopped; their history stays open.");
+    }
   });
 
   test("the trail keeps the last minutes and merges tiny steps", () => {
