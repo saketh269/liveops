@@ -174,7 +174,7 @@ function SiteMap({ siteId }: { siteId: string }) {
   };
   /** Select and bring into view (KPI tiles, room chips, events, Find). */
   // --- track fix: history, route and live tracking of the selected record ---
-  const track = useTrack({ siteId, layout, floors, floorId, assets: ui.assets, selectedId: selected, selectedAsset, setFloor, now, is3d: !use2d });
+  const track = useTrack({ siteId, layout, floors, floorId, assets: ui.assets, selectedId: selected, selectedAsset, setFloor, now });
   trackEscape.current = track.escape;
   // --- end track fix ---
   const show = (id: string) => {
@@ -259,6 +259,8 @@ function SiteMap({ siteId }: { siteId: string }) {
             glide={glide}
             track={track.following /* track fix */}
             onTrackHost={track.setHost}
+            onFollow={track.toggle /* --- track2: the camera's Follow button tracks across floors (LIVEOPS-112) --- */}
+            refocus={track.refocus /* track2 */}
             controlsHost={camHost}
           />
         )}
