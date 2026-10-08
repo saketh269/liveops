@@ -7,7 +7,8 @@ import type { Entrance, Zone } from "../../api/types";
 import { pointInPolygon, polygonBounds, type Pt } from "../placement";
 import { paintFloor, type PaintFonts } from "./floorPaint";
 import { WORLD, type ScenePalette } from "./style";
-import { isNurseStation, planWalls, type Seg } from "./walls";
+import { isNurseStation, type Seg } from "./walls";
+import { nurseDesk as deskOf, wallPlanFor, type FloorWallPlan } from "./wallPlan";
 
 export type WorldInput = {
   width: number;
@@ -157,7 +158,8 @@ export function worldMaterial(p: ScenePalette, software: boolean): MakeMat {
 }
 
 /** `background`: clear color that matches the world's surroundings (grass around the ground floor, sky above). */
-export type BuiltWorld = { group: THREE.Group; tiles: RoomTiles; wallCount: number; background: string };
+/** `plan`: the floor's shared wall plan (walls drawn here are the ones navigation walks around). */
+export type BuiltWorld = { group: THREE.Group; tiles: RoomTiles; wallCount: number; background: string; plan: FloorWallPlan };
 
 /** Build the static world of a floor centred on the origin. */
 export function buildWorld(input: WorldInput): BuiltWorld {
@@ -206,7 +208,8 @@ export function buildWorld(input: WorldInput): BuiltWorld {
 
   // Walls, desks and chairs: one merged mesh.
   const bake = new Baker();
-  const walls = planWalls({ width, depth, zones: valid, entrances, doorWidth: WORLD.doorWidth });
+  // The shared wall plan (wallPlan.ts): navigation walks around exactly these walls and through these gaps.
+  const walls = wallPlanFor({ width, depth, zones: valid, entrances });
   for (const s of walls.inner) wallPiece(bake, s, WORLD.wallHeight, p.wall, p.wallTop, toWorld);
   for (const s of walls.outer) wallPiece(bake, s, WORLD.outerWallHeight, p.wall, p.outerWallTop, toWorld);
   for (const z of valid) {
@@ -222,7 +225,7 @@ export function buildWorld(input: WorldInput): BuiltWorld {
     statics.name = "statics";
     group.add(statics);
   }
-  return { group, tiles, wallCount: walls.inner.length + walls.outer.length, background: input.ground ? p.ground : p.sky };
+  return { group, tiles, wallCount: walls.inner.length + walls.outer.length, background: input.ground ? p.ground : p.sky, plan: walls };
 }
 
 function wallPiece(bake: Baker, s: Seg, h: number, side: string, top: string, toWorld: (x: number, y: number) => THREE.Vector3, T: number = WORLD.wallThickness) {
@@ -234,11 +237,8 @@ function wallPiece(bake: Baker, s: Seg, h: number, side: string, top: string, to
 }
 
 function nurseDesk(bake: Baker, z: Zone, p: ScenePalette, toWorld: (x: number, y: number) => THREE.Vector3) {
-  const b = polygonBounds(z.polygon);
-  const along = b.w >= b.h;
-  const L = Math.max(1.6, (along ? b.w : b.h) * 0.85);
-  const D = Math.max(0.8, Math.min((along ? b.h : b.w) * 0.55, 1.6));
-  const c = toWorld(b.x + b.w / 2, b.y + b.h / 2);
+  const { cx, cy, length: L, depth: D, along } = deskOf(z); // the desk navigation walks around
+  const c = toWorld(cx, cy);
   const rot = along ? 0 : Math.PI / 2;
   bake.add(roundedBox(L, D, Math.min(0.7, D / 2), 0.95), p.desk, m4(c.x, 0, c.z, rot));
   bake.add(roundedBox(L + 0.4, D + 0.4, Math.min(0.8, D / 2 + 0.2), 0.08), p.deskTop, m4(c.x, 0.95, c.z, rot));
