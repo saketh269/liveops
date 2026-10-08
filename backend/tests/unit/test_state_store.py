@@ -117,8 +117,8 @@ async def test_event_log_entries_paging_and_text(store: StateStore) -> None:
     assert all(e["asset_id"] == "B1" and e["source_id"] == "ehr" and e["site_id"] == "s" for e in entries)
     ts = [e["ts"] for e in entries]
     assert ts == sorted(ts) and len(set(ts)) == 3
-    assert describe(entries[1]) == "B1 state free → in_use"
-    assert describe(entries[2]) == "B1 removed"
+    assert describe(entries[1]) == "B1 is in use (was free)"
+    assert describe(entries[2]) == "B1 left the map"
 
     assert await store.events("s", since=ts[0]) == entries[1:]
     assert await store.events("s", since=ts[0], limit=1) == [entries[1]]
@@ -155,13 +155,13 @@ async def test_subscriber_gets_upsert_then_feed_event(store: StateStore) -> None
     assert up.type == "upsert" and up.assets[0]["state"] == "in_use"
     fe = await next_msg(gen)
     assert fe.type == "event" and fe.event is not None
-    assert fe.event["text"] == "B01 state free → in_use"
+    assert fe.event["text"] == "B01 is in use (was free)"
     assert fe.event["asset_id"] == "B01" and fe.event["source_id"] == "ehr"
     assert fe.event["changes"] == {"state": ["free", "in_use"]}
     await store.apply(ev(asset="B01", op=AssetOp.REMOVE, ts=3))
     rm = await next_msg(gen)
     assert rm.type == "remove" and rm.assets == [{"asset_id": "B01"}]
-    assert (await next_msg(gen)).event["text"] == "B01 removed"  # type: ignore[index]
+    assert (await next_msg(gen)).event["text"] == "B01 left the map"  # type: ignore[index]
     await gen.aclose()
 
 
@@ -266,7 +266,7 @@ async def test_attributes_merge_per_key_across_sources(store: StateStore) -> Non
     assert asset.flat()["attributes"] == {"patient_count": 2, "cleaner": "C0"}
     last = (await store.events("s"))[-1]
     assert last["changes"] == {"attributes.patient_count": [0, 2]}
-    assert describe(last) == "B1 patient_count 0 → 2"
+    assert describe(last) == "B1 patient count is now 2"
 
     # Removing housekeeping drops only its attribute key.
     msg = await store.apply(ev(src="hk", mapping="m2", op=AssetOp.REMOVE, ts=4))
@@ -395,7 +395,7 @@ async def test_shared_field_falls_back_when_newer_source_leaves(store: StateStor
     assert msg.assets[0]["label"] == "Bed 01" and msg.assets[0]["_sources"]["label"] == "ehr"
     last = (await store.events("s"))[-1]
     assert last["changes"] == {"label": ["Isolation", "Bed 01"]} and not last["removed"]
-    assert describe(last) == "B1 label Isolation → Bed 01"
+    assert describe(last) == "B1 is now called Bed 01"
 
 
 async def test_shared_field_falls_back_on_clear_mapping_and_for_attribute_keys(store: StateStore) -> None:

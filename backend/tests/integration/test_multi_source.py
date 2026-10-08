@@ -163,15 +163,15 @@ async def test_two_sources_merge_into_one_asset(
                 with psycopg.connect(**{**p, "dbname": ehr_db}, autocommit=True) as c:
                     c.execute("UPDATE beds SET status = 'occupied' WHERE bed_id = 'B01'")
                 lat_ehr = s.wait_for(
-                    lambda s: any(e["text"] == "B01 state free → in_use" for e in s.feed), "EHR change + feed event"
+                    lambda s: any(e["text"] == "B01 is in use (was free)" for e in s.feed), "EHR change + feed event"
                 )
                 assert s.assets["B01"]["state"] == "in_use" and s.assets["B01"]["cleaning"] == "due"
-                assert next(e for e in s.feed if e["text"] == "B01 state free → in_use")["source_id"] == ehr_id
+                assert next(e for e in s.feed if e["text"] == "B01 is in use (was free)")["source_id"] == ehr_id
 
                 with psycopg.connect(**{**p, "dbname": hk_db}, autocommit=True) as c:
                     c.execute("UPDATE cleaning SET cleaning_status = 'done' WHERE bed_id = 'B01'")
                 lat_hk = s.wait_for(
-                    lambda s: any(e["text"] == "B01 cleaning due → done" for e in s.feed), "housekeeping change"
+                    lambda s: any(e["text"] == "B01 cleaning is now done" for e in s.feed), "housekeeping change"
                 )
                 assert s.assets["B01"]["cleaning"] == "done" and s.assets["B01"]["state"] == "in_use"
                 assert s.assets["B01"]["_sources"]["cleaning"] == hk_id
@@ -180,7 +180,7 @@ async def test_two_sources_merge_into_one_asset(
 
             events = client.get(f"/api/sites/{site['id']}/events", params={"limit": 1000}).json()
             texts = [e["text"] for e in events]
-            assert "B01 state free → in_use" in texts and "B01 cleaning due → done" in texts
+            assert "B01 is in use (was free)" in texts and "B01 cleaning is now done" in texts
             assets = {a["asset_id"]: a for a in client.get(f"/api/sites/{site['id']}/assets").json()}
             assert assets["B01"]["cleaning"] == "done" and assets["B01"]["state"] == "in_use"
 

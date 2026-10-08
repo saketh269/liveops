@@ -48,7 +48,7 @@ def test_ws_snapshot_live_feed_ping_and_unsubscribe(client: TestClient) -> None:
         assert up["type"] == "upsert" and up["assets"][0]["state"] == "in_use"
         feed = json.loads(ws.receive_text())
         assert feed["type"] == "event"
-        assert feed["event"]["text"] == "B01 state free → in_use"
+        assert feed["event"]["text"] == "B01 is in use (was free)"
         assert feed["event"]["source_id"] == "ehr" and feed["event"]["asset_id"] == "B01"
         started = time.monotonic()
         ping = json.loads(ws.receive_text())
@@ -66,9 +66,9 @@ def test_events_endpoint(client: TestClient) -> None:
     _apply(client, {"state": "in_use"})
     _apply(client, {}, op=AssetOp.REMOVE)
     all_events = client.get("/api/sites/w2/events").json()
-    assert [e["text"] for e in all_events] == ["B01 state — → free", "B01 state free → in_use", "B01 removed"]
+    assert [e["text"] for e in all_events] == ["B01 is now free", "B01 is in use (was free)", "B01 left the map"]
     since = client.get("/api/sites/w2/events", params={"since": all_events[0]["ts"], "limit": 1}).json()
-    assert [e["text"] for e in since] == ["B01 state free → in_use"]
+    assert [e["text"] for e in since] == ["B01 is in use (was free)"]
     assert client.get("/api/sites/w2/events", params={"limit": 999999}).status_code == 200
     assert client.get("/api/sites/w2/events", params={"limit": 0}).status_code == 422
     assert client.get("/api/sites/other/events").json() == []

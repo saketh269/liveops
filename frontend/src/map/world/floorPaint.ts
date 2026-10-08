@@ -4,6 +4,7 @@ import type { Zone } from "../../api/types";
 import { polygonArea, polygonBounds, polygonCentroid, type Pt } from "../placement";
 import type { ScenePalette } from "./style";
 import { isNurseStation } from "./walls";
+import { shortRoomLabel, zoneLabel } from "../labels"; // --- polish fix ---
 
 /** Pixels per metre for a floor, keeping the canvas within `maxPx` on its long side. */
 export function paintScale(width: number, depth: number, maxPx = 2048): number {
@@ -65,6 +66,21 @@ function fitText(g: CanvasRenderingContext2D, text: string, x: number, y: number
   }
   g.fillText(text, x, y);
 }
+
+// --- polish fix: readable ground labels ---
+/**
+ * The text printed for a zone: machine names humanized ("at_hospital_offloading" →
+ * "At hospital · offloading"). A room whose full name does not fit its width with room
+ * to spare (two-bed rooms, where neighbouring names would run together) prints its short
+ * form ("3W-305A" → "305A"); the card keeps the full id. `measure(t)` is the text's
+ * width at a 1 px font.
+ */
+export function groundLabel(zone: Pick<Zone, "id" | "name" | "kind">, widthPx: number, sizePx: number, measure: (t: string) => number): string {
+  const name = zoneLabel((zone.name || zone.id || "").trim());
+  if (zone.kind !== "room" || measure(name) * sizePx <= widthPx * 0.85) return name;
+  return shortRoomLabel(name) ?? name;
+}
+// --- end polish fix ---
 
 export type PaintFonts = { data: string; body: string };
 
@@ -136,17 +152,20 @@ export function paintFloor(width: number, depth: number, zones: readonly Zone[],
   g.textBaseline = "middle";
   for (const z of valid) {
     if (z.kind === "corridor" || isNurseStation(z)) continue; // nurse stations show their desk
-    const name = (z.name || z.id || "").trim();
-    if (!name) continue;
+    if (!(z.name || z.id || "").trim()) continue;
     const b = polygonBounds(z.polygon);
     if (z.kind === "room") {
       const [x, y] = labelSpot(z, { width, depth });
       g.fillStyle = p.roomLabel;
+      // --- polish fix: short room labels when the full name would not fit ---
+      g.font = `600 1px ${fonts.data}`;
+      const name = groundLabel(z, b.w * s * 0.86, 0.7 * s, (t) => g.measureText(t).width);
+      // --- end polish fix ---
       fitText(g, name, x * s, y * s, 0.7 * s, b.w * s * 0.86, 600, fonts.data);
     } else {
       const [x, y] = polygonCentroid(z.polygon);
       g.fillStyle = p.areaLabel;
-      fitText(g, name.toUpperCase(), x * s, y * s, Math.min(0.6, b.h * 0.3) * s, b.w * s * 0.85, 700, fonts.body);
+      fitText(g, groundLabel(z, 0, 0, () => 0).toUpperCase(), x * s, y * s, Math.min(0.6, b.h * 0.3) * s, b.w * s * 0.85, 700, fonts.body); // --- polish fix: humanized ---
     }
   }
   return cv;
