@@ -2,10 +2,10 @@ import type { ConnectorSpec } from "../../api/types";
 
 /** A canned HTTP reply for mockApi. Plain values are sent as 200 JSON. */
 export class Reply {
-  constructor(public status: number, public body?: unknown) {}
+  constructor(public status: number, public body?: unknown, public headers?: Record<string, string>) {}
 }
 
-type Call = { method: string; path: string; search: string; body: unknown };
+type Call = { method: string; path: string; search: string; body: unknown; headers: Record<string, string>; credentials?: RequestCredentials };
 type Route = unknown | ((call: Call) => unknown);
 
 /**
@@ -20,6 +20,7 @@ export function mockApi(routes: Record<string, Route>) {
     const call: Call = {
       method, path: url.pathname, search: url.search,
       body: init?.body ? JSON.parse(String(init.body)) : undefined,
+      headers: Object.fromEntries(new Headers(init?.headers).entries()), credentials: init?.credentials, // auth-ui
     };
     calls.push(call);
     const route = routes[`${method} ${url.pathname}`];
@@ -29,7 +30,7 @@ export function mockApi(routes: Record<string, Route>) {
     const out = typeof route === "function" ? (route as (c: Call) => unknown)(call) : route;
     const reply = out instanceof Reply ? out : new Reply(200, out);
     if (reply.status === 204) return new Response(null, { status: 204 });
-    return new Response(JSON.stringify(reply.body ?? null), { status: reply.status, headers: { "Content-Type": "application/json" } });
+    return new Response(JSON.stringify(reply.body ?? null), { status: reply.status, headers: { "Content-Type": "application/json", ...reply.headers } });
   });
   vi.stubGlobal("fetch", fn);
   return { calls, fn, find: (method: string, path: string) => calls.filter((c) => c.method === method && c.path === path) };

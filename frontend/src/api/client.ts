@@ -7,6 +7,7 @@ export class ApiError extends Error {
   status: number;
   hint?: string;
   problems?: string[];
+  retryAfter?: number; // --- auth-ui --- seconds, from Retry-After (423 locked, 429)
   constructor(status: number, message: string, hint?: string, problems?: string[]) {
     super(message);
     this.status = status;
@@ -15,12 +16,55 @@ export class ApiError extends Error {
   }
 }
 
+// --- auth-ui --- Session cookie + CSRF double-submit + 401 handling (ADR 0008).
+const UNSAFE = new Set(["POST", "PUT", "PATCH", "DELETE"]);
+const AUTH_PAGES = ["/signin", "/signup", "/setup", "/forgot", "/reset", "/verify", "/invite"];
+
+export function readCookie(name: string): string | null {
+  for (const part of document.cookie ? document.cookie.split(";") : []) {
+    const [k, ...v] = part.trim().split("=");
+    if (k === name) return decodeURIComponent(v.join("="));
+  }
+  return null;
+}
+
+/** Headers every request needs: X-CSRF-Token (from the liveops_csrf cookie) on unsafe methods. */
+export function authHeaders(method: string, extra?: Record<string, string>): Record<string, string> {
+  const h: Record<string, string> = { ...extra };
+  const csrf = UNSAFE.has(method.toUpperCase()) ? readCookie("liveops_csrf") : null;
+  if (csrf) h["X-CSRF-Token"] = csrf;
+  return h;
+}
+
+export function isAuthPage(pathname: string): boolean {
+  return AUTH_PAGES.some((p) => pathname === p || pathname.startsWith(`${p}/`));
+}
+
+let onUnauthorized: () => void = () => {
+  const here = location.pathname + location.search;
+  location.assign(`/signin?next=${encodeURIComponent(here)}`);
+};
+/** The AuthProvider swaps in a router-aware handler; the default does a full-page redirect. */
+export function setUnauthorizedHandler(fn: () => void): () => void {
+  const prev = onUnauthorized;
+  onUnauthorized = fn;
+  return () => { onUnauthorized = prev; };
+}
+
+/** A 401 outside /api/auth/* means the session ended: send the user to sign in (not from the auth pages themselves). */
+function checkSignedOut(status: number, path: string) {
+  if (status === 401 && !path.startsWith("/api/auth/") && !isAuthPage(location.pathname)) onUnauthorized();
+}
+
 async function req<T>(method: string, path: string, body?: unknown): Promise<T> {
   const res = await fetch(path, {
     method,
-    headers: body === undefined ? undefined : { "Content-Type": "application/json" },
+    credentials: "same-origin",
+    headers: authHeaders(method, body === undefined ? undefined : { "Content-Type": "application/json" }),
     body: body === undefined ? undefined : JSON.stringify(body),
   });
+  checkSignedOut(res.status, path);
+  // --- end auth-ui ---
   if (res.status === 204) return undefined as T;
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
@@ -32,10 +76,16 @@ async function req<T>(method: string, path: string, body?: unknown): Promise<T> 
       throw new ApiError(res.status, "Some values aren't valid", undefined, problems);
     }
     const msg = typeof d === "string" ? d : d.message ?? `Request failed (${res.status})`;
-    throw new ApiError(res.status, msg, d.hint, d.problems ?? d.fields);
+    // --- auth-ui ---
+    const err = new ApiError(res.status, msg, d.hint, d.problems ?? d.fields);
+    const wait = Number(res.headers?.get?.("Retry-After") ?? d.retry_after);
+    if (Number.isFinite(wait) && wait > 0) err.retryAfter = wait;
+    throw err;
+    // --- end auth-ui ---
   }
   return data as T;
 }
+export { req as request }; // --- auth-ui --- used by auth/authApi.ts
 
 export const api = {
   connectors: () => req<ConnectorSpec[]>("GET", "/api/connectors"),
@@ -50,7 +100,8 @@ export const api = {
   uploadFile: async (id: string, file: File): Promise<UploadResult> => {
     const body = new FormData();
     body.append("file", file, file.name);
-    const res = await fetch(`/api/sources/${id}/upload`, { method: "POST", body });
+    const res = await fetch(`/api/sources/${id}/upload`, { method: "POST", body, credentials: "same-origin", headers: authHeaders("POST") }); // auth-ui
+    checkSignedOut(res.status, `/api/sources/${id}/upload`); // auth-ui
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
       const d = data?.detail ?? {};
@@ -75,7 +126,8 @@ export const api = {
   uploadPlan: async (siteId: string, file: File): Promise<PlanUpload> => {
     const body = new FormData();
     body.append("file", file, file.name);
-    const res = await fetch(`/api/sites/${encodeURIComponent(siteId)}/plans`, { method: "POST", body });
+    const res = await fetch(`/api/sites/${encodeURIComponent(siteId)}/plans`, { method: "POST", body, credentials: "same-origin", headers: authHeaders("POST") }); // auth-ui
+    checkSignedOut(res.status, `/api/sites/${encodeURIComponent(siteId)}/plans`); // auth-ui
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
       const d = data?.detail ?? {};

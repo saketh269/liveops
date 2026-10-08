@@ -216,3 +216,25 @@ export type AssetHistory = {
   milestones: HistoryMilestone[];
   now: number;
 };
+
+// --- auth-ui --- Accounts and sign-in (ADR 0008). Timestamps arrive as ISO strings (or epoch seconds).
+export type Role = "admin" | "manager" | "viewer" | "wallboard";
+export type UserStatus = "invited" | "active" | "disabled";
+/** SSO is LIVEOPS-163; the list is empty until then. A provider may be a bare id or {id, name, url}. */
+export type SsoProvider = string | { id: string; name?: string; url?: string };
+export type AuthState = { setup_required: boolean; signup_open: boolean; sso: SsoProvider[] };
+export type Me = { id: string; email: string; name: string; role: Role; org: { id: string; name: string }; email_verified: boolean };
+export type AccountUser = {
+  id: string; email: string; name: string; role: Role; status: UserStatus;
+  last_sign_in_at: string | number | null; created_at: string | number;
+};
+export type AuthSession = {
+  id: string; created_at: string | number; last_seen_at: string | number | null;
+  user_agent: string | null; ip: string | null; current: boolean;
+};
+export type ApiToken = { id: string; name: string; created_at: string | number; last_used_at: string | number | null };
+/** POST /api/auth/tokens: the token record plus the plain token, shown once. */
+export type NewApiToken = ApiToken & { token: string };
+export type OrgSettings = { name: string; signup_open: boolean };
+export type CreateUserResult = { user: AccountUser; invite_link?: string | null };
+// --- end auth-ui ---
