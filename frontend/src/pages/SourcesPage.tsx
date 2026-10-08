@@ -8,6 +8,7 @@ import { ConnectorPicker, MaturityBadge } from "../components/sources/ConnectorP
 import { SourceForm } from "../components/sources/SourceForm";
 import { TestPanel } from "../components/sources/TestResults";
 import { ConfirmDelete, EmptyState, ErrorNotice, Loading } from "../components/ui";
+import { CanEdit } from "../auth/AuthProvider"; // auth-ui: hide edit controls for viewer/wallboard
 import { useLoad } from "../components/useLoad";
 
 export default function SourcesPage() {
@@ -35,14 +36,14 @@ function SourceList() {
           <h1>Sources</h1>
           <p className="lead">The systems Live Ops reads from. Live Ops only reads; it never changes your data.</p>
         </div>
-        <Link className="btn primary" to="/sources/new">Connect a source</Link>
+        <CanEdit><Link className="btn primary" to="/sources/new">Connect a source</Link></CanEdit>
       </div>
       {loading && !data && <Loading label="Loading sources…" />}
       {error !== null && <ErrorNotice error={error} title="Couldn't load sources" onRetry={reload} />}
       {data && sources.length === 0 && (
         <EmptyState
           title="No sources yet"
-          action={<Link className="btn primary" to="/sources/new">Connect your first source</Link>}
+          action={<CanEdit><Link className="btn primary" to="/sources/new">Connect your first source</Link></CanEdit>}
         >
           <ol>
             <li>Choose “Connect a source” and pick the kind of system, for example PostgreSQL.</li>
@@ -67,10 +68,12 @@ function SourceList() {
                 <div><dt>Added</dt><dd>{formatDate(s.created_ts)}</dd></div>
               </dl>
               {s.warnings.map((w) => <div key={w} className="notice">{w}</div>)}
+              <CanEdit>
               <div className="row-actions">
                 <Link className="btn" to={`/sources/${s.id}`} aria-label={`Edit and test ${s.name}`}>Edit and test</Link>
                 <Link className="btn link" to={`/mapping/new?source=${s.id}`}>Map to a site</Link>
               </div>
+              </CanEdit>
             </li>
           ))}
         </ul>

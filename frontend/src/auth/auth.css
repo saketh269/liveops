@@ -1,0 +1,179 @@
+/* Sign-in, sign-up and account pages (ADR 0008). Tokens only; glass look from the approved prototype. */
+.au-page, .au-app {
+  --glass: color-mix(in srgb, var(--panel) 84%, transparent);
+  --glass-line: color-mix(in srgb, var(--fg) 9%, transparent);
+  --au-shade: var(--fg);
+  --au-shadow: 0 18px 50px -20px color-mix(in srgb, var(--au-shade) 35%, transparent), 0 2px 6px color-mix(in srgb, var(--au-shade) 7%, transparent);
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .au-page { --au-shade: #000; } }
+:root[data-theme="dark"] .au-page { --au-shade: #000; }
+
+.au-page { position: relative; min-height: 100dvh; isolation: isolate; overflow: hidden; background: var(--bg); }
+
+/* Backdrop: the hospital map, blurred and drifting slowly. Oversized so the drift never shows an edge. */
+.au-backdrop { position: fixed; inset: 0; z-index: -1; overflow: hidden; pointer-events: none;
+  background: radial-gradient(1200px 700px at 30% 0%, color-mix(in srgb, var(--panel) 70%, var(--bg)), var(--bg)); }
+.au-map { position: absolute; inset: -12%; width: 124%; height: 124%; filter: blur(5px) saturate(1.05); opacity: 0.85;
+  animation: au-drift 90s ease-in-out infinite alternate; transform-origin: 50% 50%; }
+@keyframes au-drift {
+  from { transform: translate3d(-2.5%, -1.5%, 0) scale(1.02) rotate(-0.6deg); }
+  to { transform: translate3d(2.5%, 1.5%, 0) scale(1.06) rotate(0.6deg); }
+}
+.au-map-site { fill: color-mix(in srgb, var(--panel) 55%, var(--bg)); stroke: var(--line); stroke-width: 2; }
+.au-map-wing { fill: var(--panel-2); stroke: var(--line); stroke-width: 3; }
+.au-map-corridor { fill: color-mix(in srgb, var(--accent-soft) 70%, var(--panel)); }
+.au-map-room { fill: var(--panel); stroke: var(--line); stroke-width: 2; }
+.au-map-station { fill: var(--accent-soft); stroke: color-mix(in srgb, var(--accent) 35%, transparent); stroke-width: 2; }
+.au-map-bed { opacity: 0.55; }
+.au-tone-free { fill: var(--state-free); }
+.au-tone-use { fill: var(--state-in-use); }
+.au-tone-clean { fill: var(--state-cleaning); }
+.au-tone-alert { fill: var(--state-alert); }
+.au-map-person { opacity: 0.7; }
+.au-person-0 { fill: var(--accent); }
+.au-person-1 { fill: var(--info); }
+.au-person-2 { fill: var(--ok); }
+.au-veil { position: absolute; inset: 0; background: color-mix(in srgb, var(--bg) 35%, transparent); }
+
+/* Card: anchored from the top so a new error or meter line grows downwards, never shifting what's above. */
+.au-main { min-height: 100dvh; display: grid; justify-items: center; align-content: start; gap: 14px;
+  padding: clamp(24px, 10vh, 112px) 16px 32px; }
+.au-card { width: min(100%, 420px); display: grid; gap: 16px; padding: clamp(20px, 5vw, 32px);
+  background: var(--glass); -webkit-backdrop-filter: blur(16px) saturate(1.2); backdrop-filter: blur(16px) saturate(1.2);
+  border: 1px solid var(--glass-line); border-radius: 18px; box-shadow: var(--au-shadow); color: var(--fg); }
+.au-card--wide { width: min(100%, 480px); }
+.au-card--quiet { min-height: 140px; align-content: start; }
+.au-card h1 { font-size: 1.45rem; outline: none; }
+.au-card h1:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; border-radius: 4px; }
+.au-lead { margin: -8px 0 0; color: var(--muted); }
+.au-brand { display: flex; align-items: center; gap: 10px; font: 800 1rem var(--f-display); letter-spacing: -0.01em; }
+.au-mark { width: 30px; height: 30px; border-radius: 9px; background: var(--accent); color: var(--accent-fg); display: grid;
+  place-items: center; box-shadow: inset 0 -3px 0 color-mix(in srgb, #000 15%, transparent); flex: none; }
+.au-mark svg { width: 18px; height: 18px; }
+.au-foot { color: var(--muted); font-size: 0.85rem; text-align: center; max-width: 420px; }
+.au-foot a { font-weight: 500; }
+
+.au-form { display: grid; gap: 14px; }
+.au-field input { padding: 9px 12px; font-size: 0.95rem; background: color-mix(in srgb, var(--panel) 92%, transparent); min-width: 0; width: 100%; }
+.au-label-row { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+.au-label-row a { font-size: 0.82rem; font-weight: 500; }
+.au-pw { position: relative; display: grid; }
+.au-pw input { padding-right: 68px; }
+.au-pw-toggle { position: absolute; right: 4px; top: 50%; transform: translateY(-50%); font: 600 0.78rem var(--f-body);
+  color: var(--accent); background: transparent; border: 0; border-radius: 5px; padding: 6px 10px; cursor: pointer; }
+.au-pw-toggle:hover { background: var(--accent-soft); }
+.au-pw-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 0; }
+
+.au-meter { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; align-items: center; min-height: 18px; }
+.au-meter-bar { display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px; }
+.au-meter-bar span { height: 5px; border-radius: 99px; background: var(--line); transition: background 0.2s; }
+.au-meter-label { font-size: 0.75rem; color: var(--muted); white-space: nowrap; min-width: 9.5em; text-align: right; }
+.au-meter[data-score="1"] .au-meter-bar span:nth-child(-n + 1) { background: var(--bad); }
+.au-meter[data-score="2"] .au-meter-bar span:nth-child(-n + 2) { background: var(--warn); }
+.au-meter[data-score="3"] .au-meter-bar span:nth-child(-n + 3) { background: var(--ok); }
+.au-meter[data-score="4"] .au-meter-bar span { background: var(--ok); }
+
+.au-check { display: flex; gap: 10px; align-items: flex-start; font-size: 0.88rem; }
+.au-check input { accent-color: var(--accent); width: 18px; height: 18px; margin: 1px 0 0; flex: none; }
+.au-submit { width: 100%; padding: 10px 14px; font-size: 0.95rem; }
+.au-alert-slot:empty { display: none; }
+.au-alert { gap: 2px; }
+.au-status { font-size: 0.82rem; color: var(--ok); min-height: 0; }
+.au-status:empty { display: none; }
+.au-divider { display: grid; grid-template-columns: 1fr auto 1fr; gap: 10px; align-items: center; color: var(--muted); font-size: 0.8rem; }
+.au-divider::before, .au-divider::after { content: ""; height: 1px; background: var(--line); }
+.au-sso { display: grid; gap: 8px; }
+.au-sso .btn { text-align: center; padding: 9px 14px; }
+.au-done { display: grid; gap: 12px; justify-items: start; }
+.au-done-icon { width: 44px; height: 44px; border-radius: 50%; display: grid; place-items: center; background: var(--ok-soft); color: var(--ok); }
+.au-done-icon.bad { background: var(--bad-soft); color: var(--bad); }
+.au-done-icon svg { width: 22px; height: 22px; }
+.au-copy { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }
+.au-copy input { font-size: 0.8rem; }
+
+/* ---------- Header user menu (inside the app shell) ---------- */
+.au-user { position: relative; padding: 0 4px; }
+.au-user-btn { display: flex; align-items: center; gap: 8px; width: 100%; font: 500 0.85rem var(--f-body); color: var(--fg);
+  background: transparent; border: 1px solid transparent; border-radius: 8px; padding: 6px 8px; cursor: pointer; text-align: left; }
+.au-user-btn:hover, .au-user-btn[aria-expanded="true"] { background: var(--panel-2); border-color: var(--line); }
+.au-avatar { width: 26px; height: 26px; border-radius: 50%; display: grid; place-items: center; flex: none; background: var(--accent-soft);
+  color: var(--accent); font: 700 0.72rem var(--f-display); }
+.au-user-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; flex: 1; }
+.au-caret { color: var(--muted); font-size: 0.7rem; }
+.au-menu { position: absolute; z-index: 30; left: 4px; right: 4px; top: calc(100% + 4px); min-width: 200px; display: grid; padding: 6px;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+  box-shadow: 0 12px 30px -12px color-mix(in srgb, #000 35%, transparent); }
+.au-menu-head { padding: 6px 10px 8px; border-bottom: 1px solid var(--line); margin-bottom: 4px; font-size: 0.8rem; color: var(--muted);
+  overflow-wrap: anywhere; }
+.au-menu-head strong { display: block; color: var(--fg); font-size: 0.85rem; }
+.au-menu [role="menuitem"] { display: block; width: 100%; text-align: left; font: 500 0.85rem var(--f-body); color: var(--fg); background: transparent;
+  border: 0; border-radius: 6px; padding: 8px 10px; cursor: pointer; text-decoration: none; }
+.au-menu [role="menuitem"]:hover, .au-menu [role="menuitem"]:focus-visible { background: var(--accent-soft); color: var(--accent); outline: none; }
+@media (max-width: 760px) {
+  /* The top bar scrolls sideways on phones: keep the account button next to the brand, before the links. */
+  .nav > .au-user { order: 1; }
+  .nav > nav { order: 2; }
+  .au-user { padding: 0; }
+  .au-user-btn { width: auto; }
+  .au-user-name { max-width: 10em; }
+  .au-menu { position: fixed; top: 52px; left: auto; right: 16px; }
+}
+@media (max-width: 420px) { .au-user-name { display: none; } }
+
+/* ---------- My account and Users pages (normal app pages) ---------- */
+.au-app { display: grid; gap: var(--gap); max-width: 980px; }
+.au-section { display: grid; gap: 12px; }
+.au-section > header { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: flex-end; gap: 8px; }
+.au-section > header p { margin: 2px 0 0; }
+.au-narrow { display: grid; gap: 14px; max-width: 440px; }
+.au-list { list-style: none; margin: 0; padding: 0; display: grid; }
+.au-list li { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 8px 14px; padding: 10px 0;
+  border-bottom: 1px solid var(--line); }
+.au-list li:last-child { border-bottom: 0; }
+.au-list .what { display: grid; gap: 2px; min-width: 0; }
+.au-list .what strong { overflow-wrap: anywhere; }
+.au-list .sub { font-size: 0.8rem; color: var(--muted); overflow-wrap: anywhere; }
+.au-toggle { display: flex; gap: 10px; align-items: flex-start; }
+.au-toggle input { accent-color: var(--accent); width: 18px; height: 18px; margin: 2px 0 0; flex: none; }
+.au-toggle .help { display: block; }
+
+table.au-users { border-collapse: collapse; width: 100%; font-size: 0.85rem; }
+table.au-users th, table.au-users td { padding: 10px 12px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: middle; }
+table.au-users th { background: var(--panel-2); font-weight: 600; font-size: 0.78rem; color: var(--muted); }
+table.au-users tr:last-child td { border-bottom: 0; }
+table.au-users td.au-cell-email { overflow-wrap: anywhere; color: var(--muted); }
+table.au-users select { font: inherit; color: var(--fg); background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; }
+.au-row-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.au-row-actions .btn { padding: 5px 10px; font-size: 0.8rem; }
+.au-row-note td { background: var(--panel-2); }
+.au-row-note td > * + * { margin-top: 8px; }
+/* Phone: each user becomes a card. */
+@media (max-width: 720px) {
+  table.au-users thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+  table.au-users, table.au-users tbody, table.au-users tr, table.au-users td { display: block; width: 100%; }
+  table.au-users tr { padding: 10px 12px; border-bottom: 1px solid var(--line); }
+  table.au-users td { border: 0; padding: 4px 0; display: grid; grid-template-columns: 7.5em minmax(0, 1fr); gap: 8px; align-items: center; }
+  table.au-users td::before { content: attr(data-label); color: var(--muted); font-size: 0.78rem; }
+  table.au-users td.au-cell-user { display: block; font-size: 0.95rem; }
+  table.au-users td > * { justify-self: start; max-width: 100%; }
+  table.au-users td.au-cell-user::before, table.au-users td.au-cell-actions::before { content: none; }
+  table.au-users td.au-cell-actions { grid-template-columns: minmax(0, 1fr); padding-top: 8px; }
+  .au-row-note td { display: block; }
+  .au-row-note td::before { content: none; }
+}
+
+/* Modal dialog (Add user) */
+.au-scrim { position: fixed; inset: 0; z-index: 50; background: color-mix(in srgb, #000 45%, transparent); display: grid;
+  place-items: start center; padding: clamp(16px, 8vh, 80px) 16px 16px; overflow-y: auto; }
+.au-dialog { width: min(100%, 480px); display: grid; gap: 14px; padding: 20px; background: var(--panel); color: var(--fg);
+  border: 1px solid var(--line); border-radius: 14px; box-shadow: 0 24px 60px -20px color-mix(in srgb, #000 50%, transparent); }
+.au-dialog h2 { outline: none; }
+.au-seg { display: grid; grid-template-columns: 1fr 1fr; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+.au-seg label { display: flex; justify-content: center; align-items: center; gap: 6px; padding: 8px; cursor: pointer; font-weight: 500; font-size: 0.85rem; }
+.au-seg label + label { border-left: 1px solid var(--line); }
+.au-seg input { position: absolute; opacity: 0; width: 1px; height: 1px; }
+.au-seg label:has(input:checked) { background: var(--accent-soft); color: var(--accent); }
+.au-seg label:has(input:focus-visible) { outline: 2px solid var(--accent); outline-offset: -2px; }
+.au-field select { font: inherit; color: var(--fg); background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; }
+
+@media (prefers-reduced-motion: reduce) { .au-map { animation: none; } }

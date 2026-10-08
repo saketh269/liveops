@@ -21,6 +21,7 @@ import { webglAvailable } from "../map/webgl";
 import { useLiveSite, type LinkStatus } from "../map/useLiveSite";
 import { useTrack } from "../map/track/useTrack"; // track fix
 import "../map/map.css";
+import { useCanEdit } from "../auth/AuthProvider"; // auth-ui
 
 function errorText(e: unknown, what: string): string {
   if (e instanceof ApiError) {
@@ -98,7 +99,8 @@ function useBodyClass(cls: string, on: boolean) {
 function SiteMap({ siteId }: { siteId: string }) {
   const [params, setParams] = useSearchParams();
   const navigate = useNavigate();
-  const editing = params.get("edit") === "1";
+  const mayEdit = useCanEdit(); // auth-ui: viewer/wallboard never get the layout editor
+  const editing = params.get("edit") === "1" && mayEdit;
   const debug = params.get("debug") === "1";
   const force2d = params.get("view") === "2d";
   const motion = params.get("motion") !== "off";
@@ -322,11 +324,11 @@ function SiteMap({ siteId }: { siteId: string }) {
             }}>{force2d ? "3D" : "2D"}<span className="lm-sr"> view</span></button>
           )}
           <Legend assets={ui.assets} />
-          {!demo && <button type="button" className="btn" onClick={() => setEdit(true)}>Edit layout</button>}
+          {!demo && mayEdit && <button type="button" className="btn" onClick={() => setEdit(true)}>Edit layout</button>}
         </div>
 
         {floors.length > 1 && <FloorRail floors={floors} current={floorId} counts={floorCounts} problems={floorProblems} onChange={setFloor} />}
-        {!demo && <SetupHints site={site} assets={ui.assets} ready={ui.snapshotReceived} onSite={setSite} onEditLayout={() => setEdit(true)} floorId={floorId} />}
+        {!demo && mayEdit && <SetupHints site={site} assets={ui.assets} ready={ui.snapshotReceived} onSite={setSite} onEditLayout={() => setEdit(true)} floorId={floorId} />}
 
         <div className="lm-hud-camera" ref={setCamHost} />{/* camera fix: camera controls render here */}
         <div className="lm-hud-dock">
