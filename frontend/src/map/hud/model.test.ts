@@ -6,11 +6,21 @@ import { ageOf, fmtDur, parseTs } from "./time";
 
 const entry = (text: string, kind: FeedEntry["kind"] = "change"): FeedEntry => ({ id: 1, ts: 1, kind, text, assetId: "P1" }) as FeedEntry;
 
-test("small cards keep state, zone and status changes and drop location pings", () => {
-  expect(headline(entry("P1: status waiting_room → in_treatment, latitude 1 → 2"))).toEqual({ name: "P1", what: "status waiting_room → in_treatment" });
+test("small cards say what happened in words and drop location pings", () => {
+  expect(headline(entry("P1: status waiting_room → in_treatment, latitude 1 → 2"))).toEqual({ name: "P1", what: "is in treatment" });
   expect(headline(entry("Medic 1: latitude 1 → 2, longitude 3 → 4"))).toBeNull();
-  expect(headline(entry("P1: anchor — → —, status — → waiting_room"))).toEqual({ name: "P1", what: "status — → waiting_room" });
-  expect(headline(entry("P1 added", "added"))).toEqual({ name: null, what: "P1 added" });
+  expect(headline(entry("P1: anchor — → —, status — → waiting_room"))).toEqual({ name: "P1", what: "is now waiting room" });
+  expect(headline(entry("P1 added", "added"))).toEqual({ name: "P1", what: "was added to the map" });
+});
+
+test("server entries with changes become one sentence; the record's label and role name it", () => {
+  const nurse = { site_id: "s", asset_id: "S1", updated_ts: 0, label: "Daniel Wagner", kind: "staff", role: "Registered Nurse", zone: "3W-305A", _sources: { zone: "staff", label: "staff" } } as Asset;
+  const e = { ...entry("S1 zone 3W-NS → 3W-305A", "event"), assetId: "S1", source: "staff", changes: { zone: ["3W-NS", "3W-305A"], "attributes.badge_last_seen": ["a", "b"] } } as FeedEntry;
+  expect(headline(e, { assets: new Map([["S1", nurse]]) })).toEqual({ name: "Nurse Daniel Wagner", what: "went to 3W-305A" });
+  const ping = { ...e, changes: { "attributes.badge_last_seen": ["a", "b"] } } as FeedEntry;
+  expect(headline(ping, { assets: new Map([["S1", nurse]]) })).toBeNull();
+  const gone = { ...entry("P9 left the map", "event"), assetId: "P9", removed: true, changes: { label: ["P7401859", null], "attributes.status": ["pending_discharge", null] } } as FeedEntry;
+  expect(headline(gone)).toEqual({ name: "P7401859", what: "left the map (discharged)" });
 });
 
 test("bed chips drop the shared prefix only when names stay unique", () => {
