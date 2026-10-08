@@ -106,11 +106,14 @@ test("a new record walks in from the nearest walk entrance", () => {
   const { m, apply, clock } = setup();
   apply([rec("n1", "A")], true);
   const target = apply([rec("n1", "A"), rec("n2", "B")]).positions.get("n2")!;
-  expect(pos(m, "n2")).toEqual([20, 20]);
+  // Just inside the entrance on the building wall (not out in the street).
+  const [sx, sy] = pos(m, "n2");
+  expect(Math.hypot(sx - 20, sy - 20)).toBeLessThan(0.8);
+  expect(sy).toBeLessThan(20);
   m.step();
   clock.advance(500);
   m.step();
-  expect(pos(m, "n2")).not.toEqual([20, 20]);
+  expect(pos(m, "n2")).not.toEqual([sx, sy]);
   clock.advance(MAX_TRAVEL_S * 1000);
   m.step();
   expect(pos(m, "n2")).toEqual([target.x, target.y]);

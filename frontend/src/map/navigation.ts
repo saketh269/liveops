@@ -1,68 +1,58 @@
-// Walkable-space navigation for moving figures (ADR 0006, LIVEOPS-98).
+// Walking routes for moving figures (ADR 0006, LIVEOPS-98, LIVEOPS-107).
 //
-// One grid per floor layout: corridor zones are walkable; a floor without
-// corridors is walkable everywhere outside zones. A zone's interior can only be
-// used by a path that starts or ends in it, and is entered or left through its
-// doors (or anywhere on its edge when it has none, which picks the edge point
-// nearest the path). A* over the grid, then string-pulled to straight runs.
-// Every search is capped; when it fails the caller gets a straight line.
-import { entrancesOf, floorsOf, zonesOnFloor } from "./floors";
+// Navigation walks on the floor's shared wall plan (world/wallPlan.ts): the same
+// wall segments and door gaps the 3D world draws. A* on its fine grid of cells
+// that keep a walker clear of every wall and desk, preferring corridors and the
+// middle of the floor over squeezing along walls; then string-pulled to straight
+// runs, keeping only runs that stay on walkable cells. A route never crosses a
+// wall: when the goal cannot be reached, it ends at the nearest reachable point
+// (`reached: false`) and the caller puts the figure in place from there.
+import { floorIdOf, floorsOf, zonesOnFloor } from "./floors";
 import type { Entrance, SiteLayout, Zone } from "../api/types";
 import { pointInPolygon, polygonBounds, type Pt } from "./placement";
+import { WORLD } from "./world/style";
+import { WALKER_RADIUS, clearOfDesks, segmentClear, wallPlanFor, type FloorWallPlan } from "./world/wallPlan";
 
-/** Grid cells across the longest floor side (upper bound); keeps searches small. */
-export const NAV_MAX_CELLS = 200;
-export const NAV_MIN_CELL = 0.25;
-/** Hard time cap for one search (a cold JIT can take a few ms). Typical searches on a 120 × 72 floor take 0.2–0.4 ms. */
-export const NAV_MAX_MS = 15;
 export const NAV_PATH_CACHE = 4096;
+/** A straight run between two points is kept when it stays this far from every wall centre line (half a wall + a little). */
+export const DIRECT_MARGIN = WORLD.wallThickness / 2 + 0.12;
+/** Step cost outside corridors on floors that have corridors (corridors are preferred). */
+const OPEN_COST = 1.4;
+/** Step cost through a walled room that is neither the start's nor the goal's. */
+const OTHER_ROOM_COST = 6;
+/** Extra step cost next to a wall or desk. */
+const NEAR_WALL_COST = 0.35;
+/** How far (m) to look for a walkable spot next to a point that is not on one. */
+const SNAP_RADIUS = 4;
 
 export type NavFloor = {
   width: number;
   depth: number;
   zones: Zone[];
-  /** Entrances with the ADR 0006 defaults applied when the layout has none. */
+  /** The floor's own entrances (the building walls have openings at these). */
   entrances: Entrance[];
 };
 
+/** A walking route; `reached` is false when the goal can't be walked to and the route stops at the nearest reachable point. */
+export type Route = { points: Pt[]; reached: boolean };
+
 /**
- * The single floor a view draws, read from the layout per ADR 0006.
- *
- * Kept in one function so it can be swapped for `floors.ts` (agent-floorplan)
- * when that lands: there, views receive `floorLayout(layout, floorId)` and this
- * reads its first (only) floor. With several floors and no filtering, the first
- * floor is used, like the ADR's "no floor_id = first floor" rule.
+ * The single floor a view draws: the first floor of the layout (views pass one
+ * floor at a time, `floorLayout`), with its zones and own entrances.
  */
 export function navFloorOf(layout: SiteLayout | null | undefined): NavFloor {
-  // The views pass one floor at a time (floorLayout); its first floor is the one we walk on.
   const floor = floorsOf(layout)[0];
   const zones = zonesOnFloor(layout, floor.id).filter((z) => Array.isArray(z.polygon) && z.polygon.length >= 3);
-  const entrances = entrancesOf(layout, floor.id);
+  const entrances = (layout?.entrances ?? []).filter((e) => Array.isArray(e.point) && Number.isFinite(e.point[0]) && Number.isFinite(e.point[1]) && floorIdOf(layout, e) === floor.id);
   return { width: floor.width, depth: floor.depth, zones, entrances };
 }
-
-/** Nearest entrance of a kind to a point (falls back to any entrance). */
-export function nearestEntrance(floor: NavFloor, p: Pt, kind: Entrance["kind"]): Entrance {
-  const pool = floor.entrances.filter((e) => e.kind === kind);
-  const list = pool.length ? pool : floor.entrances;
-  let best = list[0];
-  let bd = Infinity;
-  for (const e of list) {
-    const d = Math.hypot(e.point[0] - p[0], e.point[1] - p[1]);
-    if (d < bd) { bd = d; best = e; }
-  }
-  return best;
-}
-
-/** Entrances the ADR 0006 defaults made up (the floor's layout has none of its own). */
-const isDefaultEntrance = (e: Entrance) => e.id.startsWith("default-");
 
 /**
  * Open ends of the corridors: the middle of each short side of a corridor's
  * bounds, unless another corridor continues past it. On a floor without
- * entrances of its own these are where people come and go (lifts and stairs).
+ * entrances of its own these stand for the lift and stair cores.
  */
-export function corridorEnds(floor: NavFloor): Pt[] {
+export function corridorEnds(floor: Pick<NavFloor, "zones">): Pt[] {
   const corridors = floor.zones.filter((z) => z.kind === "corridor");
   const out: Pt[] = [];
   for (const z of corridors) {
@@ -73,40 +63,22 @@ export function corridorEnds(floor: NavFloor): Pt[] {
     for (const [p, [dx, dy]] of ends) {
       const beyond: Pt = [p[0] + dx * 0.5, p[1] + dy * 0.5];
       if (corridors.some((o) => o !== z && pointInPolygon(beyond[0], beyond[1], o.polygon))) continue;
-      out.push([p[0] - dx * 0.3, p[1] - dy * 0.3]); // just inside, so the route stays on the corridor
+      out.push([p[0] - dx, p[1] - dy]); // a metre in, so the core is inside the building
     }
   }
   return out;
 }
 
-/**
- * Where a walker of a kind enters or leaves the floor nearest to `p`: the
- * floor's own entrances, else its nearest corridor end, else the default entrance.
- */
-export function nearestExit(floor: NavFloor, p: Pt, kind: Entrance["kind"]): Pt {
-  const own = floor.entrances.filter((e) => !isDefaultEntrance(e) && e.kind === kind);
-  if (own.length || kind !== "walk") return nearestEntrance(floor, p, kind).point;
-  const ends = corridorEnds(floor);
-  if (!ends.length) return nearestEntrance(floor, p, kind).point;
-  let best = ends[0];
-  for (const e of ends) if (Math.hypot(e[0] - p[0], e[1] - p[1]) < Math.hypot(best[0] - p[0], best[1] - p[1])) best = e;
-  return best;
-}
-
 export class NavGrid {
+  readonly floor: NavFloor;
+  /** The shared wall plan this grid walks on. */
+  readonly plan: FloorWallPlan;
   readonly cols: number;
   readonly rows: number;
   readonly cell: number;
-  readonly floor: NavFloor;
-  /** Room zone index per cell, -1 outside rooms (corridors count as outside). */
-  readonly zoneAt: Int16Array;
-  /** 1 where open (non-room) space is walkable. */
-  readonly open: Uint8Array;
-  /** Room zone index + 1 for cells near one of that room's doors, else 0. */
-  readonly doorOf: Int16Array;
-  /** Per room zone: true when it has doors (then it is entered only through them). */
-  readonly hasDoors: boolean[];
-  private paths = new Map<string, Pt[] | null>();
+  private paths = new Map<string, number[] | null>();
+  private spawns = new Map<string, Pt[]>();
+  private warned = new Set<string>();
   // A* scratch, reused across searches (generation stamps avoid clearing).
   private g: Float64Array;
   private parent: Int32Array;
@@ -117,63 +89,15 @@ export class NavGrid {
 
   constructor(floor: NavFloor) {
     this.floor = floor;
-    const longest = Math.max(floor.width, floor.depth);
-    this.cell = Math.max(NAV_MIN_CELL, longest / NAV_MAX_CELLS);
-    this.cols = Math.max(1, Math.ceil(floor.width / this.cell));
-    this.rows = Math.max(1, Math.ceil(floor.depth / this.cell));
-    const n = this.cols * this.rows;
-    this.zoneAt = new Int16Array(n).fill(-1);
-    this.open = new Uint8Array(n);
-    this.doorOf = new Int16Array(n);
+    this.plan = wallPlanFor(floor);
+    const { cols, rows, cell } = this.plan.grid;
+    this.cols = cols; this.rows = rows; this.cell = cell;
+    const n = cols * rows;
     this.g = new Float64Array(n);
     this.parent = new Int32Array(n);
     this.seen = new Uint32Array(n);
     this.closed = new Uint32Array(n);
-    this.heap = new Heap(n);
-
-    const corridors = floor.zones.filter((z) => z.kind === "corridor");
-    const rooms = floor.zones.map((z, i) => ({ z, i })).filter(({ z }) => z.kind !== "corridor");
-    if (corridors.length) {
-      for (const z of corridors) this.raster(z.polygon, (c) => { this.open[c] = 1; });
-    } else {
-      this.open.fill(1);
-    }
-    this.hasDoors = floor.zones.map(() => false);
-    // Smaller rooms win where rooms overlap, so a room drawn inside a unit stays reachable.
-    rooms.sort((a, b) => area(b.z.polygon) - area(a.z.polygon));
-    for (const { z, i } of rooms) this.raster(z.polygon, (c) => { this.zoneAt[c] = i; });
-    const r = Math.max(this.cell * 1.5, 0.75);
-    for (const { z, i } of rooms) {
-      const doors = (z.doors ?? []).filter((d) => Array.isArray(d) && Number.isFinite(d[0]) && Number.isFinite(d[1]));
-      if (!doors.length) continue;
-      this.hasDoors[i] = true;
-      for (const [dx, dy] of doors) {
-        this.forCellsNear(dx, dy, r, (c) => {
-          this.doorOf[c] = i + 1;
-          if (this.zoneAt[c] === -1) this.open[c] = 1; // a door always opens onto something walkable
-        });
-      }
-    }
-  }
-
-  private raster(poly: readonly Pt[], fn: (c: number) => void) {
-    const b = polygonBounds(poly);
-    const c0 = Math.max(0, Math.floor(b.x / this.cell)), c1 = Math.min(this.cols - 1, Math.ceil((b.x + b.w) / this.cell));
-    const r0 = Math.max(0, Math.floor(b.y / this.cell)), r1 = Math.min(this.rows - 1, Math.ceil((b.y + b.h) / this.cell));
-    for (let r = r0; r <= r1; r++) {
-      const y = (r + 0.5) * this.cell;
-      for (let c = c0; c <= c1; c++) if (pointInPolygon((c + 0.5) * this.cell, y, poly)) fn(r * this.cols + c);
-    }
-  }
-
-  private forCellsNear(x: number, y: number, rad: number, fn: (c: number) => void) {
-    const c0 = Math.max(0, Math.floor((x - rad) / this.cell)), c1 = Math.min(this.cols - 1, Math.floor((x + rad) / this.cell));
-    const r0 = Math.max(0, Math.floor((y - rad) / this.cell)), r1 = Math.min(this.rows - 1, Math.floor((y + rad) / this.cell));
-    for (let r = r0; r <= r1; r++) {
-      for (let c = c0; c <= c1; c++) {
-        if (Math.hypot((c + 0.5) * this.cell - x, (r + 0.5) * this.cell - y) <= rad) fn(r * this.cols + c);
-      }
-    }
+    this.heap = new Heap(Math.min(n, 1 << 16));
   }
 
   cellOf(x: number, y: number): number {
@@ -186,133 +110,241 @@ export class NavGrid {
     return [((i % this.cols) + 0.5) * this.cell, (Math.floor(i / this.cols) + 0.5) * this.cell];
   }
 
-  /** Can a figure stand in cell `i` when the path may use rooms `za` and `zb`? */
-  private passable(i: number, za: number, zb: number): boolean {
-    const z = this.zoneAt[i];
-    return z === -1 ? this.open[i] === 1 : z === za || z === zb;
+  /** Can a walker stand here? */
+  walkable(p: Pt): boolean {
+    return this.onFloor(p) && this.plan.grid.free[this.cellOf(p[0], p[1])] === 1;
   }
 
-  /** Can a figure step from cell a to the neighbouring cell b (rooms za/zb allowed)? */
-  canStep(a: number, b: number, za: number, zb: number): boolean {
-    if (!this.passable(b, za, zb)) return false;
-    const zA = this.zoneAt[a], zB = this.zoneAt[b];
-    if (zA === zB) return true;
-    // Crossing a room's wall: allowed anywhere for rooms without doors, else only at a door.
-    if (zA !== -1 && this.hasDoors[zA] && this.doorOf[a] !== zA + 1 && this.doorOf[b] !== zA + 1) return false;
-    if (zB !== -1 && this.hasDoors[zB] && this.doorOf[a] !== zB + 1 && this.doorOf[b] !== zB + 1) return false;
-    return true;
+  /**
+   * Walking route from `from` to `to` (layout metres), both ends included when reached.
+   * Every run between consecutive points stays clear of the plan's walls.
+   */
+  route(from: Pt, to: Pt): Route {
+    if (!finite(from) || !finite(to) || !this.onFloor(from) || !this.onFloor(to)) {
+      // Off the floor (the Unassigned strip) there is nothing to walk on: put the figure in place.
+      return this.unreachable(from, to, [from]);
+    }
+    if (Math.hypot(to[0] - from[0], to[1] - from[1]) < 1e-9) return { points: [from, to], reached: true };
+    if (this.directOk(from, to)) return { points: [from, to], reached: true };
+    const s = this.snap(from);
+    if (s < 0) return this.unreachable(from, to, [from]);
+    const gs = this.snap(to);
+    const { comp } = this.plan.grid;
+    let g = gs;
+    let reached = true;
+    if (g < 0 || comp[g] !== comp[s]) {
+      g = this.nearestInComp(comp[s], to);
+      reached = false;
+    }
+    const cells = this.search(s, g);
+    if (!cells) return this.unreachable(from, to, [from]); // cannot happen: same connected area
+    const pts: Pt[] = [from, ...cells.map((c) => this.centre(c))];
+    if (reached) pts.push(to);
+    const out = dedupe(pts);
+    if (!reached) return this.unreachable(from, to, out);
+    return { points: out.length >= 2 ? out : [from, to], reached: true };
   }
 
-  /** Nearest cell a figure can stand in (rooms za/zb allowed), searching outwards; -1 if none nearby. */
-  private nearestPassable(i: number, za: number, zb: number): number {
-    if (this.passable(i, za, zb)) return i;
-    const c0 = i % this.cols, r0 = Math.floor(i / this.cols);
-    const maxR = Math.max(this.cols, this.rows);
-    for (let rad = 1; rad < maxR; rad++) {
+  /** Route through several waypoints in turn; stops at the first leg that can't be walked. */
+  walk(waypoints: readonly Pt[]): Route {
+    if (waypoints.length < 2) return { points: [...waypoints], reached: true };
+    const pts: Pt[] = [waypoints[0]];
+    for (let i = 1; i < waypoints.length; i++) {
+      const r = this.route(pts[pts.length - 1], waypoints[i]);
+      pts.push(...r.points.slice(1));
+      if (!r.reached) return { points: pts, reached: false };
+    }
+    return { points: dedupe(pts), reached: true };
+  }
+
+  /**
+   * Where a walker (or vehicle) of a kind comes onto and leaves the floor nearest to `p`:
+   * a spot just inside one of the floor's own entrances of that kind; for walkers on a
+   * floor without one, the lift and stair cores at the corridor ends (else the middle of
+   * the floor). Always on a walkable spot inside the building. Null for vehicles on a floor
+   * without an ambulance entrance (they appear in place).
+   */
+  exitNear(p: Pt, kind: Entrance["kind"]): Pt | null {
+    const list = this.spawnPoints(kind);
+    if (!list.length) return null;
+    let best = list[0];
+    for (const e of list) if (Math.hypot(e[0] - p[0], e[1] - p[1]) < Math.hypot(best[0] - p[0], best[1] - p[1])) best = e;
+    return best;
+  }
+
+  /** Raw entrance point of a kind nearest `p` (vehicles drive in through its opening), or null. */
+  entranceNear(p: Pt, kind: Entrance["kind"]): Pt | null {
+    const own = this.floor.entrances.filter((e) => e.kind === kind);
+    if (!own.length) return null;
+    let best = own[0].point;
+    for (const e of own) if (Math.hypot(e.point[0] - p[0], e.point[1] - p[1]) < Math.hypot(best[0] - p[0], best[1] - p[1])) best = e.point;
+    return [best[0], best[1]];
+  }
+
+  private spawnPoints(kind: Entrance["kind"]): Pt[] {
+    const hit = this.spawns.get(kind);
+    if (hit) return hit;
+    let raw: Pt[] = this.floor.entrances.filter((e) => e.kind === kind).map((e) => [e.point[0], e.point[1]] as Pt);
+    if (!raw.length && kind === "walk") {
+      raw = corridorEnds(this.floor);
+      if (!raw.length) raw = [[this.floor.width / 2, this.floor.depth / 2]];
+    }
+    const out: Pt[] = [];
+    for (const p of raw) {
+      const c = kind === "walk" ? this.coreCell(p) : this.snap(p);
+      if (c < 0) continue;
+      // Vehicles keep their entrance point when it is walkable (the approach road meets it there).
+      out.push(kind !== "walk" && this.walkable(p) ? p : this.centre(c));
+    }
+    this.spawns.set(kind, out);
+    return out;
+  }
+
+  /** Nearest free cell to `p` in the floor's main walkable area, outside rooms when possible. */
+  private coreCell(p: Pt): number {
+    const { free, comp, room, mainComp } = this.plan.grid;
+    let best = -1, bd = Infinity, bestAny = -1, bdAny = Infinity;
+    for (let i = 0; i < free.length; i++) {
+      if (!free[i] || comp[i] !== mainComp) continue;
+      const c = this.centre(i);
+      const d = Math.hypot(c[0] - p[0], c[1] - p[1]);
+      if (d < bdAny) { bdAny = d; bestAny = i; }
+      if (room[i] === -1 && d < bd) { bd = d; best = i; }
+    }
+    return best >= 0 ? best : bestAny;
+  }
+
+  private onFloor(p: Pt) {
+    return p[0] >= 0 && p[1] >= 0 && p[0] <= this.floor.width && p[1] <= this.floor.depth;
+  }
+
+  /** A straight run is fine when it keeps clear of walls and desks and stays inside the floor. */
+  private directOk(a: Pt, b: Pt): boolean {
+    if (!segmentClear(this.plan, a, b, DIRECT_MARGIN)) return false;
+    return clearOfDesks(this.plan, a, b, WALKER_RADIUS);
+  }
+
+  private unreachable(from: Pt, to: Pt, points: Pt[]): Route {
+    const key = `${from.map((v) => v.toFixed(1))}>${to.map((v) => v.toFixed(1))}`;
+    if (!this.warned.has(key) && typeof console !== "undefined") {
+      this.warned.add(key);
+      if (this.warned.size > 256) this.warned.clear();
+      console.debug(`[liveops] no walking route from (${key.replace(">", ") to (")}); the figure is put in place instead`);
+    }
+    return { points: points.length ? points : [from], reached: false };
+  }
+
+  /**
+   * Cell to walk from or to for a point: its own cell when free, else the nearest free cell
+   * that can be reached from the point in a straight line without crossing a wall; -1 if none.
+   */
+  private snap(p: Pt): number {
+    const { free } = this.plan.grid;
+    const i0 = this.cellOf(p[0], p[1]);
+    if (free[i0]) return i0;
+    const c0 = i0 % this.cols, r0 = Math.floor(i0 / this.cols);
+    const maxR = Math.ceil(SNAP_RADIUS / this.cell);
+    const tests: ((c: Pt) => boolean)[] = [
+      (c) => segmentClear(this.plan, p, c, WORLD.wallThickness / 2),
+      (c) => segmentClear(this.plan, p, c, 0),
+      () => true, // a point right on a wall line: either side will do
+    ];
+    for (const ok of tests) {
       let best = -1, bd = Infinity;
-      for (let dr = -rad; dr <= rad; dr++) {
-        for (let dc = -rad; dc <= rad; dc++) {
-          if (Math.max(Math.abs(dr), Math.abs(dc)) !== rad) continue;
-          const r = r0 + dr, c = c0 + dc;
-          if (r < 0 || c < 0 || r >= this.rows || c >= this.cols) continue;
-          const j = r * this.cols + c;
-          const d = dr * dr + dc * dc;
-          if (d < bd && this.passable(j, za, zb)) { bd = d; best = j; }
+      for (let rad = 1; rad <= maxR; rad++) {
+        for (let dr = -rad; dr <= rad; dr++) {
+          for (let dc = -rad; dc <= rad; dc++) {
+            if (Math.max(Math.abs(dr), Math.abs(dc)) !== rad) continue;
+            const r = r0 + dr, c = c0 + dc;
+            if (r < 0 || c < 0 || r >= this.rows || c >= this.cols) continue;
+            const j = r * this.cols + c;
+            if (!free[j]) continue;
+            const q = this.centre(j);
+            const d = Math.hypot(q[0] - p[0], q[1] - p[1]);
+            if (d < bd && ok(q)) { bd = d; best = j; }
+          }
         }
+        // Rings are squares: a later ring can still hold a nearer cell, up to √2 further out.
+        if (best >= 0 && bd <= rad * this.cell) return best;
       }
       if (best >= 0) return best;
     }
     return -1;
   }
 
-  /**
-   * Walking route from `from` to `to` in layout units, both ends included.
-   * `fallback` is true when no route was found in budget and the result is a straight line.
-   */
-  route(from: Pt, to: Pt, opts: { maxMs?: number; now?: () => number } = {}): { points: Pt[]; fallback: boolean } {
-    const straight = { points: [from, to] as Pt[], fallback: true };
-    if (!finite(from) || !finite(to)) return straight;
-    const inFrom = this.inside(from), inTo = this.inside(to);
-    const fromC = this.clampPt(from), toC = this.clampPt(to);
-    const s0 = this.cellOf(fromC[0], fromC[1]);
-    const g0 = this.cellOf(toC[0], toC[1]);
-    const za = this.zoneAt[s0], zb = this.zoneAt[g0];
-    const s = this.nearestPassable(s0, za, zb);
-    const g = this.nearestPassable(g0, za, zb);
-    if (s < 0 || g < 0) return straight;
-    const key = `${s}>${g}`;
-    let mid: Pt[] | null | undefined = this.paths.get(key);
-    if (mid === undefined) {
-      const cells = this.astar(s, g, za, zb, opts.maxMs ?? NAV_MAX_MS, opts.now ?? defaultNow);
-      if (cells === TIMED_OUT) return straight; // not cached: a later search may have more time
-      mid = cells ? this.smooth(cells, za, zb).map((c) => this.centre(c)) : null;
-      if (this.paths.size >= NAV_PATH_CACHE) this.paths.delete(this.paths.keys().next().value!);
-      this.paths.set(key, mid);
-    } else {
-      // LRU: refresh recency.
-      this.paths.delete(key);
-      this.paths.set(key, mid);
+  /** Free cell of a connected area nearest to `p`. */
+  private nearestInComp(id: number, p: Pt): number {
+    const { comp } = this.plan.grid;
+    let best = -1, bd = Infinity;
+    for (let i = 0; i < comp.length; i++) {
+      if (comp[i] !== id) continue;
+      const q = this.centre(i);
+      const d = (q[0] - p[0]) ** 2 + (q[1] - p[1]) ** 2;
+      if (d < bd) { bd = d; best = i; }
     }
-    if (!mid) return straight;
-    // Real end points replace the first/last cell centres; points off the floor join with a straight run.
-    const pts: Pt[] = [];
-    if (!inFrom) pts.push(from);
-    pts.push(fromC);
-    for (let i = 1; i < mid.length - 1; i++) pts.push(mid[i]);
-    pts.push(toC);
-    if (!inTo) pts.push(to);
-    return { points: dedupe(pts), fallback: false };
+    return best;
   }
 
-  private inside(p: Pt) {
-    return p[0] >= 0 && p[1] >= 0 && p[0] <= this.floor.width && p[1] <= this.floor.depth;
+  /** Smoothed cell path s → g (cached), or null when not connected. */
+  private search(s: number, g: number): number[] | null {
+    const key = `${s}>${g}`;
+    let hit = this.paths.get(key);
+    if (hit !== undefined) {
+      this.paths.delete(key);
+      this.paths.set(key, hit);
+      return hit;
+    }
+    const raw = this.astar(s, g);
+    hit = raw ? this.smooth(raw) : null;
+    if (this.paths.size >= NAV_PATH_CACHE) this.paths.delete(this.paths.keys().next().value!);
+    this.paths.set(key, hit);
+    return hit;
   }
 
-  private clampPt(p: Pt): Pt {
-    return [Math.min(this.floor.width, Math.max(0, p[0])), Math.min(this.floor.depth, Math.max(0, p[1]))];
+  private stepCost(i: number, ra: number, rb: number): number {
+    const { corridor, room, nearWall, hasCorridors } = this.plan.grid;
+    const z = room[i];
+    let c = z !== -1 ? (z === ra || z === rb ? 1 : OTHER_ROOM_COST) : corridor[i] || !hasCorridors ? 1 : OPEN_COST;
+    if (nearWall[i]) c += NEAR_WALL_COST;
+    return c;
   }
 
-  /** Cell path, null when unreachable, or TIMED_OUT when over the time cap. */
-  private astar(s: number, goal: number, za: number, zb: number, maxMs: number, now: () => number): number[] | null | typeof TIMED_OUT {
+  private astar(s: number, goal: number): number[] | null {
     if (s === goal) return [s];
-    const gen = ++this.gen;
-    if (gen === 0xffffffff) { this.seen.fill(0); this.closed.fill(0); this.gen = 1; }
-    const { cols, g, parent, seen, closed, heap } = this;
+    if (++this.gen === 0xffffffff) { this.seen.fill(0); this.closed.fill(0); this.gen = 1; }
+    const gen = this.gen;
+    const { cols, rows, g, parent, seen, closed, heap } = this;
+    const { free, room } = this.plan.grid;
+    const ra = room[s], rb = room[goal];
     const gc = goal % cols, gr = Math.floor(goal / cols);
     const h = (i: number) => {
       const dx = Math.abs((i % cols) - gc), dy = Math.abs(Math.floor(i / cols) - gr);
       return Math.max(dx, dy) + (Math.SQRT2 - 1) * Math.min(dx, dy);
     };
     heap.clear();
-    g[s] = 0; parent[s] = -1; seen[s] = this.gen;
+    g[s] = 0; parent[s] = -1; seen[s] = gen;
     heap.push(s, h(s));
-    const t0 = now();
-    let n = 0;
     while (heap.size) {
       const cur = heap.pop();
-      if (closed[cur] === this.gen) continue;
-      closed[cur] = this.gen;
+      if (closed[cur] === gen) continue;
+      closed[cur] = gen;
       if (cur === goal) {
         const out: number[] = [];
         for (let c = cur; c !== -1; c = parent[c]) out.push(c);
         return out.reverse();
       }
-      if ((++n & 255) === 0 && now() - t0 > maxMs) return TIMED_OUT;
-      const c = cur % cols, r = Math.floor(cur / cols);
+      const c = cur % cols, r = (cur - c) / cols;
       for (let k = 0; k < 8; k++) {
         const dc = DC[k], dr = DR[k];
         const nc = c + dc, nr = r + dr;
-        if (nc < 0 || nr < 0 || nc >= cols || nr >= this.rows) continue;
+        if (nc < 0 || nr < 0 || nc >= cols || nr >= rows) continue;
         const nb = nr * cols + nc;
-        if (closed[nb] === this.gen || !this.canStep(cur, nb, za, zb)) continue;
-        if (dc && dr) {
-          // No corner cutting: both orthogonal neighbours must be steppable too.
-          const a1 = r * cols + nc, a2 = nr * cols + c;
-          if (!this.canStep(cur, a1, za, zb) || !this.canStep(a1, nb, za, zb) || !this.canStep(cur, a2, za, zb) || !this.canStep(a2, nb, za, zb)) continue;
-        }
-        const ng = g[cur] + (dc && dr ? Math.SQRT2 : 1);
-        if (seen[nb] !== this.gen || ng < g[nb]) {
-          seen[nb] = this.gen; g[nb] = ng; parent[nb] = cur;
+        if (!free[nb] || closed[nb] === gen) continue;
+        // No corner cutting: a diagonal step needs both side cells free.
+        if (dc && dr && (!free[r * cols + nc] || !free[nr * cols + c])) continue;
+        const ng = g[cur] + (dc && dr ? Math.SQRT2 : 1) * this.stepCost(nb, ra, rb);
+        if (seen[nb] !== gen || ng < g[nb]) {
+          seen[nb] = gen; g[nb] = ng; parent[nb] = cur;
           heap.push(nb, ng + h(nb));
         }
       }
@@ -320,60 +352,48 @@ export class NavGrid {
     return null;
   }
 
-  /** Line of sight between two cells: every cell the segment between their centres crosses must be a legal step. */
-  lineOfSight(a: number, b: number, za: number, zb: number): boolean {
-    const cols = this.cols;
-    let x = a % cols, y = Math.floor(a / cols);
-    const nx = Math.abs(b % cols - x), ny = Math.abs(Math.floor(b / cols) - y);
-    const sx = b % cols > x ? 1 : -1, sy = Math.floor(b / cols) > y ? 1 : -1;
-    let cur = a;
-    for (let ix = 0, iy = 0; ix < nx || iy < ny;) {
-      const decision = (1 + 2 * ix) * ny - (1 + 2 * iy) * nx;
-      if (decision <= 0 && ix < nx) {
-        x += sx; ix++;
-        const next = y * cols + x;
-        if (!this.canStep(cur, next, za, zb)) return false;
-        cur = next;
-        if (decision < 0) continue;
-      }
-      if (iy < ny) {
-        y += sy; iy++;
-        const next = y * cols + x;
-        if (!this.canStep(cur, next, za, zb)) return false;
-        cur = next;
-      }
+  /**
+   * True when the straight run between two points stays on free cells (sampled at a
+   * quarter cell; a free cell's centre keeps a walker clear of walls, so the run does too).
+   */
+  losFree(a: Pt, b: Pt): boolean {
+    const { free } = this.plan.grid;
+    const len = Math.hypot(b[0] - a[0], b[1] - a[1]);
+    const n = Math.max(1, Math.ceil(len / (this.cell / 4)));
+    for (let k = 0; k <= n; k++) {
+      const x = a[0] + ((b[0] - a[0]) * k) / n, y = a[1] + ((b[1] - a[1]) * k) / n;
+      if (x < 0 || y < 0 || x > this.floor.width || y > this.floor.depth) return false;
+      if (!free[this.cellOf(x, y)]) return false;
     }
     return true;
   }
 
-  /** Greedy string pulling: keep only the cells where the straight line of sight breaks. */
-  private smooth(cells: number[], za: number, zb: number): number[] {
+  /** Corners of a cell path, then greedy string pulling between them along walkable runs. */
+  private smooth(cells: number[]): number[] {
     if (cells.length <= 2) return cells;
-    const out = [cells[0]];
+    const corners = [cells[0]];
+    for (let i = 1; i < cells.length - 1; i++) {
+      const a = cells[i - 1], b = cells[i], c = cells[i + 1];
+      if (b - a !== c - b) corners.push(b);
+    }
+    corners.push(cells[cells.length - 1]);
+    const out = [corners[0]];
     let anchor = 0;
-    while (anchor < cells.length - 1) {
+    while (anchor < corners.length - 1) {
       let far = anchor + 1;
-      for (let j = anchor + 2; j < cells.length; j++) {
-        if (this.lineOfSight(cells[anchor], cells[j], za, zb)) far = j; else break;
+      for (let j = corners.length - 1; j > anchor + 1; j--) {
+        if (this.losFree(this.centre(corners[anchor]), this.centre(corners[j]))) { far = j; break; }
       }
-      out.push(cells[far]);
+      out.push(corners[far]);
       anchor = far;
     }
     return out;
   }
 }
 
-const TIMED_OUT = Symbol("timed out");
 const DC = [1, -1, 0, 0, 1, 1, -1, -1];
 const DR = [0, 0, 1, -1, 1, -1, 1, -1];
-const defaultNow = () => (typeof performance !== "undefined" ? performance.now() : Date.now());
 const finite = (p: Pt) => Number.isFinite(p[0]) && Number.isFinite(p[1]);
-
-function area(poly: readonly Pt[]): number {
-  let a = 0;
-  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) a += (poly[j][0] + poly[i][0]) * (poly[j][1] - poly[i][1]);
-  return Math.abs(a / 2);
-}
 
 function dedupe(pts: Pt[]): Pt[] {
   const out: Pt[] = [];
@@ -381,7 +401,7 @@ function dedupe(pts: Pt[]): Pt[] {
     const q = out[out.length - 1];
     if (!q || Math.hypot(p[0] - q[0], p[1] - q[1]) > 1e-6) out.push(p);
   }
-  return out.length >= 2 ? out : [pts[0], pts[pts.length - 1]];
+  return out;
 }
 
 /** Binary min-heap of cell indices keyed by f. */
@@ -422,7 +442,7 @@ class Heap {
 
 const grids = new WeakMap<object, NavGrid>();
 
-/** Navigation grid for a layout, built once per layout object. */
+/** Navigation grid for a layout, built once per layout object (the wall plan is shared across equal floors). */
 export function navGridFor(layout: SiteLayout): NavGrid {
   let g = grids.get(layout);
   if (!g) { g = new NavGrid(navFloorOf(layout)); grids.set(layout, g); }

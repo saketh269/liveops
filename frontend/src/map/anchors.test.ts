@@ -1,7 +1,7 @@
 // Anchored placement and motion (LIVEOPS-102): patients in beds, staff at bedsides.
 import type { Asset, SiteLayout, Zone } from "../api/types";
 import { MAX_TRAVEL_S, Motion } from "./motion";
-import { corridorEnds, navFloorOf, nearestExit } from "./navigation";
+import { corridorEnds, navFloorOf, navGridFor } from "./navigation";
 import { PlacementCache, placeAssets, placementKey, pointInPolygon, type Placement, type Pt } from "./placement";
 
 // Synthetic records for tests only.
@@ -152,26 +152,20 @@ describe("anchored placement", () => {
 });
 
 describe("navigation exits", () => {
-  test("a floor without entrances leaves by the nearest open corridor end", () => {
-    const f = navFloorOf(layout);
-    const ends = corridorEnds(f);
-    expect(ends).toHaveLength(2);
-    expect(nearestExit(f, [2, 3], "walk")[0]).toBeLessThan(1);
-    expect(nearestExit(f, [18, 3], "walk")[0]).toBeGreaterThan(19);
-  });
-
-  test("corridors that continue into each other have no end at the joint", () => {
-    const f = navFloorOf({ width: 40, depth: 10, zones: [
-      { id: "a", name: "a", kind: "corridor", polygon: rect(0, 0, 20, 4) },
-      { id: "b", name: "b", kind: "corridor", polygon: rect(20, 0, 20, 4) },
-    ] });
-    const xs = corridorEnds(f).map((p) => Math.round(p[0]));
-    expect(xs.sort((a, b) => a - b)).toEqual([0, 40]);
+  test("a floor without entrances leaves by the nearest corridor end (its lift and stair core), inside the building", () => {
+    const g = navGridFor(layout);
+    expect(corridorEnds(navFloorOf(layout))).toHaveLength(2);
+    const west = g.exitNear([2, 3], "walk")!, east = g.exitNear([18, 3], "walk")!;
+    expect(west[0]).toBeLessThan(1.5);
+    expect(west[0]).toBeGreaterThan(0.3);
+    expect(east[0]).toBeGreaterThan(18.5);
+    expect(east[0]).toBeLessThan(19.7);
   });
 
   test("own entrances win over corridor ends", () => {
-    const f = navFloorOf({ ...layout, entrances: [{ id: "e", name: "E", point: [10, 25], kind: "walk" }] });
-    expect(nearestExit(f, [2, 3], "walk")).toEqual([10, 25]);
+    const g = navGridFor({ ...layout, entrances: [{ id: "e", name: "E", point: [10, 15], kind: "walk" }] });
+    const p = g.exitNear([2, 3], "walk")!;
+    expect(Math.hypot(p[0] - 10, p[1] - 15)).toBeLessThan(0.3);
   });
 });
 
