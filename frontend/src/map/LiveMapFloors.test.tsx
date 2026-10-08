@@ -65,9 +65,11 @@ test("a site with floors shows one floor at a time with its plan, zones and asse
   // zone ER has its asset; B3 names its floor explicitly ("level 2", by name)
   await send({ type: "snapshot", site_id: "s1", ts: 1, event: null, assets: [a("B1", "ER"), a("B2", "Ward 2"), a("B3", "ER", "level 2")] });
 
-  const switcher = screen.getByRole("group", { name: "Floor" });
+  const switcher = screen.getByRole("navigation", { name: "Floors" });
   const buttons = within(switcher).getAllByRole("button");
-  expect(buttons.map((b) => b.textContent)).toEqual(["Level 22 assets", "Ground1 asset"]); // top floor first, with counts
+  // top floor first, like a lift panel, with counts
+  expect(buttons.map((b) => b.getAttribute("aria-label"))).toEqual(["Level 2: 2 assets", "Ground: 1 asset"]);
+  expect(buttons.map((b) => b.textContent)).toEqual(["22", "G1"]);
   expect(within(switcher).getByRole("button", { name: /Ground/ }).getAttribute("aria-pressed")).toBe("true");
 
   const plan = document.querySelector("image.lm-plan")!;

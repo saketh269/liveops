@@ -1,6 +1,6 @@
 // Notices on the live map that explain why assets are unplaced or grey, and fix
 // the zone layout automatically from the data.
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Link } from "react-router-dom";
 import { api } from "../api/client";
 import type { Asset, Mapping, Site, SiteLayout } from "../api/types";
@@ -31,6 +31,7 @@ export default function SetupHints({ site, assets, ready, onSite, onEditLayout, 
   const [error, setError] = useState<string | null>(null);
   const autoTried = useRef(false);
   const [hideStates, setHideStates] = useState(false);
+  const [dismissed, setDismissed] = useState(false);
   const [mappings, setMappings] = useState<Mapping[] | null>(null);
   const [sourceNames, setSourceNames] = useState<Record<string, string>>({});
 
@@ -66,16 +67,30 @@ export default function SetupHints({ site, assets, ready, onSite, onEditLayout, 
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ready, zones]);
 
-  if (!ready || assets.size === 0) return null;
+  if (!ready || dismissed) return null;
+  if (assets.size === 0) {
+    return (
+      <Card onDismiss={() => setDismissed(true)}>
+        <div className="notice info">
+          No assets on this site yet. <Link to={`/sites/${encodeURIComponent(site.id)}/setup`}>Set up from a source</Link> to
+          get suggestions, or <Link to={`/mapping/new?site=${encodeURIComponent(site.id)}`}>map a table by hand</Link>.
+        </div>
+      </Card>
+    );
+  }
   const missingCount = [...zones.missing.values()].reduce((a, b) => a + b, 0);
   const unrecognisedCount = [...states.unrecognised.values()].reduce((a, b) => a + b, 0);
   // Mappings that add details to another one (match_key differs from the ID) have no zone or state by design.
   const incomplete = (mappings ?? []).filter((m) => m.active && !(m.config.match_key && m.config.match_key !== m.config.id_field))
     .map((m) => ({ m, gaps: [!m.config.fields.zone && "Zone", !m.config.fields.state && "State"].filter(Boolean) as string[] }))
     .filter((x) => x.gaps.length > 0);
+  const showMissing = zones.missing.size > 0 && (zones.used.size > 0 || protectedFloor);
+  const showGaps = zones.noZone > 0 || states.noState > 0;
+  const showStates = states.unrecognised.size > 0 && !hideStates;
+  if (!error && !created && !showMissing && !showGaps && !showStates) return null;
 
   return (
-    <div className="lm-hints">
+    <Card onDismiss={() => setDismissed(true)}>
       {error && <div className="notice bad" role="alert">{error}</div>}
       {created && (
         <div className="notice info" role="status">
@@ -84,7 +99,7 @@ export default function SetupHints({ site, assets, ready, onSite, onEditLayout, 
           <button type="button" className="btn lm-link-btn" disabled={busy} onClick={() => void save(created.previous, created.previous, [])}>Undo</button>
         </div>
       )}
-      {zones.missing.size > 0 && (zones.used.size > 0 || protectedFloor) && (
+      {showMissing && (
         <div className="notice">
           {missingCount} asset{missingCount === 1 ? " is" : "s are"} in zones that aren't on the map yet: {list(zones.missing)}.{" "}
           <button type="button" className="btn primary lm-link-btn" disabled={busy}
@@ -93,7 +108,7 @@ export default function SetupHints({ site, assets, ready, onSite, onEditLayout, 
           </button>
         </div>
       )}
-      {(zones.noZone > 0 || states.noState > 0) && (
+      {showGaps && (
         <div className="notice">
           {zones.noZone > 0 && <>{zones.noZone} asset{zones.noZone === 1 ? " has" : "s have"} no zone, so {zones.noZone === 1 ? "it sits" : "they sit"} in Unassigned. </>}
           {states.noState > 0 && <>{states.noState} asset{states.noState === 1 ? " has" : "s have"} no state, so {states.noState === 1 ? "it is" : "they are"} grey. </>}
@@ -113,13 +128,26 @@ export default function SetupHints({ site, assets, ready, onSite, onEditLayout, 
           )}
         </div>
       )}
-      {states.unrecognised.size > 0 && !hideStates && (
+      {showStates && (
         <div className="notice">
           {unrecognisedCount} asset{unrecognisedCount === 1 ? " is" : "s are"} grey because these state values aren't recognised: {list(states.unrecognised)}.
           {" "}In the <Link to="/mapping">mapping</Link>, translate each value to Free, In use, Cleaning or Alert.
           {" "}<button type="button" className="btn lm-link-btn" onClick={() => setHideStates(true)}>Dismiss</button>
         </div>
       )}
-    </div>
+    </Card>
+  );
+}
+
+/** The notices float over the map in one card that can be put away until the page is reloaded. */
+function Card({ children, onDismiss }: { children: ReactNode; onDismiss: () => void }) {
+  return (
+    <section className="lm-glass lm-hud-hints" aria-labelledby="lm-hints-h">
+      <div className="lm-hud-hints-head">
+        <h2 id="lm-hints-h">Setup</h2>
+        <button type="button" className="btn lm-link-btn" onClick={onDismiss} aria-label="Dismiss setup notices">Dismiss</button>
+      </div>
+      <div className="lm-hints">{children}</div>
+    </section>
   );
 }
