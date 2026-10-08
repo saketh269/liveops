@@ -73,6 +73,12 @@ class MappingConfig(BaseModel):
     def key_field(self) -> str:
         return self.match_key or self.id_field
 
+    @property
+    def attached(self) -> bool:
+        """Adds details to another mapping's asset (a cleaning task on a bed): its
+        rows are told apart by ``id_field`` but land on the asset named by ``match_key``."""
+        return self.key_field != self.id_field
+
     def required_columns(self) -> set[str]:
         return {self.id_field, self.key_field, *self.fields.values(), *self.attributes}
 
@@ -142,6 +148,7 @@ def apply_mapping(
         mapping_id=mapping_id,
         dataset=change.dataset,
         fields=out,
+        attached=config.attached,
         source_ts=change.source_ts,
     )
 

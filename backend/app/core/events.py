@@ -29,6 +29,10 @@ class AssetEvent(BaseModel):
     mapping_id: str
     dataset: str
     fields: dict[str, Any] = Field(default_factory=dict)  # zone, state, label, kind, attributes...
+    # True when the mapping adds details to another mapping's asset (its match_key
+    # differs from its id_field: a transport on a patient, a cleaning task on a bed).
+    # The asset's own mapping then wins every field both send (LIVEOPS-116).
+    attached: bool = False
     source_ts: float | None = None
     received_ts: float = Field(default_factory=time.time)
 
@@ -40,6 +44,15 @@ class FieldValue(BaseModel):
     updated_ts: float
 
 
+class AttachedRecord(BaseModel):
+    """Everything one attached mapping says about an asset, kept apart from the
+    merged fields (LIVEOPS-116): a transport's own ``attributes.status`` stays
+    readable here even where the patient's own status wins the merged field."""
+
+    source_id: str
+    fields: dict[str, Any] = Field(default_factory=dict)  # field name as the store keeps it -> value
+
+
 class Asset(BaseModel):
     """Current merged state of one asset on one site."""
 
@@ -47,18 +60,21 @@ class Asset(BaseModel):
     asset_id: str
     fields: dict[str, FieldValue] = Field(default_factory=dict)
     updated_ts: float = 0.0
+    attached: dict[str, AttachedRecord] = Field(default_factory=dict)  # attached mapping id -> its values
 
     def flat(self) -> dict[str, Any]:
-        """Plain view sent to the browser: values plus where each came from."""
-        return fold_attributes(
-            {
-                "site_id": self.site_id,
-                "asset_id": self.asset_id,
-                "updated_ts": self.updated_ts,
-                **{k: v.value for k, v in self.fields.items()},
-                "_sources": {k: v.source_id for k, v in self.fields.items()},
-            }
-        )
+        """Plain view sent to the browser: values plus where each came from, and
+        (only when there are any) ``_attached``: each attached mapping's own values."""
+        flat: dict[str, Any] = {
+            "site_id": self.site_id,
+            "asset_id": self.asset_id,
+            "updated_ts": self.updated_ts,
+            **{k: v.value for k, v in self.fields.items()},
+            "_sources": {k: v.source_id for k, v in self.fields.items()},
+        }
+        if self.attached:
+            flat[ATTACHED] = {m: (r.source_id, r.fields) for m, r in self.attached.items()}
+        return fold_view(flat)
 
 
 # ``attributes`` merge per key across sources (LIVEOPS-44): the store keeps
@@ -77,6 +93,29 @@ def expand_attributes(fields: dict[str, Any]) -> dict[str, Any]:
     for k, v in fields[ATTRIBUTES].items():
         out[ATTR_PREFIX + str(k)] = v
     return out
+
+
+# Browser view of the attached mappings' own values:
+#   "_attached": {"<mapping id>": {"source_id": "<source id>", "attributes": {"status": "in_progress", ...}}}
+ATTACHED = "_attached"
+
+
+def fold_attached(source_id: str, fields: dict[str, Any]) -> dict[str, Any]:
+    """One attached mapping's values as the browser sees them (``attributes.<key>`` folded)."""
+    out: dict[str, Any] = {k: v for k, v in fields.items() if not k.startswith(ATTR_PREFIX)}
+    attrs = {k[len(ATTR_PREFIX) :]: v for k, v in fields.items() if k.startswith(ATTR_PREFIX)}
+    if attrs:
+        out[ATTRIBUTES] = attrs
+    out["source_id"] = source_id
+    return out
+
+
+def fold_view(flat: dict[str, Any]) -> dict[str, Any]:
+    """``fold_attributes`` plus ``_attached`` given as ``{mapping: (source_id, fields)}``."""
+    groups = flat.get(ATTACHED)
+    if isinstance(groups, dict):
+        flat[ATTACHED] = {m: fold_attached(str(src), dict(fields)) for m, (src, fields) in groups.items()}
+    return fold_attributes(flat)
 
 
 def fold_attributes(flat: dict[str, Any]) -> dict[str, Any]:

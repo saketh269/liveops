@@ -75,6 +75,26 @@ def test_apply_mapping_upsert_and_state_map() -> None:
     }
 
 
+def test_apply_mapping_marks_attached_mappings() -> None:
+    """A mapping whose match_key differs from its id_field adds details to another
+    mapping's asset; the store keeps its values apart (LIVEOPS-116)."""
+    ch = Change(
+        op=ChangeOp.UPSERT,
+        dataset="d",
+        key="T1",
+        record={"request_id": "T1", "patient_id": "P1", "status": "in_progress"},
+    )
+    cfg = MappingConfig(id_field="request_id", match_key="patient_id", attributes=["status"])
+    ev = apply_mapping(ch, cfg, site_id="s", source_id="src", mapping_id="m")
+    assert ev.asset_id == "P1" and ev.attached
+    same_key = MappingConfig(id_field="bed_id", match_key="bed_id", attributes=["note"])
+    assert not apply_mapping(ch.model_copy(update={"record": {"bed_id": "B1"}}), same_key, **_IDS).attached
+    assert not apply_mapping(ch.model_copy(update={"record": {"bed_id": "B1"}}), CFG, **_IDS).attached
+
+
+_IDS = {"site_id": "s", "source_id": "src", "mapping_id": "m"}
+
+
 def test_apply_mapping_missing_key() -> None:
     ch = Change(op=ChangeOp.UPSERT, dataset="d", key="?", record={"unit": "ICU"})
     with pytest.raises(MappingProblem):
