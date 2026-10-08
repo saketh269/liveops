@@ -11,7 +11,8 @@ import { draftProblem, toDraft, type FilterDraft } from "./filters";
 export const MAP_STATES = ["free", "in_use", "cleaning", "alert"];
 /** Mirrors MIN_POLL_INTERVAL_S in backend/app/connectors/base.py. */
 export const MIN_POLL_S = 0.5;
-const MAIN_FIELDS = ["zone", "state", "label"] as const;
+const MAIN_FIELDS = ["zone", "state", "label", "anchor"] as const;
+type MainField = (typeof MAIN_FIELDS)[number];
 type ExtraField = { name: string; column: string };
 
 type Props = {
@@ -61,8 +62,8 @@ export function MappingWizard({ sites, sources, connectors, existing, initialSit
   const [sourceId, setSourceId] = useState(existing?.source_id ?? initialSourceId ?? (sources.length === 1 ? sources[0].id : ""));
   const [dataset, setDataset] = useState(existing?.dataset ?? "");
   const [idField, setIdField] = useState(cfg?.id_field ?? "");
-  const [fields, setFields] = useState<Record<"zone" | "state" | "label", string>>({
-    zone: cfg?.fields.zone ?? "", state: cfg?.fields.state ?? "", label: cfg?.fields.label ?? "",
+  const [fields, setFields] = useState<Record<MainField, string>>({
+    zone: cfg?.fields.zone ?? "", state: cfg?.fields.state ?? "", label: cfg?.fields.label ?? "", anchor: cfg?.fields.anchor ?? "",
   });
   // Any other asset field the config maps (e.g. x, y, cleaning) is kept and editable (LIVEOPS-32).
   const [extraFields, setExtraFields] = useState<ExtraField[]>(() =>
@@ -108,7 +109,7 @@ export function MappingWizard({ sites, sources, connectors, existing, initialSit
     const cols = d?.columns.map((c) => c.name) ?? [];
     setIdField(d?.primary_key[0] ?? "");
     const guess = (re: RegExp) => cols.find((c) => re.test(c)) ?? "";
-    setFields({ zone: guess(GUESS.zone), state: guess(GUESS.state), label: guess(GUESS.label) });
+    setFields({ zone: guess(GUESS.zone), state: guess(GUESS.state), label: guess(GUESS.label), anchor: "" });
     setExtraFields([]);
     setAttributes([]);
     setStateMap({});
@@ -135,7 +136,7 @@ export function MappingWizard({ sites, sources, connectors, existing, initialSit
     if (poll.trim() === "" || !(pollN >= MIN_POLL_S && pollN <= 3600)) errs.poll = `Enter a number of seconds between ${MIN_POLL_S} and 3600.`;
     const names = extraFields.filter((f) => f.name.trim() || f.column).map((f) => f.name.trim());
     if (extraFields.some((f) => (f.name.trim() === "") !== (f.column === ""))) errs.extra = "Each extra field needs both a name and a column.";
-    else if (names.some((n) => (MAIN_FIELDS as readonly string[]).includes(n))) errs.extra = "Zone, state and label are set above; use another name.";
+    else if (names.some((n) => (MAIN_FIELDS as readonly string[]).includes(n))) errs.extra = "Zone, state, label and anchor are set above; use another name.";
     // "kind" may come from a column (an extra field) or be one fixed value above, not both (LIVEOPS-32).
     else if (names.includes("kind") && kind.trim()) errs.extra = "Kind is set to a fixed value above; clear it there to read kind from a column.";
     else if (new Set(names).size !== names.length) errs.extra = "Each extra field name can be used only once.";
@@ -280,6 +281,11 @@ export function MappingWizard({ sites, sources, connectors, existing, initialSit
               <label htmlFor="m-label">Label</label>
               <ColumnSelect id="m-label" value={fields.label} onChange={(v) => setFields({ ...fields, label: v })} columns={columns} noneLabel="Not mapped" describedBy="m-label-help" />
               <span className="help" id="m-label-help">The name shown next to the asset.</span>
+            </div>
+            <div className="field">
+              <label htmlFor="m-anchor">Anchor</label>
+              <ColumnSelect id="m-anchor" value={fields.anchor} onChange={(v) => setFields({ ...fields, anchor: v })} columns={columns} noneLabel="Not mapped" describedBy="m-anchor-help" />
+              <span className="help" id="m-anchor-help">The ID of another asset this one is drawn at, such as a patient's bed_id.</span>
             </div>
             <div className="field">
               <label htmlFor="m-kind">Kind</label>

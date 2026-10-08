@@ -54,6 +54,45 @@ export function nearestEntrance(floor: NavFloor, p: Pt, kind: Entrance["kind"]):
   return best;
 }
 
+/** Entrances the ADR 0006 defaults made up (the floor's layout has none of its own). */
+const isDefaultEntrance = (e: Entrance) => e.id.startsWith("default-");
+
+/**
+ * Open ends of the corridors: the middle of each short side of a corridor's
+ * bounds, unless another corridor continues past it. On a floor without
+ * entrances of its own these are where people come and go (lifts and stairs).
+ */
+export function corridorEnds(floor: NavFloor): Pt[] {
+  const corridors = floor.zones.filter((z) => z.kind === "corridor");
+  const out: Pt[] = [];
+  for (const z of corridors) {
+    const b = polygonBounds(z.polygon);
+    const ends: [Pt, Pt][] = b.w >= b.h
+      ? [[[b.x, b.y + b.h / 2], [-1, 0]], [[b.x + b.w, b.y + b.h / 2], [1, 0]]]
+      : [[[b.x + b.w / 2, b.y], [0, -1]], [[b.x + b.w / 2, b.y + b.h], [0, 1]]];
+    for (const [p, [dx, dy]] of ends) {
+      const beyond: Pt = [p[0] + dx * 0.5, p[1] + dy * 0.5];
+      if (corridors.some((o) => o !== z && pointInPolygon(beyond[0], beyond[1], o.polygon))) continue;
+      out.push([p[0] - dx * 0.3, p[1] - dy * 0.3]); // just inside, so the route stays on the corridor
+    }
+  }
+  return out;
+}
+
+/**
+ * Where a walker of a kind enters or leaves the floor nearest to `p`: the
+ * floor's own entrances, else its nearest corridor end, else the default entrance.
+ */
+export function nearestExit(floor: NavFloor, p: Pt, kind: Entrance["kind"]): Pt {
+  const own = floor.entrances.filter((e) => !isDefaultEntrance(e) && e.kind === kind);
+  if (own.length || kind !== "walk") return nearestEntrance(floor, p, kind).point;
+  const ends = corridorEnds(floor);
+  if (!ends.length) return nearestEntrance(floor, p, kind).point;
+  let best = ends[0];
+  for (const e of ends) if (Math.hypot(e[0] - p[0], e[1] - p[1]) < Math.hypot(best[0] - p[0], best[1] - p[1])) best = e;
+  return best;
+}
+
 export class NavGrid {
   readonly cols: number;
   readonly rows: number;

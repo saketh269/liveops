@@ -8,10 +8,15 @@
 // Time-based: a figure's position is a pure function of its route, start time
 // and speed, so frame rate does not change where it is. The clock is injected
 // so tests are deterministic.
+//
+// Anchored figures (LIVEOPS-102): a patient whose bed changes gets up (pose
+// "standing"), walks via the bedside and the corridors to the new bedside, and
+// lies down; staff walk bedside to bedside; a discharged patient gets up and
+// walks out to the nearest exit (a corridor end on floors without entrances).
 import type { Asset, SiteLayout } from "../api/types";
 import { figureOf, isPerson, isVehicle, type FigureModel } from "./figures";
-import { navGridFor, nearestEntrance, type NavGrid } from "./navigation";
-import type { Placement, PlacementResult, Pt } from "./placement";
+import { navGridFor, nearestExit, type NavGrid } from "./navigation";
+import type { Placement, PlacementResult, Pose, Pt } from "./placement";
 
 /** Walking speed in layout units per second (layouts are drawn in metres: 1.4 m/s). */
 export const WALK_SPEED = 1.4;
@@ -30,8 +35,10 @@ export type FigureState = {
   readonly id: string;
   x: number;
   y: number;
-  /** Direction of travel in layout coordinates (radians, atan2(dy, dx)). */
+  /** Direction of travel in layout coordinates (radians, atan2(dy, dx)); at rest, the placement's heading. */
   heading: number;
+  /** "lying" only at rest in a bed; everyone walking stands. */
+  pose: Pose;
   /** Stack level at rest (0 while moving). */
   level: number;
   /** Footprint edge length for drawing. */
@@ -191,13 +198,15 @@ export class Motion {
       }
       this.sample(f, now);
       const wasLeaving = f.leaving;
-      const moved = key !== f.key || wasLeaving;
+      // Getting into or out of a bed is a real change too (a patient's state went to or from in_use).
+      const moved = key !== f.key || wasLeaving || (!!f.target && f.target.pose !== p.pose);
       const retarget = !samePlace(f.target, p);
+      const via = this.bedsideOf(f);
       f.asset = a; f.model = model; f.key = key; f.target = p; f.size = p.size; f.leaving = false;
       if (wasLeaving) departuresChanged = true;
       if (moved || (retarget && f.walk)) {
         // Real change (or a walker whose destination slot shifted): walk from where it is now.
-        if (this.dist(f, p) > EPS) this.startWalk(f, () => this.nav().route([f.x, f.y], [p.x, p.y]).points, model, now);
+        if (this.dist(f, p) > EPS) this.startWalk(f, () => this.routeTo([f.x, f.y], via, p), model, now);
         else this.land(f);
       } else if (retarget) {
         this.land(f); // re-packed zone: not a change to this record, so no movement
@@ -207,10 +216,11 @@ export class Motion {
       if (placement.positions.has(f.id) && assets.has(f.id)) continue;
       if (f.leaving) continue;
       this.sample(f, now);
+      const via = this.bedsideOf(f);
       f.leaving = true;
       f.target = null;
       departuresChanged = true;
-      this.startWalk(f, () => this.exitRoute([f.x, f.y], f.model), f.model, now);
+      this.startWalk(f, () => this.exitRoute([f.x, f.y], f.model, via), f.model, now);
     }
     if (departuresChanged) this.departingVersion++;
   }
@@ -251,7 +261,22 @@ export class Motion {
   }
 
   private restingFig(id: string, a: Asset, p: Placement): Fig {
-    return { id, x: p.x, y: p.y, heading: 0, level: p.level, size: p.size, model: figureOf(a), asset: a, leaving: false, key: motionKey(a), target: p, walk: null };
+    return { id, x: p.x, y: p.y, heading: p.heading ?? 0, pose: p.pose, level: p.level, size: p.size, model: figureOf(a), asset: a, leaving: false, key: motionKey(a), target: p, walk: null };
+  }
+
+  /** The bedside a figure lying in a bed gets up to before walking off (null when not lying). */
+  private bedsideOf(f: Fig): Pt | null {
+    return f.pose === "lying" && !f.walk ? f.target?.approach ?? null : null;
+  }
+
+  /** Route from `from` (via the bedside it gets up to) to a placement, ending at its approach and then on it. */
+  private routeTo(from: Pt, via: Pt | null, p: Placement): Pt[] {
+    const start = via ?? from;
+    const goal: Pt = p.approach ?? [p.x, p.y];
+    const mid = this.nav().route(start, goal).points;
+    const pts: Pt[] = [from, ...(via ? [via] : []), ...mid.slice(1)];
+    if (p.approach) pts.push([p.x, p.y]);
+    return pts;
   }
 
   private arrive(id: string, a: Asset, p: Placement, key: string, model: FigureModel, now: number) {
@@ -261,21 +286,23 @@ export class Motion {
     if (!this.enabled || this.walking.size >= this.maxWalkers) return;
     const vehicle = isVehicle(model);
     const nav = this.nav();
-    const entrance = nearestEntrance(nav.floor, [p.x, p.y], vehicle ? "ambulance" : "walk").point;
+    const entrance = nearestExit(nav.floor, [p.x, p.y], vehicle ? "ambulance" : "walk");
     const start: Pt = vehicle ? approachPoint(nav, entrance) : entrance;
     f.x = start[0]; f.y = start[1]; f.level = 0;
     this.startWalk(f, () => {
-      const inner = this.nav().route(entrance, [p.x, p.y]).points;
+      const inner = this.routeTo(entrance, null, p);
       return vehicle ? [start, ...inner] : inner;
     }, model, now);
   }
 
-  private exitRoute(from: Pt, model: FigureModel): Pt[] {
+  private exitRoute(from: Pt, model: FigureModel, via: Pt | null = null): Pt[] {
     const nav = this.nav();
     const vehicle = isVehicle(model);
-    const exit = nearestEntrance(nav.floor, from, vehicle ? "ambulance" : "walk").point;
-    const inner = nav.route(from, exit).points;
-    return vehicle ? [...inner, approachPoint(nav, exit)] : inner;
+    const start = via ?? from;
+    const exit = nearestExit(nav.floor, start, vehicle ? "ambulance" : "walk");
+    const inner = nav.route(start, exit).points;
+    const head: Pt[] = via ? [from, via] : [];
+    return vehicle ? [...inner, approachPoint(nav, exit)] : [...head, ...inner.slice(via ? 1 : 0)];
   }
 
   private startWalk(f: Fig, plan: () => Pt[], model: FigureModel, now: number) {
@@ -285,6 +312,7 @@ export class Motion {
     }
     f.walk = { plan, route: null, cum: [0], total: 0, speed: isVehicle(model) ? DRIVE_SPEED : WALK_SPEED, t0: now, seg: 0 };
     f.level = 0;
+    f.pose = "standing"; // gets up before walking
     this.touched.add(f.id);
     this.walking.add(f.id);
     // Re-queue at the back so a walker that changed again waits its turn fairly.
@@ -333,9 +361,10 @@ export class Motion {
   /** Put a figure at rest on its target. */
   private land(f: Fig) {
     if (f.target) {
-      f.x = f.target.x; f.y = f.target.y; f.level = f.target.level; f.size = f.target.size;
+      f.x = f.target.x; f.y = f.target.y; f.level = f.target.level; f.size = f.target.size; f.pose = f.target.pose;
     }
-    if (!isPerson(f.model) && !isVehicle(f.model)) f.heading = 0; // beds and equipment rest square to the room
+    if (f.target?.heading !== undefined) f.heading = f.target.heading; // in the bed, facing the bed, a bed facing its door
+    else if (!isPerson(f.model) && !isVehicle(f.model)) f.heading = 0; // beds and equipment rest square to the room
     f.walk = null;
     this.walking.delete(f.id);
     this.pending.delete(f.id);
@@ -362,7 +391,8 @@ export class Motion {
 }
 
 function samePlace(a: Placement | null, b: Placement): boolean {
-  return !!a && Math.abs(a.x - b.x) < EPS && Math.abs(a.y - b.y) < EPS && a.level === b.level && Math.abs(a.size - b.size) < EPS;
+  return !!a && Math.abs(a.x - b.x) < EPS && Math.abs(a.y - b.y) < EPS && a.level === b.level && Math.abs(a.size - b.size) < EPS
+    && a.pose === b.pose && (a.heading ?? 0) === (b.heading ?? 0);
 }
 
 /** A point on the approach road outside the floor, straight out from the entrance's nearest edge. */
