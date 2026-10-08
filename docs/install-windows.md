@@ -35,7 +35,23 @@ below goes in **PowerShell**.
    docker compose up --build -d
    ```
 
-5. Open http://localhost:8080.
+5. Open http://localhost:8080. The first visit asks you to **create your admin
+   account**; after that everyone signs in. (Updating an install from before
+   sign-in: the same screen appears once, and your data is kept.)
+
+   Invite and password-reset links show up in **Users** to copy, and in the log
+   (`docker compose logs backend`) unless you set the `LIVEOPS_SMTP_*` settings in `.env`.
+
+## API tokens for scripts
+
+Open **My account → API tokens**, create a token and copy it (it is shown once),
+then pass it to scripts, for example:
+
+```powershell
+python tools\riverside-mock\setup_site.py --liveops http://localhost:8000 --token lo_... --site hs
+```
+
+Delete the token in the same place to revoke it.
 
 ## Connecting to a database on your own computer
 
