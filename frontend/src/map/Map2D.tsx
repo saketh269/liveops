@@ -10,6 +10,7 @@ import { onThemeChange, stateKey } from "./stateColors";
 import { currentPalette } from "./world/style";
 import { roomStates, tintFor } from "./world/tint";
 import type { Zone } from "../api/types";
+import { zoneLabel } from "./labels"; // --- polish fix ---
 
 type Props = {
   layout: SiteLayout;
@@ -160,7 +161,7 @@ export default function Map2D({ layout, assets, selectedId, onSelect, onHover, r
         {/* Labels last so assets never hide them. */}
         {(layout.zones ?? []).map((z) =>
           z.polygon?.length >= 3 && z.kind !== "corridor" ? (
-            <text key={z.id} className="lm-zone-text" x={polygonCentroid(z.polygon)[0]} y={polygonCentroid(z.polygon)[1]} style={{ fontSize: labelSize(z, z.name || z.id) }}>{z.name || z.id}</text>
+            <text key={z.id} className="lm-zone-text" x={polygonCentroid(z.polygon)[0]} y={polygonCentroid(z.polygon)[1]} style={{ fontSize: labelSize(z, zoneLabel(z.name || z.id)) }}>{zoneLabel(z.name || z.id)}</text> /* --- polish fix: humanized zone names --- */
           ) : null,
         )}
       </svg>

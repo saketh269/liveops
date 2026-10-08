@@ -1,5 +1,5 @@
 import type { Zone } from "../../api/types";
-import { labelSpot, paintScale } from "./floorPaint";
+import { groundLabel, labelSpot, paintScale } from "./floorPaint";
 
 const rect = (x: number, y: number, w: number, h: number): [number, number][] => [[x, y], [x + w, y], [x + w, y + h], [x, y + h]];
 
@@ -32,5 +32,18 @@ describe("paintScale", () => {
     expect(paintScale(64, 30, 2048)).toBe(32);
     expect(paintScale(200, 50, 2048)).toBeCloseTo(10.24);
     expect(paintScale(5000, 10, 2048)).toBe(4);
+  });
+});
+
+// --- polish fix ---
+describe("groundLabel", () => {
+  const measure = (t: string) => t.length * 0.6; // width at a 1 px font
+  test("machine names are humanized; real names stay", () => {
+    expect(groundLabel({ id: "fleet-a", name: "at_hospital_offloading", kind: "bay" }, 500, 10, measure)).toBe("At hospital · offloading");
+    expect(groundLabel({ id: "x", name: "ED Waiting Room", kind: "waiting" }, 500, 10, measure)).toBe("ED Waiting Room");
+  });
+  test("a half room too narrow for its full id gets the short form, so neighbours never run together", () => {
+    expect(groundLabel({ id: "3W-305A", name: "3W-305A", kind: "room" }, 100, 20, measure)).toBe("3W-305A");
+    expect(groundLabel({ id: "3W-305A", name: "3W-305A", kind: "room" }, 30, 20, measure)).toBe("305A");
   });
 });
